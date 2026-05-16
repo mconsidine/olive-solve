@@ -64,7 +64,6 @@
 //    SOFTWARE.
 
 use ndarray::{Array2, ArrayBase, Data, Ix2, s};
-use rayon::prelude::*;
 
 use std::cmp::Ordering;
 
@@ -201,8 +200,8 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
 
     // Horizontal pass: standard sliding sum (cache friendly)
     scratch
-        .par_chunks_exact_mut(w)
-        .zip(src.par_chunks_exact(w))
+        .chunks_exact_mut(w)
+        .zip(src.chunks_exact(w))
         .for_each(|(s_row, i_row)| {
             assert!(i_row.len() >= w);
             assert!(s_row.len() >= w);
@@ -273,12 +272,12 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
         });
 
     // Vertical pass
-    // Parallel over column strips for cache locality
+    // Sequential over column strips for cache locality
     let strip_width = 128;
     let num_strips = w.div_ceil(strip_width);
     let out_ptr = out.as_mut_ptr() as usize;
 
-    (0..num_strips).into_par_iter().for_each(|strip_idx| {
+    (0..num_strips).into_iter().for_each(|strip_idx| {
         let out_slice = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, w * h) };
         let x_start = strip_idx * strip_width;
         let x_end = (x_start + strip_width).min(w);
@@ -356,8 +355,8 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
     // Horizontal pass: u8 -> u16 (Slashes memory write bandwidth by 50% vs standard f32)
     // Standard sliding sum (cache friendly)
     scratch
-        .par_chunks_exact_mut(w)
-        .zip(src.par_chunks_exact(w))
+        .chunks_exact_mut(w)
+        .zip(src.chunks_exact(w))
         .for_each(|(s_row, i_row)| {
             let mut sum = 0_u16;
             if w > 2 * rad {
@@ -426,13 +425,13 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
 
     // Vertical pass: Reads u16 -> Math in f32 -> Writes f32 subtracted image directly to
     // out_buffer.
-    // Parallel over column strips for cache locality
+    // Sequential over column strips for cache locality
     let strip_width = 128;
     let num_strips = w.div_ceil(strip_width);
     let out_ptr = out.as_mut_ptr() as usize;
 
     (0..num_strips)
-        .into_par_iter()
+        .into_iter()
         .map(|strip_idx| {
             let out_slice = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, w * h) };
             let x_start = strip_idx * strip_width;
@@ -512,7 +511,7 @@ fn fast_median_filter_2d<T: Copy + ToF32 + Sync + Send>(
     let pad = (size / 2) as isize;
     let mid = (size * size) / 2;
 
-    out.par_chunks_exact_mut(w)
+    out.chunks_exact_mut(w)
         .enumerate()
         .for_each(|(y, out_row)| {
             let y_i = y as isize;
@@ -650,7 +649,7 @@ impl Extractor {
             self.image_vec.resize(height * width, 0.0);
 
             self.image_vec
-                .par_chunks_exact_mut(width)
+                .chunks_exact_mut(width)
                 .enumerate()
                 .for_each(|(y, row)| {
                     for x in 0..width {
@@ -747,7 +746,7 @@ impl Extractor {
                 let w = width;
                 if ds == 2 {
                     self.image_vec
-                        .par_chunks_exact_mut(out_width)
+                        .chunks_exact_mut(out_width)
                         .enumerate()
                         .for_each(|(out_y, row)| {
                             let start_y = out_y * 2;
@@ -766,7 +765,7 @@ impl Extractor {
                         });
                 } else if ds == 4 {
                     self.image_vec
-                        .par_chunks_exact_mut(out_width)
+                        .chunks_exact_mut(out_width)
                         .enumerate()
                         .for_each(|(out_y, row)| {
                             let start_y = out_y * 4;
@@ -787,7 +786,7 @@ impl Extractor {
                         });
                 } else {
                     self.image_vec
-                        .par_chunks_exact_mut(out_width)
+                        .chunks_exact_mut(out_width)
                         .enumerate()
                         .for_each(|(out_y, row)| {
                             let start_y = out_y * ds;
@@ -810,7 +809,7 @@ impl Extractor {
             } else {
                 // Fallback for non-contiguous views
                 self.image_vec
-                    .par_chunks_exact_mut(out_width)
+                    .chunks_exact_mut(out_width)
                     .enumerate()
                     .for_each(|(y, row)| {
                         for x in 0..out_width {
@@ -838,8 +837,8 @@ impl Extractor {
                 self.image_vec.resize(height * width, 0.0);
                 if let Some(s) = cropped.as_slice() {
                     self.image_vec
-                        .par_chunks_mut(4096)
-                        .zip(s.par_chunks(4096))
+                        .chunks_mut(4096)
+                        .zip(s.chunks(4096))
                         .for_each(|(out_c, in_c)| {
                             for (o, &i) in out_c.iter_mut().zip(in_c.iter()) {
                                 *o = i as f32;
@@ -930,11 +929,11 @@ impl Extractor {
                     )
                 }
                 BgSubMode::GlobalMean => {
-                    let sum: u64 = src.par_iter().map(|&v| v as u64).sum();
+                    let sum: u64 = src.iter().map(|&v| v as u64).sum();
                     let mean = (sum as f64 / src.len() as f64) as f32;
                     self.image_vec
-                        .par_iter_mut()
-                        .zip(src.par_iter())
+                        .iter_mut()
+                        .zip(src.iter())
                         .map(|(o, &i)| {
                             let val_f32 = (i as f32) - mean;
                             *o = val_f32;
@@ -952,8 +951,8 @@ impl Extractor {
                     let med = median as f32;
 
                     self.image_vec
-                        .par_iter_mut()
-                        .zip(src.par_iter())
+                        .iter_mut()
+                        .zip(src.iter())
                         .map(|(o, &i)| {
                             let val_f32 = (i as f32) - med;
                             *o = val_f32;
@@ -966,8 +965,8 @@ impl Extractor {
             }
         } else {
             self.image_vec
-                .par_iter_mut()
-                .zip(src.par_iter())
+                .iter_mut()
+                .zip(src.iter())
                 .map(|(o, &i)| {
                     let val_f32 = i as f32;
                     *o = val_f32;
@@ -1012,14 +1011,14 @@ impl Extractor {
         // Note: Because self.image_vec contains the same floats as the standard pipeline, this
         // loop is bit-for-bit identical to the original logic, guaranteeing matching centroid
         // output.
-        let chunk_size = (height / rayon::current_num_threads()).max(64);
+        let chunk_size = height.max(64);
 
         let eroded_pixels: Vec<usize> = if options.binary_open {
             let chunks = height.saturating_sub(2).div_ceil(chunk_size);
             (0..chunks)
-                .into_par_iter()
+                .into_iter()
                 .fold(
-                    || Vec::with_capacity(128),
+                    Vec::with_capacity(1024),
                     |mut acc, chunk_idx| {
                         let start_y = 1 + chunk_idx * chunk_size;
                         let end_y = (start_y + chunk_size).min(height - 1);
@@ -1045,16 +1044,12 @@ impl Extractor {
                         acc
                     },
                 )
-                .reduce(Vec::new, |mut a, mut b| {
-                    a.append(&mut b);
-                    a
-                })
         } else {
             let chunks = height.div_ceil(chunk_size);
             (0..chunks)
-                .into_par_iter()
+                .into_iter()
                 .fold(
-                    || Vec::with_capacity(128),
+                    Vec::with_capacity(1024),
                     |mut acc, chunk_idx| {
                         let start_y = chunk_idx * chunk_size;
                         let end_y = (start_y + chunk_size).min(height);
@@ -1070,10 +1065,6 @@ impl Extractor {
                         acc
                     },
                 )
-                .reduce(Vec::new, |mut a, mut b| {
-                    a.append(&mut b);
-                    a
-                })
         };
 
         // Binary dilation
@@ -1311,8 +1302,8 @@ impl Extractor {
                     let area = (options.filtsize * options.filtsize) as f32;
 
                     self.scratch
-                        .par_chunks_exact_mut(width)
-                        .zip(self.image_vec.par_chunks_exact(width))
+                        .chunks_exact_mut(width)
+                        .zip(self.image_vec.chunks_exact(width))
                         .for_each(|(s_row, i_row)| {
                             let rad = options.filtsize / 2;
                             let mut sum = 0.0_f32;
@@ -1379,86 +1370,83 @@ impl Extractor {
                             }
                         });
 
-                    let chunk_rows = height.div_ceil(rayon::current_num_threads());
-                    let chunk_rows = chunk_rows.max(16);
+                    let chunk_rows = height.max(16);
                     let scratch_ref = &self.scratch;
                     let rad = options.filtsize / 2;
                     let inv_area = 1.0 / area;
 
+                    let mut col_sums = vec![0.0_f32; width];
                     self.image_vec
-                        .par_chunks_mut(chunk_rows * width)
+                        .chunks_mut(chunk_rows * width)
                         .enumerate()
-                        .map_init(
-                            || vec![0.0_f32; width],
-                            |col_sums, (chunk_idx, i_chunk)| {
-                                col_sums.fill(0.0);
-                                let start_y = chunk_idx * chunk_rows;
-                                let end_y = start_y + (i_chunk.len() / width);
+                        .map(|(chunk_idx, i_chunk)| {
+                            col_sums.fill(0.0);
+                            let start_y = chunk_idx * chunk_rows;
+                            let end_y = start_y + (i_chunk.len() / width);
 
-                                for y in (start_y as isize - rad as isize)
-                                    ..=(start_y as isize + rad as isize)
+                            for y in (start_y as isize - rad as isize)
+                                ..=(start_y as isize + rad as isize)
+                            {
+                                let py = if y < 0 {
+                                    (-y - 1) as usize
+                                } else if y >= height as isize {
+                                    (2 * height as isize - 1 - y) as usize
+                                } else {
+                                    y as usize
+                                };
+                                let s_row = &scratch_ref[py * width..(py + 1) * width];
+                                for x in 0..width {
+                                    col_sums[x] += s_row[x];
+                                }
+                            }
+
+                            let mut local_sq_sum = 0.0_f64;
+
+                            {
+                                let i_row = &mut i_chunk[0..width];
+                                for (i, c) in i_row.iter_mut().zip(col_sums.iter()) {
+                                    let val = *i - (*c * inv_area);
+                                    *i = val;
+                                    local_sq_sum += (val * val) as f64;
+                                }
+                            }
+
+                            for y in (start_y + 1)..end_y {
+                                let add_y = (y as isize) + rad as isize;
+                                let add_py = if add_y >= height as isize {
+                                    (2 * height as isize - 1 - add_y) as usize
+                                } else {
+                                    add_y as usize
+                                };
+                                let sub_y = (y as isize) - rad as isize - 1;
+                                let sub_py = if sub_y < 0 {
+                                    (-sub_y - 1) as usize
+                                } else {
+                                    sub_y as usize
+                                };
+
+                                let add_row =
+                                    &scratch_ref[add_py * width..(add_py + 1) * width];
+                                let sub_row =
+                                    &scratch_ref[sub_py * width..(sub_py + 1) * width];
+                                let local_y = y - start_y;
+                                let i_row =
+                                    &mut i_chunk[local_y * width..(local_y + 1) * width];
+
+                                for (((i, c), a), s) in i_row
+                                    .iter_mut()
+                                    .zip(col_sums.iter_mut())
+                                    .zip(add_row.iter())
+                                    .zip(sub_row.iter())
                                 {
-                                    let py = if y < 0 {
-                                        (-y - 1) as usize
-                                    } else if y >= height as isize {
-                                        (2 * height as isize - 1 - y) as usize
-                                    } else {
-                                        y as usize
-                                    };
-                                    let s_row = &scratch_ref[py * width..(py + 1) * width];
-                                    for x in 0..width {
-                                        col_sums[x] += s_row[x];
-                                    }
+                                    *c += *a - *s;
+                                    let val = *i - (*c * inv_area);
+                                    *i = val;
+                                    local_sq_sum += (val * val) as f64;
                                 }
-
-                                let mut local_sq_sum = 0.0_f64;
-
-                                {
-                                    let i_row = &mut i_chunk[0..width];
-                                    for (i, c) in i_row.iter_mut().zip(col_sums.iter()) {
-                                        let val = *i - (*c * inv_area);
-                                        *i = val;
-                                        local_sq_sum += (val * val) as f64;
-                                    }
-                                }
-
-                                for y in (start_y + 1)..end_y {
-                                    let add_y = (y as isize) + rad as isize;
-                                    let add_py = if add_y >= height as isize {
-                                        (2 * height as isize - 1 - add_y) as usize
-                                    } else {
-                                        add_y as usize
-                                    };
-                                    let sub_y = (y as isize) - rad as isize - 1;
-                                    let sub_py = if sub_y < 0 {
-                                        (-sub_y - 1) as usize
-                                    } else {
-                                        sub_y as usize
-                                    };
-
-                                    let add_row =
-                                        &scratch_ref[add_py * width..(add_py + 1) * width];
-                                    let sub_row =
-                                        &scratch_ref[sub_py * width..(sub_py + 1) * width];
-                                    let local_y = y - start_y;
-                                    let i_row =
-                                        &mut i_chunk[local_y * width..(local_y + 1) * width];
-
-                                    for (((i, c), a), s) in i_row
-                                        .iter_mut()
-                                        .zip(col_sums.iter_mut())
-                                        .zip(add_row.iter())
-                                        .zip(sub_row.iter())
-                                    {
-                                        *c += *a - *s;
-                                        let val = *i - (*c * inv_area);
-                                        *i = val;
-                                        local_sq_sum += (val * val) as f64;
-                                    }
-                                }
-                                local_sq_sum
-                            },
-                        )
+                            }
+                            local_sq_sum
+                        })
                         .sum()
                 }
                 BgSubMode::GlobalMedian => {
@@ -1471,7 +1459,7 @@ impl Extractor {
                         });
 
                     self.image_vec
-                        .par_iter_mut()
+                        .iter_mut()
                         .map(|i| {
                             *i -= median;
                             (*i * *i) as f64
@@ -1479,10 +1467,10 @@ impl Extractor {
                         .sum()
                 }
                 BgSubMode::GlobalMean => {
-                    let sum: f64 = self.image_vec.par_iter().map(|&v| v as f64).sum();
+                    let sum: f64 = self.image_vec.iter().map(|&v| v as f64).sum();
                     let mean = (sum / self.image_vec.len() as f64) as f32;
                     self.image_vec
-                        .par_iter_mut()
+                        .iter_mut()
                         .map(|i| {
                             *i -= mean;
                             (*i * *i) as f64
@@ -1500,8 +1488,8 @@ impl Extractor {
                     );
                     let bg = &self.scratch;
                     self.image_vec
-                        .par_iter_mut()
-                        .zip(bg.par_iter())
+                        .iter_mut()
+                        .zip(bg.iter())
                         .map(|(i, &b)| {
                             *i -= b;
                             (*i * *i) as f64
@@ -1510,7 +1498,7 @@ impl Extractor {
                 }
             }
         } else {
-            self.image_vec.par_iter().map(|&i| (i * i) as f64).sum()
+            self.image_vec.iter().map(|&i| (i * i) as f64).sum()
         };
 
         let dbg_bg_sub = if options.return_images {
@@ -1556,7 +1544,7 @@ impl Extractor {
                         options.filtsize,
                     );
                     self.std_img
-                        .par_iter_mut()
+                        .iter_mut()
                         .for_each(|v| *v *= 1.48 * options.sigma);
                     Threshold::Array(&self.std_img)
                 }
@@ -1565,8 +1553,8 @@ impl Extractor {
                     self.scratch.resize(width * height, 0.0);
 
                     self.scratch
-                        .par_chunks_mut(4096)
-                        .zip(self.image_vec.par_chunks(4096))
+                        .chunks_mut(4096)
+                        .zip(self.image_vec.chunks(4096))
                         .for_each(|(s_c, i_c)| {
                             for (s, &i) in s_c.iter_mut().zip(i_c.iter()) {
                                 *s = i * i;
@@ -1583,7 +1571,7 @@ impl Extractor {
                         options.filtsize,
                     );
                     self.std_img
-                        .par_iter_mut()
+                        .iter_mut()
                         .for_each(|v| *v = v.max(0.0).sqrt() * options.sigma);
                     Threshold::Array(&self.std_img)
                 }
@@ -1592,16 +1580,16 @@ impl Extractor {
 
         // 4. Threshold to find binary mask
         // Fused fast extraction: evaluates threshold + binary erosion (3x3 cross) in a single pass.
-        let chunk_size = (height / rayon::current_num_threads()).max(64);
+        let chunk_size = height.max(64);
 
         let eroded_pixels: Vec<usize> = match threshold {
             Threshold::Scalar(th) => {
                 if options.binary_open {
                     let chunks = height.saturating_sub(2).div_ceil(chunk_size);
                     (0..chunks)
-                        .into_par_iter()
+                        .into_iter()
                         .fold(
-                            || Vec::with_capacity(128),
+                            Vec::with_capacity(1024),
                             |mut acc, chunk_idx| {
                                 let start_y = 1 + chunk_idx * chunk_size;
                                 let end_y = (start_y + chunk_size).min(height - 1);
@@ -1634,16 +1622,12 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
                 } else {
                     let chunks = height.div_ceil(chunk_size);
                     (0..chunks)
-                        .into_par_iter()
+                        .into_iter()
                         .fold(
-                            || Vec::with_capacity(128),
+                            Vec::with_capacity(1024),
                             |mut acc, chunk_idx| {
                                 let start_y = chunk_idx * chunk_size;
                                 let end_y = (start_y + chunk_size).min(height);
@@ -1660,19 +1644,15 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
                 }
             }
             Threshold::Array(arr) => {
                 if options.binary_open {
                     let chunks = height.saturating_sub(2).div_ceil(chunk_size);
                     (0..chunks)
-                        .into_par_iter()
+                        .into_iter()
                         .fold(
-                            || Vec::with_capacity(128),
+                            Vec::with_capacity(1024),
                             |mut acc, chunk_idx| {
                                 let start_y = 1 + chunk_idx * chunk_size;
                                 let end_y = (start_y + chunk_size).min(height - 1);
@@ -1709,16 +1689,12 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
                 } else {
                     let chunks = height.div_ceil(chunk_size);
                     (0..chunks)
-                        .into_par_iter()
+                        .into_iter()
                         .fold(
-                            || Vec::with_capacity(128),
+                            Vec::with_capacity(1024),
                             |mut acc, chunk_idx| {
                                 let start_y = chunk_idx * chunk_size;
                                 let end_y = (start_y + chunk_size).min(height);
@@ -1736,10 +1712,6 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
                 }
             }
         };
