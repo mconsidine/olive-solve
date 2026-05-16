@@ -466,6 +466,79 @@ fn test_extraction_against_python_sanity() {
     let downsamples = [None];
 
     run_validation_suite_from_fixtures(&bg_modes, &sigma_modes, &downsamples);
+
+    // Add cropping sanity check (none vs 512x512 center)
+    let image_paths = get_test_images();
+    let path = &image_paths[0];
+    let img = image::open(path).unwrap().to_luma8();
+    let (w, h) = img.dimensions();
+    let mut input_img = Array2::<f32>::zeros((h as usize, w as usize));
+    for y in 0..h {
+        for x in 0..w {
+            input_img[[y as usize, x as usize]] = img.get_pixel(x, y)[0] as f32;
+        }
+    }
+    let mut extractor = Extractor::new();
+    let fixed_th = Some(10.0);
+    let res_full = extractor.extract(
+        &input_img,
+        ExtractOptions {
+            image_th: fixed_th,
+            ..Default::default()
+        },
+    );
+    assert!(!res_full.centroids.is_empty(), "No centroids in full image");
+
+    for crop_config in [Some(tetra3::Crop::Center {
+        width: 512,
+        height: 512,
+    })] {
+        let options = ExtractOptions {
+            crop: crop_config.clone(),
+            image_th: fixed_th,
+            ..Default::default()
+        };
+        let res_crop = extractor.extract(&input_img, options);
+        assert!(
+            !res_crop.centroids.is_empty(),
+            "No centroids in crop {:?}",
+            crop_config
+        );
+
+        // Calculate actual offsets used by Extractor
+        let (cw, ch) = (512, 512);
+        let ds = 2; // default
+        let h_adj = ((ch as f32 / ds as f32).ceil() as usize) * ds;
+        let w_adj = ((cw as f32 / ds as f32).ceil() as usize) * ds;
+        let final_offs_h = ((h as usize - h_adj) / 2).min(h as usize - h_adj);
+        let final_offs_w = ((w as usize - w_adj) / 2).min(w as usize - w_adj);
+
+        let buffer = 5.0; // Avoid stars that are partially clipped at the boundary
+        let x_min = final_offs_w as f64 + buffer;
+        let x_max = (final_offs_w + w_adj) as f64 - buffer;
+        let y_min = final_offs_h as f64 + buffer;
+        let y_max = (final_offs_h + h_adj) as f64 - buffer;
+
+        // Forward check: Every star from the full image that is safely inside the crop should be found
+        for c_full in &res_full.centroids {
+            if c_full.x >= x_min && c_full.x <= x_max && c_full.y >= y_min && c_full.y <= y_max {
+                let mut found = false;
+                for c_crop in &res_crop.centroids {
+                    let dist =
+                        ((c_crop.x - c_full.x).powi(2) + (c_crop.y - c_full.y).powi(2)).sqrt();
+                    if dist < 1.0 {
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(
+                    found,
+                    "Star at ({:.1}, {:.1}) from full image was inside crop {:?} but NOT found in crop result",
+                    c_full.x, c_full.y, crop_config
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -840,6 +913,79 @@ fn test_extraction_u8_sanity() {
     let downsamples = [None];
 
     run_validation_suite_u8(&bg_modes, &sigma_modes, &downsamples);
+
+    // Add cropping sanity check (none vs 512x512 center)
+    let image_paths = get_test_images();
+    let path = &image_paths[0];
+    let img = image::open(path).unwrap().to_luma8();
+    let (w, h) = img.dimensions();
+    let mut input_img = Array2::<u8>::zeros((h as usize, w as usize));
+    for y in 0..h {
+        for x in 0..w {
+            input_img[[y as usize, x as usize]] = img.get_pixel(x, y)[0];
+        }
+    }
+    let mut extractor = Extractor::new();
+    let fixed_th = Some(10.0);
+    let res_full = extractor.extract_u8(
+        &input_img,
+        ExtractOptions {
+            image_th: fixed_th,
+            ..Default::default()
+        },
+    );
+    assert!(!res_full.centroids.is_empty(), "No centroids in full image");
+
+    for crop_config in [Some(tetra3::Crop::Center {
+        width: 512,
+        height: 512,
+    })] {
+        let options = ExtractOptions {
+            crop: crop_config.clone(),
+            image_th: fixed_th,
+            ..Default::default()
+        };
+        let res_crop = extractor.extract_u8(&input_img, options);
+        assert!(
+            !res_crop.centroids.is_empty(),
+            "No centroids in crop {:?}",
+            crop_config
+        );
+
+        // Calculate actual offsets used by Extractor
+        let (cw, ch) = (512, 512);
+        let ds = 2; // default
+        let h_adj = ((ch as f32 / ds as f32).ceil() as usize) * ds;
+        let w_adj = ((cw as f32 / ds as f32).ceil() as usize) * ds;
+        let final_offs_h = ((h as usize - h_adj) / 2).min(h as usize - h_adj);
+        let final_offs_w = ((w as usize - w_adj) / 2).min(w as usize - w_adj);
+
+        let buffer = 5.0; // Avoid stars that are partially clipped at the boundary
+        let x_min = final_offs_w as f64 + buffer;
+        let x_max = (final_offs_w + w_adj) as f64 - buffer;
+        let y_min = final_offs_h as f64 + buffer;
+        let y_max = (final_offs_h + h_adj) as f64 - buffer;
+
+        // Forward check: Every star from the full image that is safely inside the crop should be found
+        for c_full in &res_full.centroids {
+            if c_full.x >= x_min && c_full.x <= x_max && c_full.y >= y_min && c_full.y <= y_max {
+                let mut found = false;
+                for c_crop in &res_crop.centroids {
+                    let dist =
+                        ((c_crop.x - c_full.x).powi(2) + (c_crop.y - c_full.y).powi(2)).sqrt();
+                    if dist < 1.0 {
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(
+                    found,
+                    "Star at ({:.1}, {:.1}) from full image was inside crop {:?} but NOT found in crop result",
+                    c_full.x, c_full.y, crop_config
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1801,6 +1947,7 @@ fn test_benchmark_bg_sub_modes() {
     let iterations = 1000;
     let image_paths = get_test_images();
     let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];
+    let crops = [None, Some((512, 512))];
 
     let modes = [
         (Some(FastBgSubMode::GlobalMean), "GlobalMean"),
@@ -1813,60 +1960,64 @@ fn test_benchmark_bg_sub_modes() {
     ];
 
     for &ds in &downsamples {
-        println!("\n==============================================");
-        println!("Benchmarking Downsample: {:?}", ds);
-        println!("==============================================");
+        for &crop in &crops {
+            println!("\n==============================================");
+            println!("Benchmarking Downsample: {:?}, Crop: {:?}", ds, crop);
+            println!("==============================================");
 
-        // Use the first image for benchmarking to keep it consistent
-        let path = &image_paths[0];
-        let base_img = image::open(path).unwrap();
-        let (w, h) = base_img.dimensions();
+            // Use the first image for benchmarking to keep it consistent
+            let path = &image_paths[0];
+            let base_img = image::open(path).unwrap();
+            let (w, h) = base_img.dimensions();
 
-        let ds_factor = ds.factor() as u32;
-        let new_w = w - (w % ds_factor);
-        let new_h = h - (h % ds_factor);
+            let ds_factor = ds.factor() as u32;
+            let new_w = w - (w % ds_factor);
+            let new_h = h - (h % ds_factor);
 
-        let mut input_img = ndarray::Array2::<u8>::zeros((new_h as usize, new_w as usize));
-        let luma_img = base_img.to_luma8();
-        for y in 0..new_h {
-            for x in 0..new_w {
-                input_img[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
-            }
-        }
-
-        for (mode, mode_name) in &modes {
-            let options = FastExtractOptions {
-                downsample: ds,
-                bg_sub_mode: *mode,
-                sigma_mode: FastSigmaMode::GlobalRootSquare,
-                ..Default::default()
-            };
-
-            let mut extractor = FastExtractor::new(new_w as usize, new_h as usize, options.clone());
-
-            let mut total_time = Duration::ZERO;
-            for _ in 0..iterations {
-                let start = Instant::now();
-                let _res = extractor.extract(&input_img);
-                total_time += start.elapsed();
+            let mut input_img = ndarray::Array2::<u8>::zeros((new_h as usize, new_w as usize));
+            let luma_img = base_img.to_luma8();
+            for y in 0..new_h {
+                for x in 0..new_w {
+                    input_img[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
+                }
             }
 
-            let avg_time = total_time / iterations as u32;
-            println!("{:<15} -> Average Time: {:.2?}", mode_name, avg_time);
+            for (mode, mode_name) in &modes {
+                let options = FastExtractOptions {
+                    downsample: ds,
+                    bg_sub_mode: *mode,
+                    sigma_mode: FastSigmaMode::GlobalRootSquare,
+                    crop,
+                    ..Default::default()
+                };
 
-            // Also test sequential version
-            let mut extractor_seq = FastExtractor::new(new_w as usize, new_h as usize, options);
-            let mut total_time_seq = Duration::ZERO;
-            for _ in 0..iterations {
-                let start = Instant::now();
-                let _res = extractor_seq.extract_sequential(&input_img);
-                total_time_seq += start.elapsed();
+                let mut extractor =
+                    FastExtractor::new(new_w as usize, new_h as usize, options.clone());
+
+                let mut total_time = Duration::ZERO;
+                for _ in 0..iterations {
+                    let start = Instant::now();
+                    let _res = extractor.extract(&input_img);
+                    total_time += start.elapsed();
+                }
+
+                let avg_time = total_time / iterations as u32;
+                println!("{:<15} -> Average Time: {:.2?}", mode_name, avg_time);
+
+                // Also test sequential version
+                let mut extractor_seq = FastExtractor::new(new_w as usize, new_h as usize, options);
+                let mut total_time_seq = Duration::ZERO;
+                for _ in 0..iterations {
+                    let start = Instant::now();
+                    let _res = extractor_seq.extract_sequential(&input_img);
+                    total_time_seq += start.elapsed();
+                }
+                let avg_time_seq = total_time_seq / iterations as u32;
+                println!(
+                    "{:<15} -> Average Time (Sequential): {:.2?}",
+                    mode_name, avg_time_seq
+                );
             }
-            let avg_time_seq = total_time_seq / iterations as u32;
-            println!(
-                "{:<15} -> Average Time (Sequential): {:.2?}",
-                mode_name, avg_time_seq
-            );
         }
     }
 }

@@ -1200,6 +1200,7 @@ impl Extractor {
                 continue;
             }
 
+
             extracted.push(CentroidResult {
                 y: m1_y + 0.5,
                 x: m1_x + 0.5,
@@ -1848,6 +1849,7 @@ impl Extractor {
             {
                 continue;
             }
+
 
             extracted.push(CentroidResult {
                 y: m1_y + 0.5,
