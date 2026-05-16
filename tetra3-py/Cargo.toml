@@ -12,4 +12,3 @@ crate-type = ["cdylib", "rlib"]
 tetra3_core = { path = "../tetra3", package = "tetra3" }
 pyo3 = { version = "0.28.2" }
 numpy = "0.28"
-rayon = "1.11.0"
