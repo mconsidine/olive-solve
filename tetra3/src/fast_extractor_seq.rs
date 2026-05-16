@@ -23,17 +23,30 @@ impl FastExtractor {
     {
         debug_assert_eq!(
             input_image.dim(),
-            (self.height, self.width),
+            (self.orig_height, self.orig_width),
             "Input image dimensions must match the initialized FastExtractor dimensions."
         );
 
-        let src_slice = if let Some(s) = input_image.as_slice() {
-            s
+        let (crop_y, crop_x) = if let Some(_) = self.options.crop {
+            (
+                (self.orig_height.saturating_sub(self.height)) / 2,
+                (self.orig_width.saturating_sub(self.width)) / 2,
+            )
         } else {
+            (0, 0)
+        };
+
+        let src_slice = if self.options.crop.is_none() && input_image.is_standard_layout() {
+            input_image.as_slice().unwrap()
+        } else {
+            let cropped_view = input_image.slice(ndarray::s![
+                crop_y..crop_y + self.height,
+                crop_x..crop_x + self.width
+            ]);
             for (out_row, in_row) in self
                 .contiguous_u8
                 .chunks_exact_mut(self.width)
-                .zip(input_image.rows())
+                .zip(cropped_view.rows())
             {
                 out_row.copy_from_slice(in_row.as_slice().unwrap());
             }
@@ -42,7 +55,7 @@ impl FastExtractor {
 
         let ds = self.options.downsample.factor();
 
-        if ds > 1 {
+        let mut extracted = if ds > 1 {
             // =====================================================================================
             // DOWNSAMPLED PATH (Uses `u32` for accumulation, `i32` for processing)
             // =====================================================================================
@@ -736,7 +749,16 @@ impl FastExtractor {
                 &self.cw_wy,
                 &self.cw_strides,
             )
+        };
+        if let Some(_) = self.options.crop {
+            let offset_x = (self.orig_width.saturating_sub(self.width)) / 2;
+            let offset_y = (self.orig_height.saturating_sub(self.height)) / 2;
+            for r in &mut extracted {
+                r.x += offset_x as f64;
+                r.y += offset_y as f64;
+            }
         }
+        extracted
     }
 
     fn execute_erosion_and_extraction_sequential<T>(

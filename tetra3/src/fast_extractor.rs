@@ -60,6 +60,7 @@ pub struct FastExtractOptions {
     pub max_sum: Option<f64>,
     pub min_sum: Option<f64>,
     pub max_axis_ratio: Option<f64>,
+    pub crop: Option<(usize, usize)>,
 }
 
 impl Default for FastExtractOptions {
@@ -76,6 +77,7 @@ impl Default for FastExtractOptions {
             max_sum: None,
             min_sum: None,
             max_axis_ratio: None,
+            crop: None,
         }
     }
 }
@@ -93,6 +95,8 @@ pub struct FastCentroidResult {
 /// during continuous execution. It utilizes a highly specialized integer-only pipeline
 /// optimized specifically for zero-copy u8 inputs and integer downsampling.
 pub struct FastExtractor {
+    orig_width: usize,
+    orig_height: usize,
     // -------------------------------------------------------------------------
     // Dimensions & State
     // -------------------------------------------------------------------------
@@ -152,6 +156,12 @@ impl FastExtractor {
     /// Creates a fully pre-allocated extractor.
     /// Locks dimensions and options to allow for zero-allocation runtime and LUT generation.
     pub fn new(width: usize, height: usize, options: FastExtractOptions) -> Self {
+        let orig_width = width;
+        let orig_height = height;
+        let (width, height) = match options.crop {
+            Some((cw, ch)) => (cw.min(width), ch.min(height)),
+            None => (width, height),
+        };
         let total_pixels = width * height;
         let ds = options.downsample.factor();
         let out_width = width / ds;
@@ -206,6 +216,8 @@ impl FastExtractor {
         }
 
         Self {
+            orig_width,
+            orig_height,
             width,
             height,
             out_width,
@@ -239,20 +251,33 @@ impl FastExtractor {
     {
         debug_assert_eq!(
             input_image.dim(),
-            (self.height, self.width),
+            (self.orig_height, self.orig_width),
             "Input image dimensions must match the initialized FastExtractor dimensions."
         );
 
         // 1. Enforce Contiguous Memory for SIMD operations
         // Some operations require a flat slice. If the `ndarray` is already contiguous, we use
         // it directly (zero-copy). Otherwise, we flatten it into our pre-allocated vector.
-        let src_slice = if let Some(s) = input_image.as_slice() {
-            s
+        let (crop_y, crop_x) = if let Some(_) = self.options.crop {
+            (
+                (self.orig_height.saturating_sub(self.height)) / 2,
+                (self.orig_width.saturating_sub(self.width)) / 2,
+            )
         } else {
+            (0, 0)
+        };
+
+        let src_slice = if self.options.crop.is_none() && input_image.is_standard_layout() {
+            input_image.as_slice().unwrap()
+        } else {
+            let cropped_view = input_image.slice(ndarray::s![
+                crop_y..crop_y + self.height,
+                crop_x..crop_x + self.width
+            ]);
             for (out_row, in_row) in self
                 .contiguous_u8
                 .chunks_exact_mut(self.width)
-                .zip(input_image.rows())
+                .zip(cropped_view.rows())
             {
                 out_row.copy_from_slice(in_row.as_slice().unwrap());
             }
@@ -261,7 +286,7 @@ impl FastExtractor {
 
         let ds = self.options.downsample.factor();
 
-        if ds > 1 {
+        let mut results = if ds > 1 {
             // =====================================================================================
             // DOWNSAMPLED PATH (Uses `u32` for accumulation, `i32` for processing)
             // =====================================================================================
@@ -888,7 +913,16 @@ impl FastExtractor {
                 &self.cw_wy,
                 &self.cw_strides,
             )
+        };
+        if let Some(_) = self.options.crop {
+            let offset_x = (self.orig_width.saturating_sub(self.width)) / 2;
+            let offset_y = (self.orig_height.saturating_sub(self.height)) / 2;
+            for r in &mut results {
+                r.x += offset_x as f64;
+                r.y += offset_y as f64;
+            }
         }
+        results
     }
 
     /// Generics-driven logic executor to seamlessly support `i16` and `i32` fixed point pipelines.

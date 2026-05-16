@@ -1894,6 +1894,7 @@ fn test_fast_extractor_accuracy() {
             Some(tetra3::extractor::BgSubMode::GlobalMedian),
         ),
     ];
+    let crops = [None, Some((512, 512))];
 
     for path in &test_imgs {
         let base_img = image::open(path).unwrap();
@@ -1910,119 +1911,129 @@ fn test_fast_extractor_accuracy() {
         for &ds in &downsamples {
             for &sig in &sigma_modes {
                 for &(fast_bg, base_bg) in &bg_modes {
-                    let base_sig = match sig {
-                        FastSigmaMode::GlobalRootSquare => {
-                            tetra3::extractor::SigmaMode::GlobalRootSquare
-                        }
-                        FastSigmaMode::GlobalMedianAbs => {
-                            tetra3::extractor::SigmaMode::GlobalMedianAbs
-                        }
-                    };
+                    for &crop_val in &crops {
+                        let base_sig = match sig {
+                            FastSigmaMode::GlobalRootSquare => {
+                                tetra3::extractor::SigmaMode::GlobalRootSquare
+                            }
+                            FastSigmaMode::GlobalMedianAbs => {
+                                tetra3::extractor::SigmaMode::GlobalMedianAbs
+                            }
+                        };
 
-                    let base_options = tetra3::ExtractOptions {
-                        downsample: Some(ds.factor()),
-                        bg_sub_mode: base_bg,
-                        sigma_mode: base_sig,
-                        ..Default::default()
-                    };
+                        let base_crop = crop_val.map(|(cw, ch)| tetra3::Crop::Center {
+                            width: cw,
+                            height: ch,
+                        });
 
-                    let fast_options = FastExtractOptions {
-                        downsample: ds,
-                        bg_sub_mode: fast_bg,
-                        sigma_mode: sig,
-                        ..Default::default()
-                    };
+                        let base_options = tetra3::ExtractOptions {
+                            downsample: Some(ds.factor()),
+                            bg_sub_mode: base_bg,
+                            sigma_mode: base_sig,
+                            crop: base_crop,
+                            ..Default::default()
+                        };
 
-                    let mut base_extractor = tetra3::extractor::Extractor::new();
-                    let base_res = base_extractor.extract_u8(&input_img, base_options.clone());
+                        let fast_options = FastExtractOptions {
+                            downsample: ds,
+                            bg_sub_mode: fast_bg,
+                            sigma_mode: sig,
+                            crop: crop_val,
+                            ..Default::default()
+                        };
 
-                    let mut fast_extractor =
-                        FastExtractor::new(w as usize, h as usize, fast_options.clone());
-                    let fast_res = fast_extractor.extract(&input_img);
+                        let mut base_extractor = tetra3::extractor::Extractor::new();
+                        let base_res = base_extractor.extract_u8(&input_img, base_options.clone());
 
-                    let mut fast_extractor_seq =
-                        FastExtractor::new(w as usize, h as usize, fast_options.clone());
-                    let fast_res_seq = fast_extractor_seq.extract_sequential(&input_img);
+                        let mut fast_extractor =
+                            FastExtractor::new(w as usize, h as usize, fast_options.clone());
+                        let fast_res = fast_extractor.extract(&input_img);
 
-                    let mut b_sorted = base_res.centroids.clone();
-                    b_sorted.sort_by(|a, b| {
-                        a.y.partial_cmp(&b.y)
-                            .unwrap()
-                            .then(a.x.partial_cmp(&b.x).unwrap())
-                    });
+                        let mut fast_extractor_seq =
+                            FastExtractor::new(w as usize, h as usize, fast_options.clone());
+                        let fast_res_seq = fast_extractor_seq.extract_sequential(&input_img);
 
-                    let mut f_sorted = fast_res.clone();
-                    f_sorted.sort_by(|a, b| {
-                        a.y.partial_cmp(&b.y)
-                            .unwrap()
-                            .then(a.x.partial_cmp(&b.x).unwrap())
-                    });
+                        let mut b_sorted = base_res.centroids.clone();
+                        b_sorted.sort_by(|a, b| {
+                            a.y.partial_cmp(&b.y)
+                                .unwrap()
+                                .then(a.x.partial_cmp(&b.x).unwrap())
+                        });
 
-                    assert_eq!(
-                        base_res.centroids.len(),
-                        fast_res.len(),
-                        "Mismatch in number of centroids extracted for {:?}",
-                        path
-                    );
+                        let mut f_sorted = fast_res.clone();
+                        f_sorted.sort_by(|a, b| {
+                            a.y.partial_cmp(&b.y)
+                                .unwrap()
+                                .then(a.x.partial_cmp(&b.x).unwrap())
+                        });
 
-                    // Ensure parallel fast extraction aligns with base extractor 100%
-                    let mut matched_fast = 0;
-                    for b in &base_res.centroids {
-                        for f in &fast_res {
-                            let dist = ((b.x - f.x).powi(2) + (b.y - f.y).powi(2)).sqrt();
-                            if dist < 0.5 {
-                                // Fairly strict tolerance
-                                assert!(
-                                    (b.sum - f.sum).abs() < 1.0,
-                                    "Sum mismatch: Base {:.3} vs Fast {:.3} (img: {:?}, ds: {:?}, bg: {:?}, sig: {:?})",
-                                    b.sum,
-                                    f.sum,
-                                    path,
-                                    ds,
-                                    fast_bg,
-                                    sig
-                                );
-                                assert_eq!(
-                                    b.area, f.area,
-                                    "Area mismatch: Base {} vs Fast {} (img: {:?}, ds: {:?}, bg: {:?}, sig: {:?})",
-                                    b.area, f.area, path, ds, fast_bg, sig
-                                );
-                                matched_fast += 1;
-                                break;
+                        assert_eq!(
+                            base_res.centroids.len(),
+                            fast_res.len(),
+                            "Mismatch in number of centroids extracted for {:?}",
+                            path
+                        );
+
+                        // Ensure parallel fast extraction aligns with base extractor 100%
+                        let mut matched_fast = 0;
+                        for b in &base_res.centroids {
+                            for f in &fast_res {
+                                let dist = ((b.x - f.x).powi(2) + (b.y - f.y).powi(2)).sqrt();
+                                if dist < 0.5 {
+                                    // Fairly strict tolerance
+                                    assert!(
+                                        (b.sum - f.sum).abs() < 1.0,
+                                        "Sum mismatch: Base {:.3} vs Fast {:.3} (img: {:?}, ds: {:?}, bg: {:?}, sig: {:?})",
+                                        b.sum,
+                                        f.sum,
+                                        path,
+                                        ds,
+                                        fast_bg,
+                                        sig
+                                    );
+                                    assert_eq!(
+                                        b.area, f.area,
+                                        "Area mismatch: Base {} vs Fast {} (img: {:?}, ds: {:?}, bg: {:?}, sig: {:?})",
+                                        b.area, f.area, path, ds, fast_bg, sig
+                                    );
+                                    matched_fast += 1;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    assert_eq!(
-                        matched_fast,
-                        base_res.centroids.len(),
-                        "Parallel FastExtractor failed to match Base Extractor exactly for {:?}",
-                        path
-                    );
+                        assert_eq!(
+                            matched_fast,
+                            base_res.centroids.len(),
+                            "Parallel FastExtractor failed to match Base Extractor exactly for {:?}",
+                            path
+                        );
 
-                    // For sequential (which uses row-skipping and is therefore an approximation),
-                    // we verify that at least 95% of the base centroids were found within 1.5 pixels.
-                    if b_sorted.len() == 0 {
-                        continue;
-                    }
+                        // For sequential (which uses row-skipping and is therefore an approximation),
+                        // we verify that at least 95% of the base centroids were found within 1.5 pixels.
+                        if b_sorted.len() == 0 {
+                            continue;
+                        }
 
-                    let mut matched = 0;
-                    for b in &base_res.centroids {
-                        for f_seq in &fast_res_seq {
-                            let dist = ((b.x - f_seq.x).powi(2) + (b.y - f_seq.y).powi(2)).sqrt();
-                            if dist < 1.5 {
-                                matched += 1;
-                                break;
+                        let mut matched = 0;
+                        for b in &base_res.centroids {
+                            for f_seq in &fast_res_seq {
+                                let dist =
+                                    ((b.x - f_seq.x).powi(2) + (b.y - f_seq.y).powi(2)).sqrt();
+                                if dist < 1.5 {
+                                    matched += 1;
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    let match_rate = matched as f64 / b_sorted.len().max(1) as f64;
-                    assert!(
-                        match_rate >= 0.95,
-                        "Sequential approximation matched only {:.1}% of centroids (required 95%) for {:?}",
-                        match_rate * 100.0,
-                        path
-                    );
+                        let match_rate = matched as f64 / b_sorted.len().max(1) as f64;
+                        assert!(
+                            match_rate >= 0.95,
+                            "Sequential approximation matched only {:.1}% of centroids (required 95%) for {:?}",
+                            match_rate * 100.0,
+                            path
+                        );
+                    }
                 }
             }
         }
