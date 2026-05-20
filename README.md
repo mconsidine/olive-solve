@@ -2,14 +2,21 @@
 
 A fast, robust, and async-friendly Rust implementation and optimization of the [cedar-solve](https://github.com/smroid/cedar-solve) centroid extraction and plate solving algorithms. 
 
-## Unique Extractor Features
+## Unique Features
 
 This project is not just a straight port of the upstream Python logic. It introduces several performance optimizations and unique extraction features designed for constrained hardware and specific sensor characteristics:
+
+### Extractor
 
 * **Optimized `u8` Pipelines**: Highly optimized processing pipelines tailored specifically for 8-bit grayscale images, minimizing memory overhead and bandwidth.
 * **Fast Extractor Implementation**: Leverages aggressive pre-allocation and `rayon`-based multi-threading for increased performance across a subset of supported extraction modes.
 * **Sequential Fast Extractor**: An alternative sequential path that trades a negligible amount of accuracy for much faster single-threaded performance.
 * **Hybrid Background Subtraction Modes**: Includes custom `Line Median` and `Block Median` background subtraction modes. These act as high-performance compromises between the fast (but less accurate) `Global Median` and the highly accurate (but computationally expensive) `Local Median` modes. *Note: `Line Median` is specifically designed to excel at handling cameras that exhibit horizontal banding noise.*
+
+### Solver
+
+* **Database Support**: Supports both `tetra3` and `cedar-solve` database formats.
+* **Performance**: Blazingly fast single-threaded performance - centroids generated from clean images typically solve in under 1ms on a Raspberry Pi Zero 2W.
 
 ## Repository Structure
 
