@@ -1,16 +1,13 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
+// Copyright (c) 2026 Omair Kamil
 //
 // This file is a derivative work, inspired from `tetra3.py` of the cedar-solve and
 // esa/tetra3 projects. This file has major optimizations of algorithms in those
 // works with additional original computational logic.
 //
-// The original underlying code is licensed under the Apache License, Version 2.0.
-// Original Copyright (c) European Space Agency, Steven Rosenthal, and contributors.
-//
-// This derivative work is licensed under the PolyForm Small Buisness License 1.0.0.
-// You may not use this file except in compliance with the PolyForm Small Business
-// License 1.0.0. A copy of the License is located in the LICENSE.md file in the
-// root of this repository.
+// This derivative work is licensed under the Apache License, Version 2.0 (the
+// "License"). You may not use this file except in compliance with the License.
+// A copy of the License is located in the LICENSE.md file in the root of this
+// repository.
 //
 impl FastExtractor {
     /// Sequential version of the extractor that trades some accuract for single-threaded performance.

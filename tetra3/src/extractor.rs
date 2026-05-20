@@ -1,14 +1,15 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
+// Copyright (c) 2026 Omair Kamil
 //
-// This file is a derivative work - a port to Rust with heavy performance
-// optimizations from `tetra3.py` of the cedar-solve and esa/tetra3 projects.
-// The original underlying code is licensed under the Apache License, Version 2.0.
-// Original Copyright (c) European Space Agency, Steven Rosenthal, and contributors.
+// This file is a derivative work - a Python interface to the optimized Rust port
+// of the cedar-solve and esa/tetra3 projects. The original underlying code is
+// licensed under the Apache License, Version 2.0.
+// Original Copyright (c) European Space Agency, Steven Rosenthal, brownj4, and
+// contributors.
 //
-// This derivative work is licensed under the PolyForm Small Buisness License 1.0.0.
-// You may not use this file except in compliance with the PolyForm Small Business
-// License 1.0.0. A copy of the License is located in the LICENSE.md file in the
-// root of this repository.
+// This derivative work is licensed under the Apache License, Version 2.0 (the
+// "License"). You may not use this file except in compliance with the License.
+// A copy of the License is located in the LICENSE.md file in the root of this
+// repository.
 //
 // Cedar Solve license:
 //    Copyright 2023 Steven Rosenthal smr@dt3.org
