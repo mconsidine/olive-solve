@@ -110,5 +110,3 @@ Runs both extraction and plate solving in one uninterrupted, native pipeline.
 ---
 
 *Copyright (c) 2026 Omair Kamil. See the root LICENSE file for terms.*
-
-```
