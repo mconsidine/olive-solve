@@ -177,15 +177,7 @@ impl PyTetra3 {
             PyTuple::new(py, elements)?.into_any()
         } else {
             // Default: just [y, x] centroids
-            let mut cents = Vec::with_capacity(num_centroids * 2);
-            for c in &result.centroids {
-                cents.push(c.y);
-                cents.push(c.x);
-            }
-            let py_cents = numpy::PyArray1::from_slice(py, &cents)
-                .reshape([num_centroids, 2])
-                .unwrap();
-            py_cents.into_any()
+            centroids_to_numpy(py, &result.centroids)
         };
 
         // 5. If return_images is requested, wrap the core_result in another tuple with the image dictionary
@@ -211,6 +203,39 @@ impl PyTetra3 {
             // Return: core_results directly
             Ok(core_result)
         }
+    }
+
+    /// Extracts centroids from a 2D NumPy array using the fast sequential path.
+    /// Supports both u8 and f32 images.
+    #[pyo3(signature = (image, **kwargs))]
+    fn get_centroids_from_image_fast<'py>(
+        &self,
+        py: Python<'py>,
+        image: Bound<'py, PyAny>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = parse_extract_options(kwargs)?;
+
+        // Try extracting as u8 first, then f32
+        let result = if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
+            let img_view = img_u8.as_array();
+            py.detach(|| {
+                let mut inner = self.inner.lock().unwrap();
+                inner.get_centroids_from_image_fast(&img_view, options)
+            })
+        } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
+            let img_view = img_f32.as_array();
+            py.detach(|| {
+                let mut inner = self.inner.lock().unwrap();
+                inner.get_centroids_from_image_fast(&img_view, options)
+            })
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Image must be a 2D NumPy array of u8 or f32",
+            ));
+        };
+
+        Ok(centroids_to_numpy(py, &result.centroids))
     }
 
     /// Runs plate solving from pre-extracted centroids.
@@ -271,68 +296,48 @@ impl PyTetra3 {
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
-        let out_dict = PyDict::new(py);
+        let out_dict = solution_to_dict(py, solution, None)?;
 
-        // Base coordinate properties
-        out_dict.set_item("RA", solution.ra)?;
-        out_dict.set_item("Dec", solution.dec)?;
-        out_dict.set_item("Roll", solution.roll)?;
-        out_dict.set_item("FOV", solution.fov)?;
-        out_dict.set_item("distortion", solution.distortion)?;
+        Ok(out_dict)
+    }
 
-        // Metrics and statistics
-        out_dict.set_item("RMSE", solution.rmse)?;
-        out_dict.set_item("P90E", solution.p90e)?;
-        out_dict.set_item("MAXE", solution.maxe)?;
-        out_dict.set_item("Matches", solution.matches)?;
-        out_dict.set_item("Prob", solution.prob)?;
-        out_dict.set_item("is_mirrored", solution.is_mirrored)?;
+    /// Runs extraction and plate solving in one uninterrupted pipeline using the fast path.
+    /// Returns a dictionary containing the solution and execution times.
+    #[pyo3(signature = (image, **kwargs))]
+    fn solve_from_image_fast<'py>(
+        &self,
+        py: Python<'py>,
+        image: Bound<'py, PyAny>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let extract_options = parse_extract_options(kwargs)?;
+        let solve_options = parse_solve_options(kwargs)?;
 
-        // Epochs & Status
-        out_dict.set_item("epoch_equinox", solution.epoch_equinox)?;
-        out_dict.set_item("epoch_proper_motion", solution.epoch_proper_motion)?;
-        out_dict.set_item("status", format!("{:?}", solution.status))?;
+        let (solution, ext_time) =
+            if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
+                let img_view = img_u8.as_array();
+                py.detach(|| {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner
+                        .solve_from_image_fast(&img_view, extract_options, solve_options)
+                        .map_err(|e| e.to_string())
+                })
+            } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
+                let img_view = img_f32.as_array();
+                py.detach(|| {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner
+                        .solve_from_image_fast(&img_view, extract_options, solve_options)
+                        .map_err(|e| e.to_string())
+                })
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "Image must be a 2D NumPy array of u8 or f32",
+                ));
+            }
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
-        // Timings
-        out_dict.set_item("T_solve", solution.t_solve_ms)?;
-
-        // Target mapping (Vecs map naturally to Python lists via PyO3)
-        if let Some(target_ra) = solution.target_ra {
-            out_dict.set_item("RA_target", target_ra)?;
-        }
-        if let Some(target_dec) = solution.target_dec {
-            out_dict.set_item("Dec_target", target_dec)?;
-        }
-        if let Some(target_y) = solution.target_y {
-            out_dict.set_item("y_target", target_y)?;
-        }
-        if let Some(target_x) = solution.target_x {
-            out_dict.set_item("x_target", target_x)?;
-        }
-
-        // Star structures mapped to lists
-        if let Some(matched_centroids) = solution.matched_centroids {
-            out_dict.set_item("matched_centroids", matched_centroids)?;
-        }
-        if let Some(matched_stars) = solution.matched_stars {
-            out_dict.set_item("matched_stars", matched_stars)?;
-        }
-        if let Some(matched_cat_id) = solution.matched_cat_id {
-            out_dict.set_item("matched_catID", matched_cat_id)?;
-        }
-        if let Some(catalog_stars) = solution.catalog_stars {
-            out_dict.set_item("catalog_stars", catalog_stars)?;
-        }
-
-        if let Some(rm) = solution.rotation_matrix {
-            let flat_slice = rm.as_slice().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("Matrix not contiguous")
-            })?;
-            let py_matrix = numpy::PyArray1::from_slice(py, flat_slice)
-                .reshape([3, 3])
-                .unwrap();
-            out_dict.set_item("rotation_matrix", py_matrix)?;
-        }
+        let out_dict = solution_to_dict(py, solution, Some(ext_time))?;
 
         Ok(out_dict)
     }
@@ -360,75 +365,103 @@ impl PyTetra3 {
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
-        let out_dict = PyDict::new(py);
-
-        // Base coordinate properties
-        out_dict.set_item("RA", solution.ra)?;
-        out_dict.set_item("Dec", solution.dec)?;
-        out_dict.set_item("Roll", solution.roll)?;
-        out_dict.set_item("FOV", solution.fov)?;
-        out_dict.set_item("distortion", solution.distortion)?;
-
-        // Metrics and statistics
-        out_dict.set_item("RMSE", solution.rmse)?;
-        out_dict.set_item("P90E", solution.p90e)?;
-        out_dict.set_item("MAXE", solution.maxe)?;
-        out_dict.set_item("Matches", solution.matches)?;
-        out_dict.set_item("Prob", solution.prob)?;
-        out_dict.set_item("is_mirrored", solution.is_mirrored)?;
-
-        // Epochs & Status
-        out_dict.set_item("epoch_equinox", solution.epoch_equinox)?;
-        out_dict.set_item("epoch_proper_motion", solution.epoch_proper_motion)?;
-        out_dict.set_item("status", format!("{:?}", solution.status))?;
-
-        // Timings
-        out_dict.set_item("T_extract", ext_time)?;
-        out_dict.set_item("T_solve", solution.t_solve_ms)?;
-
-        // Target mapping (Vecs map naturally to Python lists via PyO3)
-        if let Some(target_ra) = solution.target_ra {
-            out_dict.set_item("RA_target", target_ra)?;
-        }
-        if let Some(target_dec) = solution.target_dec {
-            out_dict.set_item("Dec_target", target_dec)?;
-        }
-        if let Some(target_y) = solution.target_y {
-            out_dict.set_item("y_target", target_y)?;
-        }
-        if let Some(target_x) = solution.target_x {
-            out_dict.set_item("x_target", target_x)?;
-        }
-
-        // Star structures mapped to lists
-        if let Some(matched_centroids) = solution.matched_centroids {
-            out_dict.set_item("matched_centroids", matched_centroids)?;
-        }
-        if let Some(matched_stars) = solution.matched_stars {
-            out_dict.set_item("matched_stars", matched_stars)?;
-        }
-        if let Some(matched_cat_id) = solution.matched_cat_id {
-            out_dict.set_item("matched_catID", matched_cat_id)?;
-        }
-        if let Some(catalog_stars) = solution.catalog_stars {
-            out_dict.set_item("catalog_stars", catalog_stars)?;
-        }
-
-        if let Some(rm) = solution.rotation_matrix {
-            let flat_slice = rm.as_slice().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("Matrix not contiguous")
-            })?;
-            let py_matrix = numpy::PyArray1::from_slice(py, flat_slice)
-                .reshape([3, 3])
-                .unwrap();
-            out_dict.set_item("rotation_matrix", py_matrix)?;
-        }
+        let out_dict = solution_to_dict(py, solution, Some(ext_time))?;
 
         Ok(out_dict)
     }
 }
 
 // --- Helper Functions to Map Python kwargs to Rust Structs ---
+
+fn centroids_to_numpy<'py>(
+    py: Python<'py>,
+    centroids: &[tetra3_core::extractor::CentroidResult],
+) -> Bound<'py, pyo3::types::PyAny> {
+    let num_centroids = centroids.len();
+    let mut cents = Vec::with_capacity(num_centroids * 2);
+    for c in centroids {
+        cents.push(c.y);
+        cents.push(c.x);
+    }
+    numpy::PyArray1::from_slice(py, &cents)
+        .reshape([num_centroids, 2])
+        .unwrap()
+        .into_any()
+}
+
+fn solution_to_dict<'py>(
+    py: Python<'py>,
+    solution: tetra3_core::solver::Solution,
+    ext_time: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out_dict = PyDict::new(py);
+
+    // Base coordinate properties
+    out_dict.set_item("RA", solution.ra)?;
+    out_dict.set_item("Dec", solution.dec)?;
+    out_dict.set_item("Roll", solution.roll)?;
+    out_dict.set_item("FOV", solution.fov)?;
+    out_dict.set_item("distortion", solution.distortion)?;
+
+    // Metrics and statistics
+    out_dict.set_item("RMSE", solution.rmse)?;
+    out_dict.set_item("P90E", solution.p90e)?;
+    out_dict.set_item("MAXE", solution.maxe)?;
+    out_dict.set_item("Matches", solution.matches)?;
+    out_dict.set_item("Prob", solution.prob)?;
+    out_dict.set_item("is_mirrored", solution.is_mirrored)?;
+
+    // Epochs & Status
+    out_dict.set_item("epoch_equinox", solution.epoch_equinox)?;
+    out_dict.set_item("epoch_proper_motion", solution.epoch_proper_motion)?;
+    out_dict.set_item("status", format!("{:?}", solution.status))?;
+
+    // Timings
+    if let Some(et) = ext_time {
+        out_dict.set_item("T_extract", et)?;
+    }
+    out_dict.set_item("T_solve", solution.t_solve_ms)?;
+
+    // Target mapping (Vecs map naturally to Python lists via PyO3)
+    if let Some(target_ra) = solution.target_ra {
+        out_dict.set_item("RA_target", target_ra)?;
+    }
+    if let Some(target_dec) = solution.target_dec {
+        out_dict.set_item("Dec_target", target_dec)?;
+    }
+    if let Some(target_y) = solution.target_y {
+        out_dict.set_item("y_target", target_y)?;
+    }
+    if let Some(target_x) = solution.target_x {
+        out_dict.set_item("x_target", target_x)?;
+    }
+
+    // Star structures mapped to lists
+    if let Some(matched_centroids) = solution.matched_centroids {
+        out_dict.set_item("matched_centroids", matched_centroids)?;
+    }
+    if let Some(matched_stars) = solution.matched_stars {
+        out_dict.set_item("matched_stars", matched_stars)?;
+    }
+    if let Some(matched_cat_id) = solution.matched_cat_id {
+        out_dict.set_item("matched_catID", matched_cat_id)?;
+    }
+    if let Some(catalog_stars) = solution.catalog_stars {
+        out_dict.set_item("catalog_stars", catalog_stars)?;
+    }
+
+    if let Some(rm) = solution.rotation_matrix {
+        let flat_slice = rm
+            .as_slice()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Matrix not contiguous"))?;
+        let py_matrix = numpy::PyArray1::from_slice(py, flat_slice)
+            .reshape([3, 3])
+            .unwrap();
+        out_dict.set_item("rotation_matrix", py_matrix)?;
+    }
+
+    Ok(out_dict)
+}
 
 fn parse_extract_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<ExtractOptions> {
     let mut options = ExtractOptions::default();

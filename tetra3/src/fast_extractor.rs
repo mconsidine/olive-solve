@@ -44,7 +44,7 @@ pub enum FastSigmaMode {
     GlobalRootSquare,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FastExtractOptions {
     pub sigma: f32,
     pub downsample: FastDownsample,
@@ -150,6 +150,18 @@ pub struct FastExtractor {
 }
 
 impl FastExtractor {
+    pub fn options(&self) -> &FastExtractOptions {
+        &self.options
+    }
+
+    pub fn orig_width(&self) -> usize {
+        self.orig_width
+    }
+
+    pub fn orig_height(&self) -> usize {
+        self.orig_height
+    }
+
     /// Creates a fully pre-allocated extractor.
     /// Locks dimensions and options to allow for zero-allocation runtime and LUT generation.
     pub fn new(width: usize, height: usize, options: FastExtractOptions) -> Self {
@@ -252,9 +264,6 @@ impl FastExtractor {
             "Input image dimensions must match the initialized FastExtractor dimensions."
         );
 
-        // 1. Enforce Contiguous Memory for SIMD operations
-        // Some operations require a flat slice. If the `ndarray` is already contiguous, we use
-        // it directly (zero-copy). Otherwise, we flatten it into our pre-allocated vector.
         let (crop_y, crop_x) = if let Some(_) = self.options.crop {
             (
                 (self.orig_height.saturating_sub(self.height)) / 2,
@@ -264,8 +273,9 @@ impl FastExtractor {
             (0, 0)
         };
 
-        let src_slice = if self.options.crop.is_none() && input_image.is_standard_layout() {
-            input_image.as_slice().unwrap()
+        if self.options.crop.is_none() && input_image.is_standard_layout() {
+            let src_slice = input_image.as_slice().unwrap();
+            self.extract_core(src_slice)
         } else {
             let cropped_view = input_image.slice(ndarray::s![
                 crop_y..crop_y + self.height,
@@ -276,11 +286,84 @@ impl FastExtractor {
                 .chunks_exact_mut(self.width)
                 .zip(cropped_view.rows())
             {
-                out_row.copy_from_slice(in_row.as_slice().unwrap());
+                if let Some(slice) = in_row.as_slice() {
+                    out_row.copy_from_slice(slice);
+                } else {
+                    for (o, &i) in out_row.iter_mut().zip(in_row.iter()) {
+                        *o = i;
+                    }
+                }
             }
-            &self.contiguous_u8
+            self.extract_from_internal()
+        }
+    }
+
+    /// Parallel version of the extractor for f32 input images.
+    /// Performs an extremely fast parallel conversion to u8 internally.
+    pub fn extract_f32<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> Vec<FastCentroidResult>
+    where
+        S: Data<Elem = f32>,
+    {
+        debug_assert_eq!(
+            input_image.dim(),
+            (self.orig_height, self.orig_width),
+            "Input image dimensions must match the initialized FastExtractor dimensions."
+        );
+
+        let (crop_y, crop_x) = if let Some(_) = self.options.crop {
+            (
+                (self.orig_height.saturating_sub(self.height)) / 2,
+                (self.orig_width.saturating_sub(self.width)) / 2,
+            )
+        } else {
+            (0, 0)
         };
 
+        let cropped_view = input_image.slice(ndarray::s![
+            crop_y..crop_y + self.height,
+            crop_x..crop_x + self.width
+        ]);
+
+        // Parallel fused conversion and copy
+        let width = self.width;
+        if let Some(s) = cropped_view.as_slice() {
+            self.contiguous_u8
+                .par_chunks_exact_mut(width)
+                .zip(s.par_chunks_exact(width))
+                .for_each(|(out_row, in_row)| {
+                    for (o, &i) in out_row.iter_mut().zip(in_row.iter()) {
+                        *o = i as u8;
+                    }
+                });
+        } else {
+            self.contiguous_u8
+                .par_chunks_exact_mut(width)
+                .enumerate()
+                .for_each(|(y, out_row)| {
+                    let in_row = cropped_view.row(y);
+                    if let Some(slice) = in_row.as_slice() {
+                        for (o, &i) in out_row.iter_mut().zip(slice.iter()) {
+                            *o = i as u8;
+                        }
+                    } else {
+                        for (o, &i) in out_row.iter_mut().zip(in_row.iter()) {
+                            *o = i as u8;
+                        }
+                    }
+                });
+        }
+
+        self.extract_from_internal()
+    }
+
+    fn extract_from_internal(&mut self) -> Vec<FastCentroidResult> {
+        let ptr = self.contiguous_u8.as_ptr();
+        let len = self.contiguous_u8.len();
+        let src_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        self.extract_core(src_slice)
+    }
+
+    fn extract_core(&mut self, src_slice: &[u8]) -> Vec<FastCentroidResult> {
         let ds = self.options.downsample.factor();
 
         let mut results = if ds > 1 {

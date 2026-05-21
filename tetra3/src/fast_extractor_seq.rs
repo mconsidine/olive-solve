@@ -9,6 +9,7 @@
 // A copy of the License is located in the LICENSE.md file in the root of this
 // repository.
 //
+
 impl FastExtractor {
     /// Sequential version of the extractor that trades some accuract for single-threaded performance.
     pub fn extract_sequential<S>(
@@ -33,8 +34,9 @@ impl FastExtractor {
             (0, 0)
         };
 
-        let src_slice = if self.options.crop.is_none() && input_image.is_standard_layout() {
-            input_image.as_slice().unwrap()
+        if self.options.crop.is_none() && input_image.is_standard_layout() {
+            let src_slice = input_image.as_slice().unwrap();
+            self.extract_sequential_core(src_slice)
         } else {
             let cropped_view = input_image.slice(ndarray::s![
                 crop_y..crop_y + self.height,
@@ -45,11 +47,88 @@ impl FastExtractor {
                 .chunks_exact_mut(self.width)
                 .zip(cropped_view.rows())
             {
-                out_row.copy_from_slice(in_row.as_slice().unwrap());
+                if let Some(slice) = in_row.as_slice() {
+                    out_row.copy_from_slice(slice);
+                } else {
+                    for (o, &i) in out_row.iter_mut().zip(in_row.iter()) {
+                        *o = i;
+                    }
+                }
             }
-            &self.contiguous_u8
+            // Use a pointer-based approach or just copy the logic to avoid borrow conflict
+            // But extract_sequential_core only uses src_slice once.
+            // Let's just inline it or use a trick.
+            // A simple trick: use an unsafe slice to bypass the borrow checker if we know it's safe.
+            // Or better, just don't pass the slice if it's the internal one.
+            self.extract_sequential_from_internal()
+        }
+    }
+
+    /// Sequential version of the extractor for f32 input images.
+    /// Performs an extremely fast conversion to u8 internally.
+    pub fn extract_sequential_f32<S>(
+        &mut self,
+        input_image: &ArrayBase<S, Ix2>,
+    ) -> Vec<FastCentroidResult>
+    where
+        S: Data<Elem = f32>,
+    {
+        debug_assert_eq!(
+            input_image.dim(),
+            (self.orig_height, self.orig_width),
+            "Input image dimensions must match the initialized FastExtractor dimensions."
+        );
+
+        let (crop_y, crop_x) = if let Some(_) = self.options.crop {
+            (
+                (self.orig_height.saturating_sub(self.height)) / 2,
+                (self.orig_width.saturating_sub(self.width)) / 2,
+            )
+        } else {
+            (0, 0)
         };
 
+        let cropped_view = input_image.slice(ndarray::s![
+            crop_y..crop_y + self.height,
+            crop_x..crop_x + self.width
+        ]);
+
+        if let Some(s) = cropped_view.as_slice() {
+            // Bulk cast is auto-vectorized by LLVM
+            for (o, &i) in self.contiguous_u8.iter_mut().zip(s.iter()) {
+                *o = i as u8;
+            }
+        } else {
+            for (out_row, in_row) in self
+                .contiguous_u8
+                .chunks_exact_mut(self.width)
+                .zip(cropped_view.rows())
+            {
+                if let Some(slice) = in_row.as_slice() {
+                    for (o, &i) in out_row.iter_mut().zip(slice.iter()) {
+                        *o = i as u8;
+                    }
+                } else {
+                    for (o, &i) in out_row.iter_mut().zip(in_row.iter()) {
+                        *o = i as u8;
+                    }
+                }
+            }
+        }
+
+        self.extract_sequential_from_internal()
+    }
+
+    fn extract_sequential_from_internal(&mut self) -> Vec<FastCentroidResult> {
+        // Use a temporary swap or just access field directly in core logic
+        // To keep code clean, I'll use a pointer trick since I know I won't reallocate contiguous_u8.
+        let ptr = self.contiguous_u8.as_ptr();
+        let len = self.contiguous_u8.len();
+        let src_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        self.extract_sequential_core(src_slice)
+    }
+
+    fn extract_sequential_core(&mut self, src_slice: &[u8]) -> Vec<FastCentroidResult> {
         let ds = self.options.downsample.factor();
 
         let mut extracted = if ds > 1 {

@@ -2190,3 +2190,91 @@ fn test_fast_extractor_accuracy() {
         }
     }
 }
+
+#[test]
+fn test_non_contiguous_and_crops_no_panic() {
+    init_rayon_thread_pool();
+    let mut extractor = tetra3::extractor::Extractor::new();
+
+    // Create a 100x100 f32 image and u8 image
+    let mut img_f32 = ndarray::Array2::<f32>::zeros((100, 100));
+    let mut img_u8 = ndarray::Array2::<u8>::zeros((100, 100));
+
+    // Add some spots so there's data to extract
+    img_f32[[50, 50]] = 255.0;
+    img_u8[[50, 50]] = 255;
+
+    let options = tetra3::ExtractOptions {
+        downsample: Some(2),
+        crop: Some(tetra3::extractor::Crop::Center {
+            height: 80,
+            width: 80,
+        }),
+        ..Default::default()
+    };
+
+    let fast_options = tetra3::fast_extractor::FastExtractOptions {
+        downsample: tetra3::fast_extractor::FastDownsample::X2,
+        bg_sub_mode: Some(tetra3::fast_extractor::FastBgSubMode::GlobalMedian),
+        sigma_mode: tetra3::fast_extractor::FastSigmaMode::GlobalMedianAbs,
+        crop: Some((80, 80)),
+        ..Default::default()
+    };
+
+    let mut fast_extractor =
+        tetra3::fast_extractor::FastExtractor::new(100, 100, fast_options.clone());
+    let mut fast_extractor_seq =
+        tetra3::fast_extractor::FastExtractor::new(100, 100, fast_options.clone());
+
+    // Test 1: Standard layout (C-contiguous)
+    extractor.extract(&img_f32, options.clone());
+    extractor.extract_u8(&img_u8, options.clone());
+    fast_extractor.extract_f32(&img_f32);
+    fast_extractor.extract(&img_u8);
+    fast_extractor_seq.extract_sequential_f32(&img_f32);
+    fast_extractor_seq.extract_sequential(&img_u8);
+
+    // Test 2: Non-standard layout (Transposed -> Fortran layout)
+    let transposed_f32 = img_f32.t();
+    let transposed_u8 = img_u8.t();
+
+    extractor.extract(&transposed_f32, options.clone());
+    extractor.extract_u8(&transposed_u8, options.clone());
+    fast_extractor.extract_f32(&transposed_f32);
+    fast_extractor.extract(&transposed_u8);
+    fast_extractor_seq.extract_sequential_f32(&transposed_f32);
+    fast_extractor_seq.extract_sequential(&transposed_u8);
+
+    // Test 3: Sliced with step (Non-contiguous rows and columns)
+    let sliced_f32 = img_f32.slice(ndarray::s![..;2, ..;2]);
+    let sliced_u8 = img_u8.slice(ndarray::s![..;2, ..;2]);
+
+    let options_sliced = tetra3::ExtractOptions {
+        downsample: Some(2),
+        crop: Some(tetra3::extractor::Crop::Center {
+            height: 40,
+            width: 40,
+        }),
+        ..Default::default()
+    };
+
+    let fast_options_sliced = tetra3::fast_extractor::FastExtractOptions {
+        downsample: tetra3::fast_extractor::FastDownsample::X2,
+        bg_sub_mode: Some(tetra3::fast_extractor::FastBgSubMode::GlobalMedian),
+        sigma_mode: tetra3::fast_extractor::FastSigmaMode::GlobalMedianAbs,
+        crop: Some((40, 40)),
+        ..Default::default()
+    };
+
+    let mut fast_extractor_sliced =
+        tetra3::fast_extractor::FastExtractor::new(50, 50, fast_options_sliced.clone());
+    let mut fast_extractor_seq_sliced =
+        tetra3::fast_extractor::FastExtractor::new(50, 50, fast_options_sliced.clone());
+
+    extractor.extract(&sliced_f32, options_sliced.clone());
+    extractor.extract_u8(&sliced_u8, options_sliced.clone());
+    fast_extractor_sliced.extract_f32(&sliced_f32);
+    fast_extractor_sliced.extract(&sliced_u8);
+    fast_extractor_seq_sliced.extract_sequential_f32(&sliced_f32);
+    fast_extractor_seq_sliced.extract_sequential(&sliced_u8);
+}

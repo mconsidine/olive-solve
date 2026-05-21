@@ -5,7 +5,12 @@ use ndarray::{Array2, ArrayBase, Data, Ix2};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::extractor::{ExtractOptions, ExtractionResult, Extractor};
+use crate::extractor::{
+    BgSubMode, CentroidResult, Crop, ExtractOptions, ExtractionResult, Extractor, SigmaMode,
+};
+use crate::fast_extractor::{
+    FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor, FastSigmaMode,
+};
 use crate::solver::{Solution, SolveOptions, Solver};
 
 /// The main Tetra3 instance that centralizes star extraction and plate solving.
@@ -15,6 +20,7 @@ pub struct Tetra3 {
     database_path: PathBuf,
     solver: Option<Solver>,
     extractor: Option<Extractor>,
+    fast_extractor: Option<FastExtractor>,
 }
 
 impl Tetra3 {
@@ -25,6 +31,7 @@ impl Tetra3 {
             database_path: database_path.as_ref().to_path_buf(),
             solver: None,
             extractor: None,
+            fast_extractor: None,
         }
     }
 
@@ -68,6 +75,102 @@ impl Tetra3 {
         extractor.extract(image, options)
     }
 
+    /// Extracts star centroids from a u8 image array.
+    pub fn get_centroids_from_image_u8<S>(
+        &mut self,
+        image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
+    where
+        S: Data<Elem = u8>,
+    {
+        let extractor = self.get_extractor();
+        extractor.extract_u8(image, options)
+    }
+
+    /// Explicitly triggers the fast sequential extraction path.
+    /// Falls back to the normal extractor if parameters are incompatible.
+    pub fn get_centroids_from_image_fast<S, T>(
+        &mut self,
+        image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
+    where
+        S: Data<Elem = T>,
+        T: FastPixel,
+    {
+        let (height, width) = image.dim();
+        if let Some(fast_options) = try_to_fast_options(&options, width, height) {
+            let reinit = match &self.fast_extractor {
+                Some(fe) => {
+                    fe.orig_width() != width
+                        || fe.orig_height() != height
+                        || fe.options() != &fast_options
+                }
+                None => true,
+            };
+            if reinit {
+                self.fast_extractor = Some(FastExtractor::new(width, height, fast_options));
+            }
+            let fe = self.fast_extractor.as_mut().unwrap();
+            let fast_centroids = T::extract_sequential(fe, image);
+
+            // Map FastCentroidResult to CentroidResult
+            let centroids = fast_centroids
+                .into_iter()
+                .map(|c| CentroidResult {
+                    y: c.y,
+                    x: c.x,
+                    sum: c.sum,
+                    area: c.area,
+                    m2_xx: 0.0, // Fast extractor doesn't return moments currently
+                    m2_yy: 0.0,
+                    m2_xy: 0.0,
+                    axis_ratio: c.axis_ratio,
+                })
+                .collect();
+
+            ExtractionResult {
+                centroids,
+                debug_images: None,
+            }
+        } else {
+            T::extract_normal(self, image, options)
+        }
+    }
+
+    /// Runs the full pipeline using the fast sequential path.
+    pub fn solve_from_image_fast<S, T>(
+        &mut self,
+        image: &ArrayBase<S, Ix2>,
+        extract_options: ExtractOptions,
+        solve_options: SolveOptions,
+    ) -> Result<(Solution, f64), Box<dyn std::error::Error>>
+    where
+        S: Data<Elem = T>,
+        T: FastPixel,
+    {
+        let t0 = Instant::now();
+        let extract_result = self.get_centroids_from_image_fast(image, extract_options);
+        let extract_time_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let num_centroids = extract_result.centroids.len();
+        let mut centroids_arr = Array2::zeros((num_centroids, 2));
+        for (i, c) in extract_result.centroids.iter().enumerate() {
+            centroids_arr[[i, 0]] = c.y;
+            centroids_arr[[i, 1]] = c.x;
+        }
+
+        let (height, width) = image.dim();
+        let solution = self.solve_from_centroids(
+            &centroids_arr,
+            (height as f64, width as f64),
+            solve_options,
+        )?;
+
+        Ok((solution, extract_time_ms))
+    }
+
     /// Runs the full pipeline: extracts centroids from the image and immediately solves them.
     /// Returns the Solution alongside the extraction time in milliseconds.
     pub fn solve_from_image<S>(
@@ -103,4 +206,133 @@ impl Tetra3 {
 
         Ok((solution, extract_time_ms))
     }
+}
+
+/// Internal trait to unify dispatch between f32 and u8 for fast extraction.
+pub trait FastPixel: Copy {
+    fn extract_sequential<S>(
+        fe: &mut FastExtractor,
+        image: &ArrayBase<S, Ix2>,
+    ) -> Vec<crate::fast_extractor::FastCentroidResult>
+    where
+        S: Data<Elem = Self>;
+    fn extract_normal<S>(
+        t3: &mut Tetra3,
+        image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
+    where
+        S: Data<Elem = Self>;
+}
+
+impl FastPixel for f32 {
+    fn extract_sequential<S>(
+        fe: &mut FastExtractor,
+        image: &ArrayBase<S, Ix2>,
+    ) -> Vec<crate::fast_extractor::FastCentroidResult>
+    where
+        S: Data<Elem = Self>,
+    {
+        fe.extract_sequential_f32(image)
+    }
+    fn extract_normal<S>(
+        t3: &mut Tetra3,
+        image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
+    where
+        S: Data<Elem = Self>,
+    {
+        t3.get_centroids_from_image(image, options)
+    }
+}
+
+impl FastPixel for u8 {
+    fn extract_sequential<S>(
+        fe: &mut FastExtractor,
+        image: &ArrayBase<S, Ix2>,
+    ) -> Vec<crate::fast_extractor::FastCentroidResult>
+    where
+        S: Data<Elem = Self>,
+    {
+        fe.extract_sequential(image)
+    }
+    fn extract_normal<S>(
+        t3: &mut Tetra3,
+        image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
+    where
+        S: Data<Elem = Self>,
+    {
+        t3.get_centroids_from_image_u8(image, options)
+    }
+}
+
+fn try_to_fast_options(
+    options: &ExtractOptions,
+    img_width: usize,
+    img_height: usize,
+) -> Option<FastExtractOptions> {
+    // Check if options are compatible with FastExtractor
+    // 1. downsample must be 1, 2, or 4
+    let ds = match options.downsample {
+        None | Some(1) => FastDownsample::None,
+        Some(2) => FastDownsample::X2,
+        Some(4) => FastDownsample::X4,
+        _ => return None,
+    };
+
+    // 2. bg_sub_mode must be GlobalMedian or GlobalMean
+    let bg_mode = match options.bg_sub_mode {
+        Some(BgSubMode::GlobalMedian) => Some(FastBgSubMode::GlobalMedian),
+        Some(BgSubMode::GlobalMean) => Some(FastBgSubMode::GlobalMean),
+        None => None,
+        _ => return None, // LocalMean/Median not supported by FastExtractor
+    };
+
+    // 3. sigma_mode must be GlobalMedianAbs or GlobalRootSquare
+    let sigma_mode = match options.sigma_mode {
+        SigmaMode::GlobalMedianAbs => FastSigmaMode::GlobalMedianAbs,
+        SigmaMode::GlobalRootSquare => FastSigmaMode::GlobalRootSquare,
+        _ => return None, // Local modes not supported
+    };
+
+    // 4. crop must be None or Center
+    let crop = match &options.crop {
+        None => None,
+        Some(Crop::Center { height, width }) => Some((*width, *height)),
+        Some(Crop::Fraction(f)) => Some((img_width / f, img_height / f)),
+        _ => return None, // Region not supported
+    };
+
+    // 5. max_returned is not supported by FastExtractor (it returns all)
+    if options.max_returned.is_some() {
+        return None;
+    }
+
+    // 6. return_images is not supported
+    if options.return_images {
+        return None;
+    }
+
+    // 7. image_th is not supported (it uses sigma)
+    if options.image_th.is_some() {
+        return None;
+    }
+
+    Some(FastExtractOptions {
+        sigma: options.sigma,
+        downsample: ds,
+        bg_sub_mode: bg_mode,
+        sigma_mode,
+        binary_open: options.binary_open,
+        centroid_window: options.centroid_window,
+        max_area: options.max_area,
+        min_area: options.min_area,
+        max_sum: options.max_sum,
+        min_sum: options.min_sum,
+        max_axis_ratio: options.max_axis_ratio,
+        crop,
+    })
 }
