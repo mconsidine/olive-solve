@@ -480,11 +480,35 @@ impl FastExtractor {
                     mean_sq.max(0.0).sqrt() * self.options.sigma
                 }
                 FastSigmaMode::GlobalMedianAbs => {
-                    self.median_scratch_i32.clear();
-                    self.median_scratch_i32
-                        .extend(self.image_i32.iter().map(|&v| v.abs()));
-                    let mid = self.median_scratch_i32.len() / 2;
-                    let (_, &mut median, _) = self.median_scratch_i32.select_nth_unstable(mid);
+                    // OPTIMIZATION: Histogram-based median of absolute deviations.
+                    // This is much faster than select_nth_unstable as it avoids allocating 20MB+
+                    // and performing an O(N) partial sort.
+                    let mut hist = [0u32; 8192]; // Covers absolute range of i32 * 128
+                    let mut max_val = 0usize;
+                    for &v in &self.image_i32 {
+                        let av = v.abs() as usize;
+                        if av < 8192 {
+                            unsafe {
+                                *hist.get_unchecked_mut(av) += 1;
+                            }
+                            max_val = max_val.max(av);
+                        } else {
+                            unsafe {
+                                *hist.get_unchecked_mut(8191) += 1;
+                            }
+                            max_val = 8191;
+                        }
+                    }
+                    let target = (self.image_i32.len() as u32).div_ceil(2);
+                    let mut accum = 0;
+                    let mut median = 0.0f32;
+                    for val in 0..=max_val {
+                        accum += unsafe { *hist.get_unchecked(val) };
+                        if accum >= target {
+                            median = val as f32;
+                            break;
+                        }
+                    }
                     (median as f32 / 128.0) * 1.48 * self.options.sigma
                 }
             };
@@ -533,46 +557,91 @@ impl FastExtractor {
                         total_sum_sq
                     }
                     FastBgSubMode::GlobalMedian => {
-                        // OPTIMIZATION: Row-skipping histogram pass is fast for finding the median.
-                        let mut hist = [0u32; 256];
-                        let mut count = 0;
-                        for row in src_slice.chunks_exact(self.width).step_by(4) {
-                            for &v in row {
+                        #[cfg(target_pointer_width = "32")]
+                        {
+                            // OPTIMIZATION (32-bit): Full histogram pass avoids emulated 64-bit math in hot loop.
+                            let mut hist = [0u32; 256];
+                            for &v in src_slice {
                                 unsafe {
                                     *hist.get_unchecked_mut(v as usize) += 1;
                                 }
                             }
-                            count += self.width;
-                        }
-                        let target = count.div_ceil(2) as u32;
-                        let mut accum = 0;
-                        let mut med = 0.0f32;
-                        for (val, &c) in hist.iter().enumerate() {
-                            accum += c;
-                            if accum >= target {
-                                med = val as f32;
-                                break;
+
+                            let target = (src_slice.len() as u32).div_ceil(2);
+                            let mut accum = 0;
+                            let mut med = 0.0f32;
+                            for (val, &c) in hist.iter().enumerate() {
+                                accum += c;
+                                if accum >= target {
+                                    med = val as f32;
+                                    break;
+                                }
                             }
+
+                            let mut sum_i = 0u64;
+                            let mut sum_sq_i = 0u64;
+                            for (val, &count) in hist.iter().enumerate() {
+                                if count > 0 {
+                                    let v64 = val as u64;
+                                    let c64 = count as u64;
+                                    sum_i += v64 * c64;
+                                    sum_sq_i += v64 * v64 * c64;
+                                }
+                            }
+
+                            let med_i32 = (med * 128.0).round() as i32;
+
+                            for (o, &i) in self.image_i16.iter_mut().zip(src_slice.iter()) {
+                                *o = (i as i32 * 128 - med_i32) as i16;
+                            }
+
+                            let med_f64 = med as f64;
+                            let n_f64 = src_slice.len() as f64;
+
+                            (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                                + n_f64 * med_f64 * med_f64
                         }
+                        #[cfg(target_pointer_width = "64")]
+                        {
+                            // OPTIMIZATION (64-bit): Row-skipping histogram + SIMD-friendly fused math pass.
+                            let mut hist = [0u32; 256];
+                            let mut count = 0;
+                            for row in src_slice.chunks_exact(self.width).step_by(4) {
+                                for &v in row {
+                                    unsafe {
+                                        *hist.get_unchecked_mut(v as usize) += 1;
+                                    }
+                                }
+                                count += self.width;
+                            }
+                            let target = count.div_ceil(2) as u32;
+                            let mut accum = 0;
+                            let mut med = 0.0f32;
+                            for (val, &c) in hist.iter().enumerate() {
+                                accum += c;
+                                if accum >= target {
+                                    med = val as f32;
+                                    break;
+                                }
+                            }
 
-                        // OPTIMIZATION: Pure integer loop accumulates residual sum-of-squares
-                        // mathematically on the fly without inner loop floats.
-                        let med_i32 = (med * 128.0).round() as i32;
-                        let mut sum_i = 0u64;
-                        let mut sum_sq_i = 0u64;
+                            let med_i32 = (med * 128.0).round() as i32;
+                            let mut sum_i = 0u64;
+                            let mut sum_sq_i = 0u64;
 
-                        for (o, &i) in self.image_i16.iter_mut().zip(src_slice.iter()) {
-                            let iv = i as u64;
-                            sum_i += iv;
-                            sum_sq_i += iv * iv;
-                            *o = (i as i32 * 128 - med_i32) as i16;
+                            for (o, &i) in self.image_i16.iter_mut().zip(src_slice.iter()) {
+                                let iv = i as u64;
+                                sum_i += iv;
+                                sum_sq_i += iv * iv;
+                                *o = (i as i32 * 128 - med_i32) as i16;
+                            }
+
+                            let med_f64 = med as f64;
+                            let n_f64 = src_slice.len() as f64;
+
+                            (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                                + n_f64 * med_f64 * med_f64
                         }
-
-                        let med_f64 = med as f64;
-                        let n_f64 = src_slice.len() as f64;
-
-                        (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
-                            + n_f64 * med_f64 * med_f64
                     }
                     FastBgSubMode::LineMedian => {
                         let mut hist = [0u32; 256];
@@ -802,11 +871,35 @@ impl FastExtractor {
                     mean_sq.max(0.0).sqrt() * self.options.sigma
                 }
                 FastSigmaMode::GlobalMedianAbs => {
-                    self.median_scratch_i16.clear();
-                    self.median_scratch_i16
-                        .extend(self.image_i16.iter().map(|&v| v.abs()));
-                    let mid = self.median_scratch_i16.len() / 2;
-                    let (_, &mut median, _) = self.median_scratch_i16.select_nth_unstable(mid);
+                    // OPTIMIZATION: Histogram-based median of absolute deviations.
+                    // This is much faster than select_nth_unstable as it avoids allocating 20MB+
+                    // and performing an O(N) partial sort.
+                    let mut hist = [0u32; 8192]; // Covers absolute range of i16 * 128
+                    let mut max_val = 0usize;
+                    for &v in &self.image_i16 {
+                        let av = v.abs() as usize;
+                        if av < 8192 {
+                            unsafe {
+                                *hist.get_unchecked_mut(av) += 1;
+                            }
+                            max_val = max_val.max(av);
+                        } else {
+                            unsafe {
+                                *hist.get_unchecked_mut(8191) += 1;
+                            }
+                            max_val = 8191;
+                        }
+                    }
+                    let target = (self.image_i16.len() as u32).div_ceil(2);
+                    let mut accum = 0;
+                    let mut median = 0.0f32;
+                    for val in 0..=max_val {
+                        accum += unsafe { *hist.get_unchecked(val) };
+                        if accum >= target {
+                            median = val as f32;
+                            break;
+                        }
+                    }
                     (median as f32 / 128.0) * 1.48 * self.options.sigma
                 }
             };
