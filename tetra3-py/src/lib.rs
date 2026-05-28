@@ -460,6 +460,10 @@ fn solution_to_dict<'py>(
         out_dict.set_item("rotation_matrix", py_matrix)?;
     }
 
+    // Attitude quaternion (w, x, y, z) — always present on a successful solve,
+    // None otherwise. Pass as `attitude_hint` on the next frame.
+    out_dict.set_item("quaternion", solution.quaternion.map(|q| q.to_vec()))?;
+
     Ok(out_dict)
 }
 
@@ -596,6 +600,20 @@ fn parse_solve_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<SolveOpti
                 let py_arr: numpy::PyReadonlyArray2<f64> = val.extract()?;
                 options.target_sky_coord = Some(py_arr.as_array().to_owned());
             }
+        }
+
+        // Attitude hint: unit quaternion (w, x, y, z) from a recent solve.
+        if let Some(val) = dict.get_item("attitude_hint")? {
+            if !val.is_none() {
+                let arr: [f64; 4] = val.extract()?;
+                options.attitude_hint = Some(arr);
+            }
+        }
+        if let Some(val) = dict.get_item("hint_uncertainty_deg")? {
+            options.hint_uncertainty_deg = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("strict_hint")? {
+            options.strict_hint = val.extract()?;
         }
     }
     Ok(options)
