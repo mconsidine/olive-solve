@@ -107,6 +107,18 @@ pub struct SolveOptions {
     pub return_rotation_matrix: bool,
     pub target_pixel: Option<Array2<f64>>,     // N x 2 (y, x)
     pub target_sky_coord: Option<Array2<f64>>, // N x 2 (ra, dec)
+    /// Attitude hint: unit quaternion (w, x, y, z) from a recent solve or IMU.
+    /// When set, candidates whose rotation matrix differs from the hint by more
+    /// than `hint_uncertainty_deg` are skipped before the expensive KD-tree
+    /// verification step, reducing per-frame solve latency on sequential frames.
+    pub attitude_hint: Option<[f64; 4]>,
+    /// Angular half-width of the hint search cone [degrees]. Ignored when
+    /// `attitude_hint` is None. Default 15° gives a comfortable margin after
+    /// a slow telescope slew; tighten to 2–5° for tracking/stationary use.
+    pub hint_uncertainty_deg: f64,
+    /// If true, do not fall back to a blind solve when every candidate is
+    /// outside the hint cone. Useful to enforce strict re-acquisition windows.
+    pub strict_hint: bool,
 }
 
 impl Default for SolveOptions {
@@ -124,6 +136,9 @@ impl Default for SolveOptions {
             return_rotation_matrix: false,
             target_pixel: None,
             target_sky_coord: None,
+            attitude_hint: None,
+            hint_uncertainty_deg: 15.0,
+            strict_hint: false,
         }
     }
 }
@@ -146,6 +161,9 @@ pub struct Solution {
     pub t_solve_ms: f64,
     pub is_mirrored: bool,
     pub rotation_matrix: Option<Array2<f64>>,
+    /// Attitude quaternion (w, x, y, z) derived from the refined rotation
+    /// matrix of a successful solve. Pass as `attitude_hint` on the next frame.
+    pub quaternion: Option<[f64; 4]>,
     pub target_ra: Option<Vec<f64>>,
     pub target_dec: Option<Vec<f64>>,
     pub target_y: Option<Vec<Option<f64>>>,
@@ -455,6 +473,59 @@ fn find_centroid_matches_inplace(
     indices0.into_iter().map(|idx| matches1[idx]).collect()
 }
 
+// ── Attitude-hint helpers ─────────────────────────────────────────────────────
+
+/// Unit quaternion (w, x, y, z) → 3×3 rotation matrix.
+fn quat_to_matrix(q: &[f64; 4]) -> Matrix3<f64> {
+    let [w, x, y, z] = *q;
+    Matrix3::new(
+        1.0 - 2.0*(y*y + z*z),  2.0*(x*y - w*z),        2.0*(x*z + w*y),
+        2.0*(x*y + w*z),        1.0 - 2.0*(x*x + z*z),  2.0*(y*z - w*x),
+        2.0*(x*z - w*y),        2.0*(y*z + w*x),         1.0 - 2.0*(x*x + y*y),
+    )
+}
+
+/// Geodesic angle [degrees] between a hint quaternion and a candidate rotation
+/// matrix. Uses: angle = acos((trace(R_hint^T · R_cand) − 1) / 2).
+/// trace(R_hint^T · R_cand) equals the Frobenius inner product of the two matrices.
+fn geodesic_angle_deg(hint_q: &[f64; 4], candidate: &Matrix3<f64>) -> f64 {
+    let r_hint = quat_to_matrix(hint_q);
+    let tr = r_hint.column(0).dot(&candidate.column(0))
+           + r_hint.column(1).dot(&candidate.column(1))
+           + r_hint.column(2).dot(&candidate.column(2));
+    ((tr - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// 3×3 rotation matrix → unit quaternion (w, x, y, z) via Shepperd's method.
+fn rotation_matrix_to_quat(r: &Matrix3<f64>) -> [f64; 4] {
+    let trace = r[(0,0)] + r[(1,1)] + r[(2,2)];
+    if trace > 0.0 {
+        let s = 0.5 / (trace + 1.0).sqrt();
+        [0.25 / s,
+         (r[(2,1)] - r[(1,2)]) * s,
+         (r[(0,2)] - r[(2,0)]) * s,
+         (r[(1,0)] - r[(0,1)]) * s]
+    } else if r[(0,0)] > r[(1,1)] && r[(0,0)] > r[(2,2)] {
+        let s = 2.0 * (1.0 + r[(0,0)] - r[(1,1)] - r[(2,2)]).sqrt();
+        [(r[(2,1)] - r[(1,2)]) / s,
+         0.25 * s,
+         (r[(0,1)] + r[(1,0)]) / s,
+         (r[(0,2)] + r[(2,0)]) / s]
+    } else if r[(1,1)] > r[(2,2)] {
+        let s = 2.0 * (1.0 + r[(1,1)] - r[(0,0)] - r[(2,2)]).sqrt();
+        [(r[(0,2)] - r[(2,0)]) / s,
+         (r[(0,1)] + r[(1,0)]) / s,
+         0.25 * s,
+         (r[(1,2)] + r[(2,1)]) / s]
+    } else {
+        let s = 2.0 * (1.0 + r[(2,2)] - r[(0,0)] - r[(1,1)]).sqrt();
+        [(r[(1,0)] - r[(0,1)]) / s,
+         (r[(0,2)] + r[(2,0)]) / s,
+         (r[(1,2)] + r[(2,1)]) / s,
+         0.25 * s]
+    }
+}
+
 // Helper to build the solution
 #[allow(clippy::too_many_arguments)]
 fn verify_and_build_solution(
@@ -702,6 +773,7 @@ fn verify_and_build_solution(
         status: SolveStatus::MatchFound,
         t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
         is_mirrored: precise_det < 0.0,
+        quaternion: Some(rotation_matrix_to_quat(&precise_rotation_matrix)),
         ..Default::default()
     };
 
@@ -1744,6 +1816,18 @@ impl Solver {
                                         Some(res) => res,
                                         None => continue,
                                     };
+
+                                // Attitude-hint early rejection: skip the expensive
+                                // KD-tree verification if this candidate's orientation
+                                // is outside the hint cone. Free after the rotation
+                                // matrix is already in hand.
+                                if let Some(hint_q) = &options.attitude_hint {
+                                    if geodesic_angle_deg(hint_q, &rotation_matrix)
+                                        > options.hint_uncertainty_deg
+                                    {
+                                        continue;
+                                    }
+                                }
 
                                 if let Some(solution) = verify_and_build_solution(
                                     scratch,
