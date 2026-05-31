@@ -60,6 +60,14 @@ pub struct FastExtractOptions {
     pub crop: Option<(usize, usize)>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FastExtractOptionsUpdate {
+    pub sigma: Option<f32>,
+    pub noise_filter: Option<bool>,
+    pub min_area: Option<usize>,
+    pub max_area: Option<usize>,
+}
+
 impl Default for FastExtractOptions {
     fn default() -> Self {
         FastExtractOptions {
@@ -160,6 +168,21 @@ impl FastExtractor {
 
     pub fn orig_height(&self) -> usize {
         self.orig_height
+    }
+
+    pub fn update_options(&mut self, update: FastExtractOptionsUpdate) {
+        if let Some(sigma) = update.sigma {
+            self.options.sigma = sigma;
+        }
+        if let Some(nf) = update.noise_filter {
+            self.options.binary_open = nf;
+        }
+        if let Some(ma) = update.min_area {
+            self.options.min_area = Some(ma);
+        }
+        if let Some(mxa) = update.max_area {
+            self.options.max_area = Some(mxa);
+        }
     }
 
     /// Creates a fully pre-allocated extractor.
