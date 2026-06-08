@@ -13,7 +13,7 @@ rayon = "1.11.0"
 
 [build-dependencies]
 tonic-build = "0.11"
-pyo3-build-config = "0.28.2"
+pyo3-build-config = { version = "0.28.2", features = ["resolve-config"] }
 
 [dev-dependencies]
 pyo3 = { version = "0.28.2", features = ["auto-initialize"] }
