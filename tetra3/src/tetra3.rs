@@ -1,13 +1,18 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
-use ndarray::{Array2, ArrayBase, Data, Ix2};
+use ndarray::Array2;
+#[cfg(feature = "extractor")]
+use ndarray::{ArrayBase, Data, Ix2};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "extractor")]
 use std::time::Instant;
 
+#[cfg(feature = "extractor")]
 use crate::extractor::{
     BgSubMode, CentroidResult, Crop, ExtractOptions, ExtractionResult, Extractor, SigmaMode,
 };
+#[cfg(feature = "extractor")]
 use crate::fast_extractor::{
     FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor, FastSigmaMode,
 };
@@ -19,7 +24,9 @@ use crate::solver::{Solution, SolveOptions, Solver};
 pub struct Tetra3 {
     database_path: PathBuf,
     solver: Option<Solver>,
+    #[cfg(feature = "extractor")]
     extractor: Option<Extractor>,
+    #[cfg(feature = "extractor")]
     fast_extractor: Option<FastExtractor>,
 }
 
@@ -30,7 +37,9 @@ impl Tetra3 {
         Self {
             database_path: database_path.as_ref().to_path_buf(),
             solver: None,
+            #[cfg(feature = "extractor")]
             extractor: None,
+            #[cfg(feature = "extractor")]
             fast_extractor: None,
         }
     }
@@ -44,6 +53,7 @@ impl Tetra3 {
     }
 
     /// Helper to lazy-initialize or retrieve the extractor.
+    #[cfg(feature = "extractor")]
     fn get_extractor(&mut self) -> &mut Extractor {
         if self.extractor.is_none() {
             self.extractor = Some(Extractor::new());
@@ -63,6 +73,7 @@ impl Tetra3 {
     }
 
     /// Extracts star centroids from an image array.
+    #[cfg(feature = "extractor")]
     pub fn get_centroids_from_image<S>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -76,6 +87,7 @@ impl Tetra3 {
     }
 
     /// Extracts star centroids from a u8 image array.
+    #[cfg(feature = "extractor")]
     pub fn get_centroids_from_image_u8<S>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -90,6 +102,7 @@ impl Tetra3 {
 
     /// Explicitly triggers the fast sequential extraction path.
     /// Falls back to the normal extractor if parameters are incompatible.
+    #[cfg(feature = "extractor")]
     pub fn get_centroids_from_image_fast<S, T>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -140,6 +153,7 @@ impl Tetra3 {
     }
 
     /// Runs the full pipeline using the fast sequential path.
+    #[cfg(feature = "extractor")]
     pub fn solve_from_image_fast<S, T>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -173,6 +187,7 @@ impl Tetra3 {
 
     /// Runs the full pipeline: extracts centroids from the image and immediately solves them.
     /// Returns the Solution alongside the extraction time in milliseconds.
+    #[cfg(feature = "extractor")]
     pub fn solve_from_image<S>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -209,6 +224,7 @@ impl Tetra3 {
 }
 
 /// Internal trait to unify dispatch between f32 and u8 for fast extraction.
+#[cfg(feature = "extractor")]
 pub trait FastPixel: Copy {
     fn extract_sequential<S>(
         fe: &mut FastExtractor,
@@ -225,6 +241,7 @@ pub trait FastPixel: Copy {
         S: Data<Elem = Self>;
 }
 
+#[cfg(feature = "extractor")]
 impl FastPixel for f32 {
     fn extract_sequential<S>(
         fe: &mut FastExtractor,
@@ -247,6 +264,7 @@ impl FastPixel for f32 {
     }
 }
 
+#[cfg(feature = "extractor")]
 impl FastPixel for u8 {
     fn extract_sequential<S>(
         fe: &mut FastExtractor,
@@ -269,6 +287,7 @@ impl FastPixel for u8 {
     }
 }
 
+#[cfg(feature = "extractor")]
 fn try_to_fast_options(
     options: &ExtractOptions,
     img_width: usize,

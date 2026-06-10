@@ -3,6 +3,15 @@ name = "tetra3"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["extractor"]
+# The centroid-extraction pipelines (Extractor + FastExtractor). Consumers
+# that bring their own extractor (e.g. diofinder pairs this solver with
+# sycamore star_detect) can build with --no-default-features to drop the
+# ~4,300 lines of extraction code from the binary; the solver API is
+# unaffected.
+extractor = []
+
 [dependencies]
 zip = "0.6"
 ndarray = { version = "0.17.1", features = ["rayon"] }
