@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "2"
 
+[profile.test]
+opt-level = 3          # The solver validation/parity tests run thousands of solves
+
 [profile.release]
 lto = "fat"            # Enables Link-Time Optimization across all dependency crates
 codegen-units = 1      # Compiles the whole program as a single unit for max optimization

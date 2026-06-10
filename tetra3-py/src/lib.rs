@@ -615,6 +615,9 @@ fn parse_solve_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<SolveOpti
         if let Some(val) = dict.get_item("strict_hint")? {
             options.strict_hint = val.extract()?;
         }
+        if let Some(val) = dict.get_item("parallel")? {
+            options.parallel = val.extract()?;
+        }
     }
     Ok(options)
 }
