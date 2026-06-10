@@ -283,12 +283,13 @@ fn try_to_fast_options(
         _ => return None,
     };
 
-    // 2. bg_sub_mode must be GlobalMedian or GlobalMean
+    // 2. bg_sub_mode must be GlobalMedian or GlobalMean or LocalMedian
     let bg_mode = match options.bg_sub_mode {
         Some(BgSubMode::GlobalMedian) => Some(FastBgSubMode::GlobalMedian),
         Some(BgSubMode::GlobalMean) => Some(FastBgSubMode::GlobalMean),
+        Some(BgSubMode::LocalMedian) => Some(FastBgSubMode::BlockMedian { block_size: 32 }),
         None => None,
-        _ => return None, // LocalMean/Median not supported by FastExtractor
+        _ => return None, // LocalMean not supported by FastExtractor
     };
 
     // 3. sigma_mode must be GlobalMedianAbs or GlobalRootSquare
