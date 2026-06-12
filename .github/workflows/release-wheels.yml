@@ -9,11 +9,18 @@ on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
-    # Pass a real version (e.g. v0.2.0) to publish a release.
-    # Pass a dev/test suffix (e.g. v0.0.0-dev) to build without releasing.
+    # Version conventions:
+    #   vX.Y.Z          -> full release (becomes "latest"; consumers pull it)
+    #   vX.Y.Z-<suffix> -> PRErelease (e.g. v0.2.0-noext from a feature
+    #                      branch; never becomes "latest" — select it
+    #                      explicitly via diofinder's olive_solve_tag input
+    #                      or OLIVE_SOLVE_TAG variable)
+    #   *-dev           -> build only, no release
+    # To build from a branch, pick that branch in the "Run workflow"
+    # dropdown (or push a tag pointing at it).
     inputs:
       version:
-        description: "Version tag (e.g. v0.2.0 to release, v0.2.0-test to build only)"
+        description: "Version tag (vX.Y.Z = release, vX.Y.Z-suffix = prerelease, *-dev = build only)"
         required: true
         default: "v0.0.0-dev"
 
@@ -48,7 +55,7 @@ jobs:
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' &&
        startsWith(github.event.inputs.version, 'v') &&
-       !contains(github.event.inputs.version, '-'))
+       !endsWith(github.event.inputs.version, '-dev'))
     permissions:
       contents: write
     steps:
@@ -86,4 +93,7 @@ jobs:
             ```
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # Hyphenated versions (branch/test builds) are prereleases:
+          # excluded from "latest", so consumers only get them when the
+          # tag is selected explicitly.
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
