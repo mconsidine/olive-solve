@@ -1,0 +1,11 @@
+# Build tuned for the Raspberry Pi Zero 2 W (Cortex-A53, ARMv8-A, NEON).
+#
+# IMPORTANT: scoped to the aarch64-unknown-linux-gnu target only. A global
+# [build] rustflags would also apply to host-side build scripts compiled for
+# x86, and the x86 LLVM backend rejects "cortex-a53".
+#
+# The diofinder 'Vendor Binaries' workflow passes the same flag via RUSTFLAGS;
+# this file makes native builds on the Pi (and ad-hoc cross builds) match the
+# shipped wheel instead of silently losing the tuning.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=cortex-a53"]
