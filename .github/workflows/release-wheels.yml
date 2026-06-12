@@ -29,7 +29,7 @@ jobs:
     name: build aarch64 wheel (abi3)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # PyO3's official maturin action. Handles the cross-compile toolchain
       # and linker config. The committed .cargo/config.toml scopes
@@ -41,7 +41,7 @@ jobs:
           manylinux: "2014"
           args: --release -m tetra3-py/Cargo.toml --interpreter python3.11
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-aarch64
           path: target/wheels/*.whl
@@ -59,9 +59,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -79,7 +79,7 @@ jobs:
           fi
 
       - name: create release with wheels
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           files: dist/*.whl
