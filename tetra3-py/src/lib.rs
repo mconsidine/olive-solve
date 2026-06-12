@@ -64,12 +64,17 @@
 //    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //    SOFTWARE.
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray2};
+#[cfg(feature = "extractor")]
+use numpy::IntoPyArray;
+use numpy::{PyArrayMethods, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyDict;
+#[cfg(feature = "extractor")]
+use pyo3::types::PyTuple;
 use std::path::PathBuf;
 
 use tetra3_core::Tetra3;
+#[cfg(feature = "extractor")]
 use tetra3_core::extractor::{BgSubMode, ExtractOptions, SigmaMode};
 use tetra3_core::solver::SolveOptions;
 
@@ -104,6 +109,7 @@ impl PyTetra3 {
     ///     moments, N major over minor axis ratio. If `return_images=True` a tuple is returned
     ///     with the results as defined previously and a dictionary with images and data of partial
     ///     results. The keys are: `cropped_and_downsampled`, `removed_background`, `binary_mask`.
+    #[cfg(feature = "extractor")]
     #[pyo3(signature = (image, **kwargs))]
     fn get_centroids_from_image<'py>(
         &self,
@@ -207,6 +213,7 @@ impl PyTetra3 {
 
     /// Extracts centroids from a 2D NumPy array using the fast sequential path.
     /// Supports both u8 and f32 images.
+    #[cfg(feature = "extractor")]
     #[pyo3(signature = (image, **kwargs))]
     fn get_centroids_from_image_fast<'py>(
         &self,
@@ -303,6 +310,7 @@ impl PyTetra3 {
 
     /// Runs extraction and plate solving in one uninterrupted pipeline using the fast path.
     /// Returns a dictionary containing the solution and execution times.
+    #[cfg(feature = "extractor")]
     #[pyo3(signature = (image, **kwargs))]
     fn solve_from_image_fast<'py>(
         &self,
@@ -344,6 +352,7 @@ impl PyTetra3 {
 
     /// Runs extraction and plate solving in one uninterrupted pipeline.
     /// Returns a dictionary containing the solution and execution times.
+    #[cfg(feature = "extractor")]
     #[pyo3(signature = (image, **kwargs))]
     fn solve_from_image<'py>(
         &self,
@@ -373,6 +382,7 @@ impl PyTetra3 {
 
 // --- Helper Functions to Map Python kwargs to Rust Structs ---
 
+#[cfg(feature = "extractor")]
 fn centroids_to_numpy<'py>(
     py: Python<'py>,
     centroids: &[tetra3_core::extractor::CentroidResult],
@@ -467,6 +477,7 @@ fn solution_to_dict<'py>(
     Ok(out_dict)
 }
 
+#[cfg(feature = "extractor")]
 fn parse_extract_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<ExtractOptions> {
     let mut options = ExtractOptions::default();
 
@@ -615,6 +626,9 @@ fn parse_solve_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<SolveOpti
         if let Some(val) = dict.get_item("strict_hint")? {
             options.strict_hint = val.extract()?;
         }
+        if let Some(val) = dict.get_item("parallel")? {
+            options.parallel = val.extract()?;
+        }
     }
     Ok(options)
 }
@@ -630,7 +644,9 @@ fn tetra3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// The embedded-Python integration tests drive the full image pipeline, so
+// they need the extraction methods compiled in.
+#[cfg(all(test, feature = "extractor"))]
 mod tests {
     use super::*;
     use pyo3::types::PyModule;

@@ -67,6 +67,7 @@ fn map_solve_options(opt: proto::SolveOptions) -> SolveOptions {
             .unwrap_or(def.return_rotation_matrix),
         target_pixel,
         target_sky_coord,
+        ..def
     }
 }
 

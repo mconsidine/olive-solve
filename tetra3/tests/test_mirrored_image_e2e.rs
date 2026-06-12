@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+#![cfg(feature = "extractor")]
+
 use ndarray::Array2;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+#![cfg(feature = "extractor")]
+
 use image::GenericImageView;
 use ndarray::Array2;
 use numpy::{PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};

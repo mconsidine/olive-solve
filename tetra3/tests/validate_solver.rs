@@ -150,6 +150,7 @@ fn test_solver_consistency_with_testdata() {
             return_rotation_matrix: input_dto.options.return_rotation_matrix,
             target_pixel,
             target_sky_coord,
+            ..Default::default()
         };
 
         // --- Capture the execution time ---
@@ -342,6 +343,7 @@ fn test_solver_mirrored_image() {
         return_rotation_matrix: input_dto.options.return_rotation_matrix,
         target_pixel,
         target_sky_coord: None,
+        ..Default::default()
     };
 
     let result = solver.solve(

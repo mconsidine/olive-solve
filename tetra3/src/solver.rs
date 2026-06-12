@@ -69,6 +69,7 @@ use kiddo::{KdTree, SquaredEuclidean};
 use nalgebra::{DMatrix, DVector, Matrix3, SVD};
 use ndarray::{Array1, Array2};
 use npyz::NpyFile;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read};
@@ -119,6 +120,12 @@ pub struct SolveOptions {
     /// If true, do not fall back to a blind solve when every candidate is
     /// outside the hint cone. Useful to enforce strict re-acquisition windows.
     pub strict_hint: bool,
+    /// Distribute the pattern-candidate search across the rayon thread pool.
+    /// The result is identical to the serial search: the first verified match
+    /// in enumeration order wins, and workers poll the same timeout/cancel
+    /// flag as the serial path. Set false to force the single-threaded search
+    /// (also used automatically when the pool has a single thread).
+    pub parallel: bool,
 }
 
 impl Default for SolveOptions {
@@ -139,6 +146,7 @@ impl Default for SolveOptions {
             attitude_hint: None,
             hint_uncertainty_deg: 15.0,
             strict_hint: false,
+            parallel: true,
         }
     }
 }
@@ -479,9 +487,15 @@ fn find_centroid_matches_inplace(
 fn quat_to_matrix(q: &[f64; 4]) -> Matrix3<f64> {
     let [w, x, y, z] = *q;
     Matrix3::new(
-        1.0 - 2.0*(y*y + z*z),  2.0*(x*y - w*z),        2.0*(x*z + w*y),
-        2.0*(x*y + w*z),        1.0 - 2.0*(x*x + z*z),  2.0*(y*z - w*x),
-        2.0*(x*z - w*y),        2.0*(y*z + w*x),         1.0 - 2.0*(x*x + y*y),
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y - w * z),
+        2.0 * (x * z + w * y),
+        2.0 * (x * y + w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
     )
 }
 
@@ -491,38 +505,46 @@ fn quat_to_matrix(q: &[f64; 4]) -> Matrix3<f64> {
 fn geodesic_angle_deg(hint_q: &[f64; 4], candidate: &Matrix3<f64>) -> f64 {
     let r_hint = quat_to_matrix(hint_q);
     let tr = r_hint.column(0).dot(&candidate.column(0))
-           + r_hint.column(1).dot(&candidate.column(1))
-           + r_hint.column(2).dot(&candidate.column(2));
+        + r_hint.column(1).dot(&candidate.column(1))
+        + r_hint.column(2).dot(&candidate.column(2));
     ((tr - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 /// 3×3 rotation matrix → unit quaternion (w, x, y, z) via Shepperd's method.
 fn rotation_matrix_to_quat(r: &Matrix3<f64>) -> [f64; 4] {
-    let trace = r[(0,0)] + r[(1,1)] + r[(2,2)];
+    let trace = r[(0, 0)] + r[(1, 1)] + r[(2, 2)];
     if trace > 0.0 {
         let s = 0.5 / (trace + 1.0).sqrt();
-        [0.25 / s,
-         (r[(2,1)] - r[(1,2)]) * s,
-         (r[(0,2)] - r[(2,0)]) * s,
-         (r[(1,0)] - r[(0,1)]) * s]
-    } else if r[(0,0)] > r[(1,1)] && r[(0,0)] > r[(2,2)] {
-        let s = 2.0 * (1.0 + r[(0,0)] - r[(1,1)] - r[(2,2)]).sqrt();
-        [(r[(2,1)] - r[(1,2)]) / s,
-         0.25 * s,
-         (r[(0,1)] + r[(1,0)]) / s,
-         (r[(0,2)] + r[(2,0)]) / s]
-    } else if r[(1,1)] > r[(2,2)] {
-        let s = 2.0 * (1.0 + r[(1,1)] - r[(0,0)] - r[(2,2)]).sqrt();
-        [(r[(0,2)] - r[(2,0)]) / s,
-         (r[(0,1)] + r[(1,0)]) / s,
-         0.25 * s,
-         (r[(1,2)] + r[(2,1)]) / s]
+        [
+            0.25 / s,
+            (r[(2, 1)] - r[(1, 2)]) * s,
+            (r[(0, 2)] - r[(2, 0)]) * s,
+            (r[(1, 0)] - r[(0, 1)]) * s,
+        ]
+    } else if r[(0, 0)] > r[(1, 1)] && r[(0, 0)] > r[(2, 2)] {
+        let s = 2.0 * (1.0 + r[(0, 0)] - r[(1, 1)] - r[(2, 2)]).sqrt();
+        [
+            (r[(2, 1)] - r[(1, 2)]) / s,
+            0.25 * s,
+            (r[(0, 1)] + r[(1, 0)]) / s,
+            (r[(0, 2)] + r[(2, 0)]) / s,
+        ]
+    } else if r[(1, 1)] > r[(2, 2)] {
+        let s = 2.0 * (1.0 + r[(1, 1)] - r[(0, 0)] - r[(2, 2)]).sqrt();
+        [
+            (r[(0, 2)] - r[(2, 0)]) / s,
+            (r[(0, 1)] + r[(1, 0)]) / s,
+            0.25 * s,
+            (r[(1, 2)] + r[(2, 1)]) / s,
+        ]
     } else {
-        let s = 2.0 * (1.0 + r[(2,2)] - r[(0,0)] - r[(1,1)]).sqrt();
-        [(r[(1,0)] - r[(0,1)]) / s,
-         (r[(0,2)] + r[(2,0)]) / s,
-         (r[(1,2)] + r[(2,1)]) / s,
-         0.25 * s]
+        let s = 2.0 * (1.0 + r[(2, 2)] - r[(0, 0)] - r[(1, 1)]).sqrt();
+        [
+            (r[(1, 0)] - r[(0, 1)]) / s,
+            (r[(0, 2)] + r[(2, 0)]) / s,
+            (r[(1, 2)] + r[(2, 1)]) / s,
+            0.25 * s,
+        ]
     }
 }
 
@@ -899,6 +921,263 @@ fn verify_and_build_solution(
 // --- Ported Utility Functions ---
 fn separation_for_density(fov: f64, stars_per_fov: f64) -> f64 {
     0.6 * fov / stars_per_fov.sqrt()
+}
+
+/// Immutable per-solve context shared by every pattern-combination probe.
+/// Bundles the solver's catalog references and the solve-invocation state so
+/// `try_pattern_combo` can run identically from the serial loop and from
+/// rayon workers.
+struct ComboContext<'a> {
+    precomputed_angles: &'a [f64],
+    num_vecs: usize,
+    image_centroids: &'a [[f64; 2]],
+    num_extracted_stars: usize,
+    height: f64,
+    width: f64,
+    fov_initial: f64,
+    p_bins: usize,
+    p_max_err: f64,
+    presorted: bool,
+    match_threshold: f64,
+    options: &'a SolveOptions,
+    t0_solve: Instant,
+    star_kd_tree: &'a KdTree<f64, 3>,
+    star_table_flat: &'a [CatalogStar],
+    pattern_catalog_flat: &'a [usize],
+    pattern_key_hashes: &'a Option<Array1<u16>>,
+    pattern_largest_edge: &'a Option<Array1<f32>>,
+    star_catalog_ids: &'a Option<Array2<u32>>,
+    db_props: &'a HashMap<String, f64>,
+    num_patterns: usize,
+    linear_probe: bool,
+}
+
+fn aborted_solution(is_cancelled: &AtomicBool, t0_solve: Instant) -> Solution {
+    let status = if is_cancelled.load(Ordering::Relaxed) {
+        SolveStatus::Cancelled
+    } else {
+        SolveStatus::Timeout
+    };
+    Solution {
+        status,
+        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    }
+}
+
+/// Probe one 4-star image pattern (p_i, p_j, p_k, p_l are indices into the
+/// extracted centroid list): hash the edge-ratio key neighborhood, test every
+/// catalog candidate, and run full verification on geometric matches.
+/// Returns the first verified solution, or None. Mirrors one iteration of the
+/// original l/k/j/i loop body exactly.
+#[allow(clippy::too_many_arguments)]
+fn try_pattern_combo(
+    ctx: &ComboContext,
+    scratch: &mut Scratchpads,
+    image_centroids_undist: &mut Vec<[f64; 2]>,
+    p_i: usize,
+    p_j: usize,
+    p_k: usize,
+    p_l: usize,
+) -> Option<Solution> {
+    let p_size = 4;
+    let num_vecs = ctx.num_vecs;
+
+    // Fast direct memory lookups for pairwise distance angle metrics
+    let mut edges = [
+        ctx.precomputed_angles[p_i * num_vecs + p_j],
+        ctx.precomputed_angles[p_i * num_vecs + p_k],
+        ctx.precomputed_angles[p_i * num_vecs + p_l],
+        ctx.precomputed_angles[p_j * num_vecs + p_k],
+        ctx.precomputed_angles[p_j * num_vecs + p_l],
+        ctx.precomputed_angles[p_k * num_vecs + p_l],
+    ];
+
+    // Calculate edge angles and sort
+    edges.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let image_pattern_largest_edge = edges[5];
+
+    // Min/max edge ratio bounds
+    let mut key_space_min = [0; 5];
+    let mut key_space_max = [0; 5];
+    let mut target_keys = [0isize; 5];
+
+    for x in 0..5 {
+        let ratio = edges[x] / image_pattern_largest_edge;
+        key_space_min[x] = ((ratio - ctx.p_max_err).max(0.0) * ctx.p_bins as f64) as usize;
+        key_space_max[x] = ((ratio + ctx.p_max_err).min(1.0) * ctx.p_bins as f64) as usize;
+        target_keys[x] = (ratio * ctx.p_bins as f64) as isize;
+    }
+
+    // Generate search space combinations via zero-allocation DFS (replaces Cartesian product)
+    scratch.sp_pattern_key_list.clear();
+    for k0 in key_space_min[0]..=key_space_max[0] {
+        for k1 in key_space_min[1]..=key_space_max[1] {
+            for k2 in key_space_min[2]..=key_space_max[2] {
+                for k3 in key_space_min[3]..=key_space_max[3] {
+                    for k4 in key_space_min[4]..=key_space_max[4] {
+                        let diff0 = k0 as isize - target_keys[0];
+                        let diff1 = k1 as isize - target_keys[1];
+                        let diff2 = k2 as isize - target_keys[2];
+                        let diff3 = k3 as isize - target_keys[3];
+                        let diff4 = k4 as isize - target_keys[4];
+                        let dist = diff0 * diff0
+                            + diff1 * diff1
+                            + diff2 * diff2
+                            + diff3 * diff3
+                            + diff4 * diff4;
+                        scratch
+                            .sp_pattern_key_list
+                            .push((dist as usize, [k0, k1, k2, k3, k4]));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut image_pattern_largest_distance = None;
+
+    for key_idx in 0..scratch.sp_pattern_key_list.len() {
+        let pattern_key = scratch.sp_pattern_key_list[key_idx].1;
+        let pattern_key_hash = Solver::compute_pattern_key_hash(&pattern_key, ctx.p_bins);
+        let hash_index = Solver::pattern_key_hash_to_index(
+            pattern_key_hash,
+            (ctx.pattern_catalog_flat.len() / p_size) as u64,
+            ctx.linear_probe,
+        );
+
+        Solver::get_all_patterns_for_index_inplace(
+            pattern_key_hash,
+            hash_index,
+            image_pattern_largest_edge,
+            ctx.options.fov_estimate.map(|x| x.to_radians()),
+            ctx.options.fov_max_error.map(|x| x.to_radians()),
+            ctx.pattern_catalog_flat,
+            p_size,
+            ctx.pattern_key_hashes,
+            ctx.pattern_largest_edge,
+            ctx.star_table_flat,
+            ctx.linear_probe,
+            &mut scratch.sp_hash_match_inds,
+            &mut scratch.sp_cat_edges_list,
+            &mut scratch.sp_cat_vectors_list,
+        );
+
+        for cat_idx in 0..scratch.sp_cat_edges_list.len() {
+            let catalog_largest_edge = *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
+            let mut valid = true;
+            for x in 0..5 {
+                let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x] / catalog_largest_edge;
+                let img_ratio = edges[x] / image_pattern_largest_edge;
+                if cat_ratio < img_ratio - ctx.p_max_err || cat_ratio > img_ratio + ctx.p_max_err {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            // We have a matched pattern! Calculate refined FOV
+            let fov;
+            if ctx.options.fov_estimate.is_some() {
+                fov = catalog_largest_edge / image_pattern_largest_edge * ctx.fov_initial;
+            } else {
+                if image_pattern_largest_distance.is_none() {
+                    let pts = [
+                        image_centroids_undist[p_i],
+                        image_centroids_undist[p_j],
+                        image_centroids_undist[p_k],
+                        image_centroids_undist[p_l],
+                    ];
+                    let mut max_dist = 0.0;
+                    for r in 0..4 {
+                        for c in (r + 1)..4 {
+                            let d = ((pts[r][0] - pts[c][0]).powi(2)
+                                + (pts[r][1] - pts[c][1]).powi(2))
+                            .sqrt();
+                            if d > max_dist {
+                                max_dist = d;
+                            }
+                        }
+                    }
+                    image_pattern_largest_distance = Some(max_dist);
+                }
+                let f = image_pattern_largest_distance.unwrap()
+                    / 2.0
+                    / (catalog_largest_edge / 2.0).tan();
+                fov = 2.0 * (ctx.width / 2.0 / f).atan();
+            }
+
+            // Re-calculate vectors uniquely sorted by radius to centroid
+            let pts = [
+                image_centroids_undist[p_i],
+                image_centroids_undist[p_j],
+                image_centroids_undist[p_k],
+                image_centroids_undist[p_l],
+            ];
+            compute_vectors_inplace(&pts, ctx.height, ctx.width, fov, &mut scratch.sp_p_vecs, 4);
+            sort_vectors_by_radius_inplace(
+                &scratch.sp_p_vecs,
+                &mut scratch.sp_image_pattern_vectors_sorted,
+                &mut scratch.sp_radii_scratch,
+                4,
+            );
+
+            if ctx.presorted {
+                scratch.sp_catalog_pattern_vectors_sorted[..4]
+                    .copy_from_slice(&scratch.sp_cat_vectors_list[cat_idx][..4]);
+            } else {
+                sort_vectors_by_radius_inplace(
+                    &scratch.sp_cat_vectors_list[cat_idx],
+                    &mut scratch.sp_catalog_pattern_vectors_sorted,
+                    &mut scratch.sp_radii_scratch,
+                    4,
+                );
+            };
+
+            let (rotation_matrix, _det) = match find_rotation_matrix_and_det_inplace(
+                &scratch.sp_image_pattern_vectors_sorted,
+                &scratch.sp_catalog_pattern_vectors_sorted,
+                4,
+            ) {
+                Some(res) => res,
+                None => continue,
+            };
+
+            // Attitude-hint early rejection: skip the expensive
+            // KD-tree verification if this candidate's orientation
+            // is outside the hint cone. Free after the rotation
+            // matrix is already in hand.
+            if let Some(hint_q) = &ctx.options.attitude_hint {
+                if geodesic_angle_deg(hint_q, &rotation_matrix) > ctx.options.hint_uncertainty_deg {
+                    continue;
+                }
+            }
+
+            if let Some(solution) = verify_and_build_solution(
+                scratch,
+                ctx.star_kd_tree,
+                ctx.star_table_flat,
+                ctx.star_catalog_ids,
+                ctx.db_props,
+                ctx.num_patterns,
+                &rotation_matrix,
+                fov,
+                ctx.height,
+                ctx.width,
+                ctx.options,
+                ctx.image_centroids,
+                image_centroids_undist,
+                ctx.num_extracted_stars,
+                ctx.match_threshold,
+                ctx.t0_solve,
+            ) {
+                return Some(solution);
+            }
+        }
+    }
+    None
 }
 
 // --- Scratchpad for Zero-Allocation Combinatorics ---
@@ -1593,14 +1872,6 @@ impl Solver {
             }
         }
 
-        let scratch = &mut self.scratch;
-        let star_kd_tree = &self.star_kd_tree;
-        let star_table_flat = &self.star_table_flat;
-        let pattern_catalog_flat = &self.pattern_catalog_flat;
-        let pattern_key_hashes = &self.pattern_key_hashes;
-        let pattern_largest_edge = &self.pattern_largest_edge;
-        let linear_probe = self.linear_probe;
-
         let n_inds = pattern_centroids_inds.len();
 
         // Fail fast: if spatial thinning leaves us with too few stars to form a single pattern, abort.
@@ -1612,243 +1883,108 @@ impl Solver {
             };
         }
 
-        // -------------------------------------------------------------
-        // Allocation-free native iteration mirroring breadth-first order
-        // -------------------------------------------------------------
-        for l in 3..n_inds {
-            for k in 2..l {
-                for j in 1..k {
-                    for i in 0..j {
-                        // Check abort from watchdog thread or cancel_solve
-                        if self.abort.load(Ordering::Relaxed) {
-                            let status = if self.is_cancelled.load(Ordering::Relaxed) {
-                                SolveStatus::Cancelled
-                            } else {
-                                SolveStatus::Timeout
-                            };
-                            return Solution {
-                                status,
-                                t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                ..Default::default()
-                            };
+        let ctx = ComboContext {
+            precomputed_angles: &precomputed_angles,
+            num_vecs,
+            image_centroids: &image_centroids,
+            num_extracted_stars,
+            height,
+            width,
+            fov_initial,
+            p_bins,
+            p_max_err,
+            presorted,
+            match_threshold,
+            options: &options,
+            t0_solve,
+            star_kd_tree: &self.star_kd_tree,
+            star_table_flat: &self.star_table_flat,
+            pattern_catalog_flat: &self.pattern_catalog_flat,
+            pattern_key_hashes: &self.pattern_key_hashes,
+            pattern_largest_edge: &self.pattern_largest_edge,
+            star_catalog_ids: &self.star_catalog_ids,
+            db_props: &self.db_props,
+            num_patterns: self.num_patterns,
+            linear_probe: self.linear_probe,
+        };
+
+        if options.parallel && rayon::current_num_threads() > 1 {
+            // -------------------------------------------------------------
+            // Parallel search. The combination list is materialized in the
+            // exact breadth-first order of the serial loop, split into
+            // contiguous chunks, and scanned with find_map_first: the result
+            // is the leftmost (= earliest in serial order) verified solution,
+            // so the answer is identical to the serial path. Each worker gets
+            // its own Scratchpads and undistorted-centroid buffer (the
+            // distortion branch of verification refines the latter).
+            // -------------------------------------------------------------
+            let mut combos: Vec<[usize; 4]> =
+                Vec::with_capacity(n_inds * (n_inds - 1) * (n_inds - 2) * (n_inds - 3) / 24);
+            for l in 3..n_inds {
+                for k in 2..l {
+                    for j in 1..k {
+                        for i in 0..j {
+                            combos.push([
+                                pattern_centroids_inds[i],
+                                pattern_centroids_inds[j],
+                                pattern_centroids_inds[k],
+                                pattern_centroids_inds[l],
+                            ]);
                         }
+                    }
+                }
+            }
 
-                        let p_i = pattern_centroids_inds[i];
-                        let p_j = pattern_centroids_inds[j];
-                        let p_k = pattern_centroids_inds[k];
-                        let p_l = pattern_centroids_inds[l];
+            // Small chunks for load balancing; chunks left of a found match
+            // still complete (keeping determinism), so cap the tail latency.
+            let chunk_size = (combos.len() / (rayon::current_num_threads() * 8)).clamp(4, 64);
+            let abort = &self.abort;
+            let is_cancelled = &self.is_cancelled;
 
-                        // Fast direct memory lookups for pairwise distance angle metrics
-                        let mut edges = [
-                            precomputed_angles[p_i * num_vecs + p_j],
-                            precomputed_angles[p_i * num_vecs + p_k],
-                            precomputed_angles[p_i * num_vecs + p_l],
-                            precomputed_angles[p_j * num_vecs + p_k],
-                            precomputed_angles[p_j * num_vecs + p_l],
-                            precomputed_angles[p_k * num_vecs + p_l],
-                        ];
+            let result = combos.par_chunks(chunk_size).find_map_first(|chunk| {
+                let mut scratch = Scratchpads::new(p_size);
+                let mut undist_local = image_centroids_undist.clone();
+                for &[p_i, p_j, p_k, p_l] in chunk {
+                    // Check abort from watchdog thread or cancel_solve
+                    if abort.load(Ordering::Relaxed) {
+                        return Some(aborted_solution(is_cancelled, t0_solve));
+                    }
+                    if let Some(solution) =
+                        try_pattern_combo(&ctx, &mut scratch, &mut undist_local, p_i, p_j, p_k, p_l)
+                    {
+                        return Some(solution);
+                    }
+                }
+                None
+            });
 
-                        // Calculate edge angles and sort
-                        edges.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-                        let image_pattern_largest_edge = edges[5];
-
-                        // Min/max edge ratio bounds
-                        let mut key_space_min = [0; 5];
-                        let mut key_space_max = [0; 5];
-                        let mut target_keys = [0isize; 5];
-
-                        for x in 0..5 {
-                            let ratio = edges[x] / image_pattern_largest_edge;
-                            key_space_min[x] =
-                                ((ratio - p_max_err).max(0.0) * p_bins as f64) as usize;
-                            key_space_max[x] =
-                                ((ratio + p_max_err).min(1.0) * p_bins as f64) as usize;
-                            target_keys[x] = (ratio * p_bins as f64) as isize;
-                        }
-
-                        // Generate search space combinations via zero-allocation DFS (replaces Cartesian product)
-                        scratch.sp_pattern_key_list.clear();
-                        for k0 in key_space_min[0]..=key_space_max[0] {
-                            for k1 in key_space_min[1]..=key_space_max[1] {
-                                for k2 in key_space_min[2]..=key_space_max[2] {
-                                    for k3 in key_space_min[3]..=key_space_max[3] {
-                                        for k4 in key_space_min[4]..=key_space_max[4] {
-                                            let diff0 = k0 as isize - target_keys[0];
-                                            let diff1 = k1 as isize - target_keys[1];
-                                            let diff2 = k2 as isize - target_keys[2];
-                                            let diff3 = k3 as isize - target_keys[3];
-                                            let diff4 = k4 as isize - target_keys[4];
-                                            let dist = diff0 * diff0
-                                                + diff1 * diff1
-                                                + diff2 * diff2
-                                                + diff3 * diff3
-                                                + diff4 * diff4;
-                                            scratch
-                                                .sp_pattern_key_list
-                                                .push((dist as usize, [k0, k1, k2, k3, k4]));
-                                        }
-                                    }
-                                }
+            if let Some(solution) = result {
+                return solution;
+            }
+        } else {
+            // -------------------------------------------------------------
+            // Allocation-free native iteration mirroring breadth-first order
+            // -------------------------------------------------------------
+            let scratch = &mut self.scratch;
+            for l in 3..n_inds {
+                for k in 2..l {
+                    for j in 1..k {
+                        for i in 0..j {
+                            // Check abort from watchdog thread or cancel_solve
+                            if self.abort.load(Ordering::Relaxed) {
+                                return aborted_solution(&self.is_cancelled, t0_solve);
                             }
-                        }
 
-                        let mut image_pattern_largest_distance = None;
-
-                        for key_idx in 0..scratch.sp_pattern_key_list.len() {
-                            let pattern_key = scratch.sp_pattern_key_list[key_idx].1;
-                            let pattern_key_hash =
-                                Self::compute_pattern_key_hash(&pattern_key, p_bins);
-                            let hash_index = Self::pattern_key_hash_to_index(
-                                pattern_key_hash,
-                                (pattern_catalog_flat.len() / p_size) as u64,
-                                linear_probe,
-                            );
-
-                            Self::get_all_patterns_for_index_inplace(
-                                pattern_key_hash,
-                                hash_index,
-                                image_pattern_largest_edge,
-                                options.fov_estimate.map(|x| x.to_radians()),
-                                options.fov_max_error.map(|x| x.to_radians()),
-                                pattern_catalog_flat,
-                                p_size,
-                                pattern_key_hashes,
-                                pattern_largest_edge,
-                                star_table_flat,
-                                linear_probe,
-                                &mut scratch.sp_hash_match_inds,
-                                &mut scratch.sp_cat_edges_list,
-                                &mut scratch.sp_cat_vectors_list,
-                            );
-
-                            for cat_idx in 0..scratch.sp_cat_edges_list.len() {
-                                let catalog_largest_edge =
-                                    *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
-                                let mut valid = true;
-                                for x in 0..5 {
-                                    let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x]
-                                        / catalog_largest_edge;
-                                    let img_ratio = edges[x] / image_pattern_largest_edge;
-                                    if cat_ratio < img_ratio - p_max_err
-                                        || cat_ratio > img_ratio + p_max_err
-                                    {
-                                        valid = false;
-                                        break;
-                                    }
-                                }
-                                if !valid {
-                                    continue;
-                                }
-
-                                // We have a matched pattern! Calculate refined FOV
-                                let fov;
-                                if options.fov_estimate.is_some() {
-                                    fov = catalog_largest_edge / image_pattern_largest_edge
-                                        * fov_initial;
-                                } else {
-                                    if image_pattern_largest_distance.is_none() {
-                                        let pts = [
-                                            image_centroids_undist[p_i],
-                                            image_centroids_undist[p_j],
-                                            image_centroids_undist[p_k],
-                                            image_centroids_undist[p_l],
-                                        ];
-                                        let mut max_dist = 0.0;
-                                        for r in 0..4 {
-                                            for c in (r + 1)..4 {
-                                                let d = ((pts[r][0] - pts[c][0]).powi(2)
-                                                    + (pts[r][1] - pts[c][1]).powi(2))
-                                                .sqrt();
-                                                if d > max_dist {
-                                                    max_dist = d;
-                                                }
-                                            }
-                                        }
-                                        image_pattern_largest_distance = Some(max_dist);
-                                    }
-                                    let f = image_pattern_largest_distance.unwrap()
-                                        / 2.0
-                                        / (catalog_largest_edge / 2.0).tan();
-                                    fov = 2.0 * (width / 2.0 / f).atan();
-                                }
-
-                                // Re-calculate vectors uniquely sorted by radius to centroid
-                                let pts = [
-                                    image_centroids_undist[p_i],
-                                    image_centroids_undist[p_j],
-                                    image_centroids_undist[p_k],
-                                    image_centroids_undist[p_l],
-                                ];
-                                compute_vectors_inplace(
-                                    &pts,
-                                    height,
-                                    width,
-                                    fov,
-                                    &mut scratch.sp_p_vecs,
-                                    4,
-                                );
-                                sort_vectors_by_radius_inplace(
-                                    &scratch.sp_p_vecs,
-                                    &mut scratch.sp_image_pattern_vectors_sorted,
-                                    &mut scratch.sp_radii_scratch,
-                                    4,
-                                );
-
-                                if presorted {
-                                    scratch.sp_catalog_pattern_vectors_sorted[..4].copy_from_slice(
-                                        &scratch.sp_cat_vectors_list[cat_idx][..4],
-                                    );
-                                } else {
-                                    sort_vectors_by_radius_inplace(
-                                        &scratch.sp_cat_vectors_list[cat_idx],
-                                        &mut scratch.sp_catalog_pattern_vectors_sorted,
-                                        &mut scratch.sp_radii_scratch,
-                                        4,
-                                    );
-                                };
-
-                                let (rotation_matrix, _det) =
-                                    match find_rotation_matrix_and_det_inplace(
-                                        &scratch.sp_image_pattern_vectors_sorted,
-                                        &scratch.sp_catalog_pattern_vectors_sorted,
-                                        4,
-                                    ) {
-                                        Some(res) => res,
-                                        None => continue,
-                                    };
-
-                                // Attitude-hint early rejection: skip the expensive
-                                // KD-tree verification if this candidate's orientation
-                                // is outside the hint cone. Free after the rotation
-                                // matrix is already in hand.
-                                if let Some(hint_q) = &options.attitude_hint {
-                                    if geodesic_angle_deg(hint_q, &rotation_matrix)
-                                        > options.hint_uncertainty_deg
-                                    {
-                                        continue;
-                                    }
-                                }
-
-                                if let Some(solution) = verify_and_build_solution(
-                                    scratch,
-                                    star_kd_tree,
-                                    star_table_flat,
-                                    &self.star_catalog_ids,
-                                    &self.db_props,
-                                    self.num_patterns,
-                                    &rotation_matrix,
-                                    fov,
-                                    height,
-                                    width,
-                                    &options,
-                                    &image_centroids,
-                                    &mut image_centroids_undist,
-                                    num_extracted_stars,
-                                    match_threshold,
-                                    t0_solve,
-                                ) {
-                                    return solution;
-                                }
+                            if let Some(solution) = try_pattern_combo(
+                                &ctx,
+                                scratch,
+                                &mut image_centroids_undist,
+                                pattern_centroids_inds[i],
+                                pattern_centroids_inds[j],
+                                pattern_centroids_inds[k],
+                                pattern_centroids_inds[l],
+                            ) {
+                                return solution;
                             }
                         }
                     }
