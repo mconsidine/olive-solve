@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "tetra3"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "cedar_detect",
  "image",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "tetra3-py"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "numpy",
  "pyo3",
@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "tetra3-server"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "clap",
  "image",
