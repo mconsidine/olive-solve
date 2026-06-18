@@ -65,7 +65,7 @@
 //    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //    SOFTWARE.
 
-use kiddo::{KdTree, SquaredEuclidean};
+use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::{DMatrix, DVector, Matrix3, SVD};
 use ndarray::{Array1, Array2};
 use npyz::NpyFile;
@@ -162,29 +162,6 @@ pub struct CatalogStar {
     pub dec: f64,
     pub vec: [f64; 3],
     pub mag: f64,
-}
-
-// --- Watchdog Types ---
-
-struct WatchdogState {
-    armed: bool,
-    shutdown: bool,
-    timeout: Duration,
-}
-
-struct WatchdogGuard<'a> {
-    sync: &'a (Mutex<WatchdogState>, Condvar),
-}
-
-impl<'a> Drop for WatchdogGuard<'a> {
-    fn drop(&mut self) {
-        let (lock, cvar) = self.sync;
-        // The instant the solver finishes or panics, we disarm the watchdog.
-        if let Ok(mut state) = lock.lock() {
-            state.armed = false;
-            cvar.notify_all();
-        }
-    }
 }
 
 // --- High-Performance Native Math Helpers ---
@@ -459,7 +436,7 @@ fn find_centroid_matches_inplace(
 #[allow(clippy::too_many_arguments)]
 fn verify_and_build_solution(
     scratch: &mut Scratchpads,
-    star_kd_tree: &KdTree<f64, 3>,
+    star_kd_tree: &ImmutableKdTree<f64, 3>,
     star_table_flat: &[CatalogStar],
     star_catalog_ids: &Option<Array2<u32>>,
     db_props: &HashMap<String, f64>,
@@ -486,7 +463,7 @@ fn verify_and_build_solution(
     // Epsilon to capture borders safely in f64
     let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
     let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
-        .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
+        .within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
         .into_iter()
         .map(|n| n.item as usize)
         .collect();
@@ -499,53 +476,41 @@ fn verify_and_build_solution(
         return None;
     }
 
-    if scratch.sp_nearby_cat_star_vectors.len() < num_nearby {
-        let new_size = num_nearby.max(scratch.sp_nearby_cat_star_vectors.len() * 2);
-        scratch
-            .sp_nearby_cat_star_vectors
-            .resize(new_size, [0.0; 3]);
-        scratch
-            .sp_nearby_cat_star_vectors_derot
-            .resize(new_size, [0.0; 3]);
-        scratch
-            .sp_nearby_cat_star_centroids_all
-            .resize(new_size, [0.0; 2]);
-    }
+    let target_crop_len = 2 * num_extracted_stars;
 
-    for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
-        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
-    }
-
-    rotate_vectors_inplace(
-        rotation_matrix,
-        &scratch.sp_nearby_cat_star_vectors[..num_nearby],
-        false,
-        &mut scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
-        num_nearby,
-    );
-    compute_centroids_inplace(
-        &scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
-        height,
-        width,
-        fov,
-        &mut scratch.sp_nearby_cat_star_centroids_all[..num_nearby],
-        &mut scratch.sp_kept,
-        num_nearby,
-    );
-
-    let crop_len = scratch.sp_kept.len().min(2 * num_extracted_stars);
-
-    if scratch.sp_valid_cat_centroids.len() < crop_len {
-        let new_size = crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
+    if scratch.sp_valid_cat_centroids.len() < target_crop_len {
+        let new_size = target_crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
         scratch.sp_valid_cat_centroids.resize(new_size, [0.0; 2]);
         scratch.sp_valid_cat_vectors.resize(new_size, [0.0; 3]);
     }
     scratch.sp_valid_cat_inds.clear();
 
-    for (c_idx, &x) in scratch.sp_kept.iter().take(crop_len).enumerate() {
-        scratch.sp_valid_cat_centroids[c_idx] = scratch.sp_nearby_cat_star_centroids_all[x];
-        scratch.sp_valid_cat_vectors[c_idx] = scratch.sp_nearby_cat_star_vectors[x];
-        scratch.sp_valid_cat_inds.push(nearby_cat_stars_inds[x]);
+    let scale_factor_cent = -width / 2.0 / (fov / 2.0).tan();
+    let img_center_y = height / 2.0;
+    let img_center_x = width / 2.0;
+
+    let r = rotation_matrix;
+    let mut crop_len = 0;
+
+    for &star_idx in &nearby_cat_stars_inds {
+        let vec = star_table_flat[star_idx].vec;
+
+        let v0 = r[(0, 0)] * vec[0] + r[(0, 1)] * vec[1] + r[(0, 2)] * vec[2];
+        let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
+        let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
+
+        let cy = scale_factor_cent * (v2 / v0) + img_center_y;
+        let cx = scale_factor_cent * (v1 / v0) + img_center_x;
+
+        if cy > 0.0 && cx > 0.0 && cy < height && cx < width {
+            scratch.sp_valid_cat_centroids[crop_len] = [cy, cx];
+            scratch.sp_valid_cat_vectors[crop_len] = vec;
+            scratch.sp_valid_cat_inds.push(star_idx);
+            crop_len += 1;
+            if crop_len >= target_crop_len {
+                break;
+            }
+        }
     }
 
     let matched_stars = find_centroid_matches_inplace(
@@ -850,6 +815,8 @@ pub struct Scratchpads {
     pub sp_valid_cat_vectors: Vec<[f64; 3]>,
     pub sp_valid_cat_inds: Vec<usize>,
     pub sp_hash_match_inds: Vec<usize>,
+    pub sp_keep_for_patterns: Vec<bool>,
+    pub sp_precomputed_angles: Vec<f64>,
 }
 
 impl Scratchpads {
@@ -875,6 +842,8 @@ impl Scratchpads {
             sp_valid_cat_vectors: Vec::with_capacity(256),
             sp_valid_cat_inds: Vec::with_capacity(256),
             sp_hash_match_inds: Vec::with_capacity(64),
+            sp_keep_for_patterns: Vec::with_capacity(1024),
+            sp_precomputed_angles: Vec::with_capacity(2500),
         }
     }
 }
@@ -891,8 +860,9 @@ impl Scratchpads {
 pub struct Solver {
     // OPTIMIZATION: Highly optimized cache-aligned struct lists
     pub star_table_flat: Vec<CatalogStar>,
-    pub pattern_catalog_flat: Vec<usize>,
-    pub star_kd_tree: KdTree<f64, 3>,
+    pub pattern_catalog_flat: Vec<u32>,
+    pub probe_table: Vec<u32>,
+    pub star_kd_tree: ImmutableKdTree<f64, 3>,
 
     pub pattern_largest_edge: Option<Array1<f32>>,
     pub pattern_key_hashes: Option<Array1<u16>>,
@@ -902,11 +872,8 @@ pub struct Solver {
     pub linear_probe: bool,
     pub scratch: Scratchpads, // OPTIMIZATION: Instance-level persistent memory context
 
-    // Watchdog context
-    abort: Arc<AtomicBool>,
-    is_cancelled: Arc<AtomicBool>,
-    watchdog_sync: Arc<(Mutex<WatchdogState>, Condvar)>,
-    watchdog_handle: Option<JoinHandle<()>>,
+    // Control flags for Python threading
+    pub is_cancelled: Arc<AtomicBool>,
 }
 
 impl Solver {
@@ -950,7 +917,7 @@ impl Solver {
         // tetra3.py optimizes the data type of the pattern_catalog based on the number of patterns.
         let read_pattern_catalog = |arc: &mut ZipArchive<File>,
                                     name: &str|
-         -> Result<Array2<usize>, Box<dyn std::error::Error>> {
+         -> Result<Array2<u32>, Box<dyn std::error::Error>> {
             let mut zf = arc.by_name(name)?;
             let mut buf = Vec::new();
             zf.read_to_end(&mut buf)?;
@@ -967,7 +934,7 @@ impl Solver {
             if let Ok(npy) = NpyFile::new(&mut cursor)
                 && let Ok(data_u8) = npy.into_vec::<u8>()
             {
-                let data: Vec<usize> = data_u8.into_iter().map(|v| v as usize).collect();
+                let data: Vec<u32> = data_u8.into_iter().map(|v| v as u32).collect();
                 return Ok(Array2::from_shape_vec(
                     (shape[0] as usize, shape[1] as usize),
                     data,
@@ -979,7 +946,7 @@ impl Solver {
             if let Ok(npy) = NpyFile::new(&mut cursor)
                 && let Ok(data_u16) = npy.into_vec::<u16>()
             {
-                let data: Vec<usize> = data_u16.into_iter().map(|v| v as usize).collect();
+                let data: Vec<u32> = data_u16.into_iter().map(|v| v as u32).collect();
                 return Ok(Array2::from_shape_vec(
                     (shape[0] as usize, shape[1] as usize),
                     data,
@@ -990,10 +957,9 @@ impl Solver {
             let mut cursor = Cursor::new(&buf);
             let npy = NpyFile::new(&mut cursor)?;
             let data_u32: Vec<u32> = npy.into_vec()?;
-            let data: Vec<usize> = data_u32.into_iter().map(|v| v as usize).collect();
             Ok(Array2::from_shape_vec(
                 (shape[0] as usize, shape[1] as usize),
-                data,
+                data_u32,
             )?)
         };
 
@@ -1093,10 +1059,33 @@ impl Solver {
             pattern_catalog_flat.push(val);
         }
 
-        let mut star_kd_tree = KdTree::new();
-        for (i, star) in star_table_flat.iter().enumerate() {
-            star_kd_tree.add(&star.vec, i as u64);
+        let num_patterns_allocated = pattern_catalog_flat.len() / 4;
+        let mut probe_table = Vec::with_capacity(num_patterns_allocated);
+        let has_pattern_key_hashes = pattern_key_hashes.is_some();
+        let hashes_ref = pattern_key_hashes.as_ref().map(|a| a.as_slice().unwrap());
+
+        for i in 0..num_patterns_allocated {
+            let row_start = i * 4;
+            if pattern_catalog_flat[row_start] == 0
+                && pattern_catalog_flat[row_start + 1] == 0
+                && pattern_catalog_flat[row_start + 2] == 0
+                && pattern_catalog_flat[row_start + 3] == 0
+            {
+                probe_table.push(u32::MAX);
+            } else {
+                if has_pattern_key_hashes {
+                    probe_table.push(hashes_ref.unwrap()[i] as u32);
+                } else {
+                    probe_table.push(0);
+                }
+            }
         }
+
+        let mut points: Vec<[f64; 3]> = Vec::with_capacity(star_table_flat.len());
+        for star in star_table_flat.iter() {
+            points.push(star.vec);
+        }
+        let star_kd_tree = ImmutableKdTree::new_from_slice(&points);
 
         let mut num_patterns = pattern_catalog_arr.nrows() / 2;
         let mut db_props = HashMap::new();
@@ -1205,48 +1194,12 @@ impl Solver {
             return Err("Only databases with a pattern size of 4 are supported".into());
         }
 
-        let abort = Arc::new(AtomicBool::new(false));
         let is_cancelled = Arc::new(AtomicBool::new(false));
-        let watchdog_sync = Arc::new((
-            Mutex::new(WatchdogState {
-                armed: false,
-                shutdown: false,
-                timeout: Duration::from_millis(5000),
-            }),
-            Condvar::new(),
-        ));
-
-        let thread_abort = Arc::clone(&abort);
-        let thread_sync = Arc::clone(&watchdog_sync);
-
-        let watchdog_handle = std::thread::spawn(move || {
-            let (lock, cvar) = &*thread_sync;
-            let mut state = lock.lock().unwrap();
-
-            loop {
-                while !state.armed && !state.shutdown {
-                    state = cvar.wait(state).unwrap();
-                }
-
-                if state.shutdown {
-                    break;
-                }
-
-                let timeout_duration = state.timeout;
-                let (new_state, timeout_result) =
-                    cvar.wait_timeout(state, timeout_duration).unwrap();
-                state = new_state;
-
-                if timeout_result.timed_out() && state.armed {
-                    thread_abort.store(true, Ordering::Relaxed);
-                    state.armed = false; // Reset to prevent double-firing
-                }
-            }
-        });
 
         Ok(Solver {
             star_table_flat,
             pattern_catalog_flat,
+            probe_table,
             star_kd_tree,
             pattern_largest_edge,
             pattern_key_hashes,
@@ -1255,27 +1208,25 @@ impl Solver {
             num_patterns,
             linear_probe,
             scratch: Scratchpads::new(p_size),
-            abort,
             is_cancelled,
-            watchdog_sync,
-            watchdog_handle: Some(watchdog_handle),
         })
     }
 
-    pub fn cancel_solve(&mut self) {
+    pub fn cancel_solve(&self) {
         self.is_cancelled.store(true, Ordering::Relaxed);
-        self.abort.store(true, Ordering::Relaxed);
     }
 
     #[inline(always)]
     fn compute_pattern_key_hash(pattern_key: &[usize; 5], bin_factor: usize) -> u64 {
-        let mut hash: u64 = 0;
-        let mut multiplier: u64 = 1;
-        for &k in pattern_key {
-            hash += (k as u64) * multiplier;
-            multiplier *= bin_factor as u64;
-        }
-        hash
+        let bf = bin_factor as u64;
+        let bf2 = bf * bf;
+        let bf3 = bf2 * bf;
+        let bf4 = bf3 * bf;
+        (pattern_key[0] as u64)
+            + (pattern_key[1] as u64) * bf
+            + (pattern_key[2] as u64) * bf2
+            + (pattern_key[3] as u64) * bf3
+            + (pattern_key[4] as u64) * bf4
     }
 
     #[inline(always)]
@@ -1288,33 +1239,29 @@ impl Solver {
     }
 
     fn get_table_indices_from_hash_inplace(
-        pattern_catalog_flat: &[usize],
-        p_size: usize,
+        probe_table: &[u32],
         hash_index: u64,
         linear_probe: bool,
+        has_hashes: bool,
+        key_hash16: u16,
         out_found: &mut Vec<usize>,
     ) {
         out_found.clear();
-        let max_ind = (pattern_catalog_flat.len() / p_size) as u64;
+        let max_ind = probe_table.len() as u64;
         for c in 0.. {
             let i = if linear_probe {
                 (hash_index + c) % max_ind
             } else {
                 (hash_index + c * c) % max_ind
-            };
-            let row_start = (i as usize) * p_size;
+            } as usize;
 
-            let mut is_empty = true;
-            for j in 0..p_size {
-                if pattern_catalog_flat[row_start + j] != 0 {
-                    is_empty = false;
-                    break;
-                }
-            }
-            if is_empty {
+            let probe_val = probe_table[i];
+            if probe_val == u32::MAX {
                 break;
             }
-            out_found.push(i as usize);
+            if !has_hashes || probe_val == key_hash16 as u32 {
+                out_found.push(i);
+            }
         }
     }
 
@@ -1324,7 +1271,8 @@ impl Solver {
         image_pattern_largest_edge: f64,
         fov_estimate: Option<f64>,
         fov_max_error: Option<f64>,
-        pattern_catalog_flat: &[usize],
+        pattern_catalog_flat: &[u32],
+        probe_table: &[u32],
         p_size: usize,
         pattern_key_hashes: &Option<Array1<u16>>,
         pattern_largest_edge: &Option<Array1<f32>>,
@@ -1334,22 +1282,21 @@ impl Solver {
         out_edges: &mut Vec<Vec<f64>>,
         out_vectors: &mut Vec<Vec<[f64; 3]>>,
     ) {
+        let has_hashes = pattern_key_hashes.is_some();
+        let key_hash16 = (pattern_key_hash & 0xffff) as u16;
+
         Self::get_table_indices_from_hash_inplace(
-            pattern_catalog_flat,
-            p_size,
+            probe_table,
             hash_index,
             linear_probe,
+            has_hashes,
+            key_hash16,
             sp_hash_match_inds,
         );
         if sp_hash_match_inds.is_empty() {
             out_edges.clear();
             out_vectors.clear();
             return;
-        }
-
-        if let Some(hashes) = pattern_key_hashes {
-            let key_hash16 = (pattern_key_hash & 0xffff) as u16;
-            sp_hash_match_inds.retain(|&idx| hashes[idx] == key_hash16);
         }
 
         if let (Some(largest_edges), Some(f_est), Some(f_err)) =
@@ -1376,7 +1323,7 @@ impl Solver {
             let row_start = idx * p_size;
             let vecs = &mut out_vectors[out_idx];
             for i in 0..p_size {
-                let star_id = pattern_catalog_flat[row_start + i];
+                let star_id = pattern_catalog_flat[row_start + i] as usize;
                 vecs[i] = star_table_flat[star_id].vec;
             }
 
@@ -1403,22 +1350,7 @@ impl Solver {
         let t0_solve = Instant::now();
         let (height, width) = size;
 
-        self.abort.store(false, Ordering::Relaxed);
         self.is_cancelled.store(false, Ordering::Relaxed);
-
-        if let Some(timeout_ms) = options.solve_timeout_ms {
-            let (lock, cvar) = &*self.watchdog_sync;
-            if let Ok(mut state) = lock.lock() {
-                state.armed = true;
-                state.timeout = Duration::from_secs_f64(timeout_ms / 1000.0);
-                cvar.notify_one(); // Wake the watchdog up!
-            }
-        }
-
-        // Guarantees the watchdog is disarmed upon *any* return path
-        let _watchdog_guard = WatchdogGuard {
-            sync: &self.watchdog_sync,
-        };
 
         let fov_initial = options
             .fov_estimate
@@ -1455,31 +1387,36 @@ impl Solver {
         // Thinning strategy
         let pattern_stars_separation_pixels =
             width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
-        let mut keep_for_patterns = vec![false; num_centroids_raw];
+        let sep_sq = pattern_stars_separation_pixels.powi(2);
+
+        let scratch = &mut self.scratch;
+        scratch.sp_keep_for_patterns.clear();
+        scratch
+            .sp_keep_for_patterns
+            .resize(num_centroids_raw, false);
 
         for i in 0..num_centroids_raw {
             let mut occupied = false;
             let c_i = star_centroids.row(i);
             for j in 0..i {
-                if keep_for_patterns[j] {
+                if scratch.sp_keep_for_patterns[j] {
                     let c_j = star_centroids.row(j);
-                    if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt()
-                        < pattern_stars_separation_pixels
-                    {
+                    if (c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2) < sep_sq {
                         occupied = true;
                         break;
                     }
                 }
             }
             if !occupied {
-                keep_for_patterns[i] = true;
+                scratch.sp_keep_for_patterns[i] = true;
             }
         }
 
-        let mut pattern_centroids_inds: Vec<usize> = keep_for_patterns
-            .into_iter()
+        let mut pattern_centroids_inds: Vec<usize> = scratch
+            .sp_keep_for_patterns
+            .iter()
             .enumerate()
-            .filter_map(|(i, keep)| if keep { Some(i) } else { None })
+            .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
             .collect();
 
         let mut num_extracted_stars = num_centroids_raw;
@@ -1506,9 +1443,16 @@ impl Solver {
         // OPTIMIZATION: Precompute pairwise distance angles exactly once.
         // Drops 6 sqrt and 6 asin operations per iteration inside the hot combinatorics loop.
         let num_vecs = image_centroids_vectors.len();
-        let mut precomputed_angles = vec![0.0; num_vecs * num_vecs];
-        for i in 0..num_vecs {
-            for j in (i + 1)..num_vecs {
+        scratch.sp_precomputed_angles.clear();
+        scratch
+            .sp_precomputed_angles
+            .resize(num_vecs * num_vecs, 0.0);
+
+        // ONLY precompute for pairs that are actually combinations evaluated!
+        for i_idx in 0..pattern_centroids_inds.len() {
+            for j_idx in (i_idx + 1)..pattern_centroids_inds.len() {
+                let i = pattern_centroids_inds[i_idx];
+                let j = pattern_centroids_inds[j_idx];
                 let v_i = image_centroids_vectors[i];
                 let v_j = image_centroids_vectors[j];
                 let dist = ((v_i[0] - v_j[0]).powi(2)
@@ -1516,8 +1460,8 @@ impl Solver {
                     + (v_i[2] - v_j[2]).powi(2))
                 .sqrt();
                 let ang = angle_from_distance(dist);
-                precomputed_angles[i * num_vecs + j] = ang;
-                precomputed_angles[j * num_vecs + i] = ang;
+                scratch.sp_precomputed_angles[i * num_vecs + j] = ang;
+                scratch.sp_precomputed_angles[j * num_vecs + i] = ang;
             }
         }
 
@@ -1543,24 +1487,30 @@ impl Solver {
         // -------------------------------------------------------------
         // Allocation-free native iteration mirroring breadth-first order
         // -------------------------------------------------------------
+        let mut solver_idx = 0;
         for l in 3..n_inds {
             for k in 2..l {
                 for j in 1..k {
-                    for i in 0..j {
-                        // Check abort from watchdog thread or cancel_solve
-                        if self.abort.load(Ordering::Relaxed) {
-                            let status = if self.is_cancelled.load(Ordering::Relaxed) {
-                                SolveStatus::Cancelled
-                            } else {
-                                SolveStatus::Timeout
-                            };
+                    solver_idx += 1;
+                    if solver_idx % 100 == 0 {
+                        if let Some(timeout_ms) = options.solve_timeout_ms {
+                            if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout_ms {
+                                return Solution {
+                                    status: SolveStatus::Timeout,
+                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                        if self.is_cancelled.load(Ordering::Relaxed) {
                             return Solution {
-                                status,
+                                status: SolveStatus::Cancelled,
                                 t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
                                 ..Default::default()
                             };
                         }
-
+                    }
+                    for i in 0..j {
                         let p_i = pattern_centroids_inds[i];
                         let p_j = pattern_centroids_inds[j];
                         let p_k = pattern_centroids_inds[k];
@@ -1568,12 +1518,12 @@ impl Solver {
 
                         // Fast direct memory lookups for pairwise distance angle metrics
                         let mut edges = [
-                            precomputed_angles[p_i * num_vecs + p_j],
-                            precomputed_angles[p_i * num_vecs + p_k],
-                            precomputed_angles[p_i * num_vecs + p_l],
-                            precomputed_angles[p_j * num_vecs + p_k],
-                            precomputed_angles[p_j * num_vecs + p_l],
-                            precomputed_angles[p_k * num_vecs + p_l],
+                            scratch.sp_precomputed_angles[p_i * num_vecs + p_j],
+                            scratch.sp_precomputed_angles[p_i * num_vecs + p_k],
+                            scratch.sp_precomputed_angles[p_i * num_vecs + p_l],
+                            scratch.sp_precomputed_angles[p_j * num_vecs + p_k],
+                            scratch.sp_precomputed_angles[p_j * num_vecs + p_l],
+                            scratch.sp_precomputed_angles[p_k * num_vecs + p_l],
                         ];
 
                         // Calculate edge angles and sort
@@ -1620,6 +1570,9 @@ impl Solver {
                             }
                         }
 
+                        // OPTIMIZATION: Sort by distance to center to search the most likely patterns first.
+                        scratch.sp_pattern_key_list.sort_unstable_by_key(|k| k.0);
+
                         let mut image_pattern_largest_distance = None;
 
                         for key_idx in 0..scratch.sp_pattern_key_list.len() {
@@ -1639,6 +1592,7 @@ impl Solver {
                                 options.fov_estimate.map(|x| x.to_radians()),
                                 options.fov_max_error.map(|x| x.to_radians()),
                                 pattern_catalog_flat,
+                                &self.probe_table,
                                 p_size,
                                 pattern_key_hashes,
                                 pattern_largest_edge,
@@ -1781,19 +1735,5 @@ impl Solver {
 }
 
 impl Drop for Solver {
-    fn drop(&mut self) {
-        // Tell the watchdog to shut down
-        {
-            let (lock, cvar) = &*self.watchdog_sync;
-            if let Ok(mut state) = lock.lock() {
-                state.shutdown = true;
-                cvar.notify_one();
-            }
-        }
-
-        // Wait for the thread to exit cleanly
-        if let Some(handle) = self.watchdog_handle.take() {
-            let _ = handle.join();
-        }
-    }
+    fn drop(&mut self) {}
 }
