@@ -229,19 +229,20 @@ fn compute_vectors_inplace(
     height: f64,
     width: f64,
     fov: f64,
-    out: &mut [[f64; 3]],
+    out: &mut Vec<[f64; 3]>,
     len: usize,
 ) {
     let scale_factor = (fov / 2.0).tan() / width * 2.0;
     let img_center_y = height / 2.0;
     let img_center_x = width / 2.0;
 
+    out.clear();
     for i in 0..len {
         let v0 = 1.0;
         let v1 = (img_center_x - centroids[i][1]) * scale_factor;
         let v2 = (img_center_y - centroids[i][0]) * scale_factor;
         let norm = (v0 * v0 + v1 * v1 + v2 * v2).sqrt();
-        out[i] = [v0 / norm, v1 / norm, v2 / norm];
+        out.push([v0 / norm, v1 / norm, v2 / norm]);
     }
 }
 
@@ -361,14 +362,17 @@ fn rotate_vectors_inplace(
     rot: &Matrix3<f64>,
     vecs: &[[f64; 3]],
     transpose_rot: bool,
-    out: &mut [[f64; 3]],
+    out: &mut Vec<[f64; 3]>,
     len: usize,
 ) {
     let r = if transpose_rot { rot.transpose() } else { *rot };
+    out.clear();
     for i in 0..len {
-        out[i][0] = r[(0, 0)] * vecs[i][0] + r[(0, 1)] * vecs[i][1] + r[(0, 2)] * vecs[i][2];
-        out[i][1] = r[(1, 0)] * vecs[i][0] + r[(1, 1)] * vecs[i][1] + r[(1, 2)] * vecs[i][2];
-        out[i][2] = r[(2, 0)] * vecs[i][0] + r[(2, 1)] * vecs[i][1] + r[(2, 2)] * vecs[i][2];
+        let mut row = [0.0; 3];
+        row[0] = r[(0, 0)] * vecs[i][0] + r[(0, 1)] * vecs[i][1] + r[(0, 2)] * vecs[i][2];
+        row[1] = r[(1, 0)] * vecs[i][0] + r[(1, 1)] * vecs[i][1] + r[(1, 2)] * vecs[i][2];
+        row[2] = r[(2, 0)] * vecs[i][0] + r[(2, 1)] * vecs[i][1] + r[(2, 2)] * vecs[i][2];
+        out.push(row);
     }
 }
 
@@ -404,9 +408,16 @@ fn find_centroid_matches_inplace(
     catalog_centroids: &[[f64; 2]],
     cat_len: usize,
     r: f64,
-) -> Vec<(usize, usize)> {
-    let mut matches = Vec::new();
+    out_matches: &mut Vec<(usize, usize)>,
+    matches: &mut Vec<(usize, usize)>,
+    matches1: &mut Vec<(usize, usize)>,
+) {
+    out_matches.clear();
+    matches.clear();
+    matches1.clear();
     let r_sq = r * r;
+
+    // Step 1: Find all matches
     for i in 0..img_len {
         for j in 0..cat_len {
             let dy = image_centroids[i][0] - catalog_centroids[j][0];
@@ -417,19 +428,25 @@ fn find_centroid_matches_inplace(
         }
     }
 
-    let mut unique_col1 = std::collections::BTreeMap::new();
-    for (idx, &(_, j)) in matches.iter().enumerate() {
-        unique_col1.entry(j).or_insert(idx);
+    // Step 2: unique_col1 = np.unique(matches[:, 1], return_index=True)
+    matches.sort_by_key(|&(i, j)| (j, i));
+    let mut last_j = usize::MAX;
+    for &(i, j) in matches.iter() {
+        if j != last_j {
+            matches1.push((i, j));
+            last_j = j;
+        }
     }
-    let indices1: Vec<usize> = unique_col1.values().cloned().collect();
-    let matches1: Vec<(usize, usize)> = indices1.into_iter().map(|idx| matches[idx]).collect();
 
-    let mut unique_col0 = std::collections::BTreeMap::new();
-    for (idx, &(i, _)) in matches1.iter().enumerate() {
-        unique_col0.entry(i).or_insert(idx);
+    // Step 3: unique_col0 = np.unique(matches1[:, 0], return_index=True)
+    matches1.sort_by_key(|&(i, j)| (i, j));
+    let mut last_i = usize::MAX;
+    for &(i, j) in matches1.iter() {
+        if i != last_i {
+            out_matches.push((i, j));
+            last_i = i;
+        }
     }
-    let indices0: Vec<usize> = unique_col0.values().cloned().collect();
-    indices0.into_iter().map(|idx| matches1[idx]).collect()
 }
 
 // Helper to build the solution
@@ -461,17 +478,14 @@ fn verify_and_build_solution(
     ];
 
     // Epsilon to capture borders safely in f64
-    let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
-    let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
-        .within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
-        .into_iter()
-        .map(|n| n.item as usize)
-        .collect();
+    let max_dist_sq = (distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8);
+    let mut nearby_nodes = star_kd_tree
+        .within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq);
 
     // Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
-    nearby_cat_stars_inds.sort_unstable();
+    nearby_nodes.sort_unstable_by_key(|n| n.item);
 
-    let num_nearby = nearby_cat_stars_inds.len();
+    let num_nearby = nearby_nodes.len();
     if num_nearby == 0 {
         return None;
     }
@@ -492,19 +506,20 @@ fn verify_and_build_solution(
     let r = rotation_matrix;
     let mut crop_len = 0;
 
-    for &star_idx in &nearby_cat_stars_inds {
+    for node in &nearby_nodes {
+        let star_idx = node.item as usize;
         let vec = star_table_flat[star_idx].vec;
 
-        let v0 = r[(0, 0)] * vec[0] + r[(0, 1)] * vec[1] + r[(0, 2)] * vec[2];
-        let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
-        let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
+        let v0 = r[(0, 0)] * vec[0] as f64 + r[(0, 1)] * vec[1] as f64 + r[(0, 2)] * vec[2] as f64;
+        let v1 = r[(1, 0)] * vec[0] as f64 + r[(1, 1)] * vec[1] as f64 + r[(1, 2)] * vec[2] as f64;
+        let v2 = r[(2, 0)] * vec[0] as f64 + r[(2, 1)] * vec[1] as f64 + r[(2, 2)] * vec[2] as f64;
 
         let cy = scale_factor_cent * (v2 / v0) + img_center_y;
         let cx = scale_factor_cent * (v1 / v0) + img_center_x;
 
         if cy > 0.0 && cx > 0.0 && cy < height && cx < width {
             scratch.sp_valid_cat_centroids[crop_len] = [cy, cx];
-            scratch.sp_valid_cat_vectors[crop_len] = vec;
+            scratch.sp_valid_cat_vectors[crop_len] = [vec[0] as f64, vec[1] as f64, vec[2] as f64];
             scratch.sp_valid_cat_inds.push(star_idx);
             crop_len += 1;
             if crop_len >= target_crop_len {
@@ -513,13 +528,17 @@ fn verify_and_build_solution(
         }
     }
 
-    let matched_stars = find_centroid_matches_inplace(
+    find_centroid_matches_inplace(
         image_centroids_undist,
         num_extracted_stars,
         &scratch.sp_valid_cat_centroids,
         crop_len,
         width * options.match_radius,
+        &mut scratch.sp_matched_stars,
+        &mut scratch.sp_matches_scratch,
+        &mut scratch.sp_matches1_scratch,
     );
+    let matched_stars = &scratch.sp_matched_stars;
 
     // Probability calculation
     let num_star_matches = matched_stars.len();
@@ -534,17 +553,17 @@ fn verify_and_build_solution(
     }
 
     // We passed all checks. Complete the final exact solution details
-    let mut matched_img_cents = Vec::with_capacity(num_star_matches);
-    let mut matched_cat_vecs = Vec::with_capacity(num_star_matches);
-    for &(img_idx, cat_idx) in &matched_stars {
-        matched_img_cents.push(image_centroids_undist[img_idx]);
-        matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
+    scratch.sp_matched_img_cents.clear();
+    scratch.sp_matched_cat_vecs.clear();
+    for &(img_idx, cat_idx) in matched_stars {
+        scratch.sp_matched_img_cents.push(image_centroids_undist[img_idx]);
+        scratch.sp_matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
     }
 
-    let matched_img_vecs = compute_vectors_flat(&matched_img_cents, height, width, fov);
+    compute_vectors_inplace(&scratch.sp_matched_img_cents, height, width, fov, &mut scratch.sp_matched_img_vecs, num_star_matches);
     let (precise_rotation_matrix, precise_det) = find_rotation_matrix_and_det_inplace(
-        &matched_img_vecs,
-        &matched_cat_vecs,
+        &scratch.sp_matched_img_vecs,
+        &scratch.sp_matched_cat_vecs,
         num_star_matches,
     )?;
 
@@ -553,16 +572,19 @@ fn verify_and_build_solution(
         // Refine fov & distortion using Least Squares System
         // A = [tangent, radius^3], b = [radius]
         // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
-        let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
-        let mut b_na = DVector::<f64>::zeros(num_star_matches);
-        let mut derotated_matched_cat = vec![[0.0; 3]; num_star_matches];
         rotate_vectors_inplace(
             &precise_rotation_matrix,
-            &matched_cat_vecs,
+            &scratch.sp_matched_cat_vecs,
             false,
-            &mut derotated_matched_cat,
+            &mut scratch.sp_derotated_matched_cat,
             num_star_matches,
         );
+
+        let mut ata_00 = 0.0;
+        let mut ata_01 = 0.0;
+        let mut ata_11 = 0.0;
+        let mut atb_0 = 0.0;
+        let mut atb_1 = 0.0;
 
         for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
             let r_cent = image_centroids[img_idx];
@@ -570,59 +592,66 @@ fn verify_and_build_solution(
                 .sqrt()
                 / width
                 * 2.0;
-            let cat_derot = derotated_matched_cat[m_idx];
+            let cat_derot = scratch.sp_derotated_matched_cat[m_idx];
             let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
-            a_na[(m_idx, 0)] = tangent;
-            a_na[(m_idx, 1)] = r_dist.powi(3);
-            b_na[m_idx] = r_dist;
+            
+            let a0 = tangent;
+            let a1 = r_dist.powi(3);
+            let b = r_dist;
+
+            ata_00 += a0 * a0;
+            ata_01 += a0 * a1;
+            ata_11 += a1 * a1;
+            atb_0 += a0 * b;
+            atb_1 += a1 * b;
         }
 
-        // Pure-Rust SVD pseudo-inverse for distortions
-        let svd = SVD::new(a_na, true, true);
-        if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
-            let sol = pseudo_inv * b_na;
-            let f_val = sol[0] / (1.0 - sol[1]);
-            k_final = Some(sol[1]);
+        let det = ata_00 * ata_11 - ata_01 * ata_01;
+        if det.abs() > 1e-12 {
+            let sol_0 = (ata_11 * atb_0 - ata_01 * atb_1) / det;
+            let sol_1 = (ata_00 * atb_1 - ata_01 * atb_0) / det;
+
+            let f_val = sol_0 / (1.0 - sol_1);
+            k_final = Some(sol_1);
             fov = 2.0 * (1.0 / f_val).atan();
-            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol[1]);
+            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol_1);
             for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                matched_img_cents[m_idx] = image_centroids_undist[img_idx];
+                scratch.sp_matched_img_cents[m_idx] = image_centroids_undist[img_idx];
             }
         }
     }
 
-    let final_match_vectors = compute_vectors_flat(&matched_img_cents, height, width, fov);
-    let mut final_derotated = vec![[0.0; 3]; num_star_matches];
+    compute_vectors_inplace(&scratch.sp_matched_img_cents, height, width, fov, &mut scratch.sp_matched_img_vecs, num_star_matches);
     rotate_vectors_inplace(
         &precise_rotation_matrix,
-        &final_match_vectors,
+        &scratch.sp_matched_img_vecs,
         true,
-        &mut final_derotated,
+        &mut scratch.sp_final_derotated,
         num_star_matches,
     );
 
-    let mut distances: Vec<f64> = (0..num_star_matches)
-        .map(|m_idx| {
-            let row_f = final_derotated[m_idx];
-            let row_c = matched_cat_vecs[m_idx];
-            ((row_f[0] - row_c[0]).powi(2)
-                + (row_f[1] - row_c[1]).powi(2)
-                + (row_f[2] - row_c[2]).powi(2))
-            .sqrt()
-        })
-        .collect();
-    distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    scratch.sp_distances.clear();
+    for m_idx in 0..num_star_matches {
+        let row_f = scratch.sp_final_derotated[m_idx];
+        let row_c = scratch.sp_matched_cat_vecs[m_idx];
+        let dist = ((row_f[0] - row_c[0]).powi(2)
+            + (row_f[1] - row_c[1]).powi(2)
+            + (row_f[2] - row_c[2]).powi(2))
+        .sqrt();
+        scratch.sp_distances.push(dist);
+    }
+    scratch.sp_distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let p90_idx = (0.9 * (distances.len() - 1) as f64) as usize;
-    let p90_err_angle = angle_from_distance(distances[p90_idx]).to_degrees() * 3600.0;
-    let max_err_angle = angle_from_distance(*distances.last().unwrap()).to_degrees() * 3600.0;
+    let p90_idx = (0.9 * (scratch.sp_distances.len() - 1) as f64) as usize;
+    let p90_err_angle = angle_from_distance(scratch.sp_distances[p90_idx]).to_degrees() * 3600.0;
+    let max_err_angle = angle_from_distance(*scratch.sp_distances.last().unwrap()).to_degrees() * 3600.0;
 
     let mut rms_sum = 0.0;
-    for &d in &distances {
+    for &d in &scratch.sp_distances {
         let a = angle_from_distance(d);
         rms_sum += a * a;
     }
-    let rms_err_angle = (rms_sum / distances.len() as f64).sqrt().to_degrees() * 3600.0;
+    let rms_err_angle = (rms_sum / scratch.sp_distances.len() as f64).sqrt().to_degrees() * 3600.0;
 
     let ra = precise_rotation_matrix[(0, 1)]
         .atan2(precise_rotation_matrix[(0, 0)])
@@ -749,7 +778,7 @@ fn verify_and_build_solution(
         let mut m_cents = Vec::new();
         let mut m_stars = Vec::new();
         let mut m_ids = Vec::new();
-        for &(img_idx, cat_idx) in &matched_stars {
+        for &(img_idx, cat_idx) in matched_stars {
             m_cents.push(image_centroids_undist[img_idx]);
             let star_idx = scratch.sp_valid_cat_inds[cat_idx];
             let star = &star_table_flat[star_idx];
@@ -800,8 +829,8 @@ pub struct Scratchpads {
     pub sp_pattern_key_list: Vec<(usize, [usize; 5])>,
 
     // Core matching scratchpads
-    pub sp_cat_edges_list: Vec<Vec<f64>>,
-    pub sp_cat_vectors_list: Vec<Vec<[f64; 3]>>,
+    pub sp_cat_edges_list: Vec<[f64; 6]>,
+    pub sp_cat_vectors_list: Vec<[[f64; 3]; 4]>,
     pub sp_p_cents: Vec<[f64; 2]>,
     pub sp_p_vecs: Vec<[f64; 3]>,
     pub sp_image_pattern_vectors_sorted: Vec<[f64; 3]>,
@@ -815,8 +844,17 @@ pub struct Scratchpads {
     pub sp_valid_cat_vectors: Vec<[f64; 3]>,
     pub sp_valid_cat_inds: Vec<usize>,
     pub sp_hash_match_inds: Vec<usize>,
-    pub sp_keep_for_patterns: Vec<bool>,
     pub sp_precomputed_angles: Vec<f64>,
+    pub sp_keep_for_patterns: Vec<bool>,
+    pub sp_matched_stars: Vec<(usize, usize)>,
+    pub sp_matched_img_cents: Vec<[f64; 2]>,
+    pub sp_matched_cat_vecs: Vec<[f64; 3]>,
+    pub sp_matched_img_vecs: Vec<[f64; 3]>,
+    pub sp_derotated_matched_cat: Vec<[f64; 3]>,
+    pub sp_final_derotated: Vec<[f64; 3]>,
+    pub sp_distances: Vec<f64>,
+    pub sp_matches_scratch: Vec<(usize, usize)>,
+    pub sp_matches1_scratch: Vec<(usize, usize)>,
 }
 
 impl Scratchpads {
@@ -841,9 +879,18 @@ impl Scratchpads {
             sp_valid_cat_centroids: Vec::with_capacity(256),
             sp_valid_cat_vectors: Vec::with_capacity(256),
             sp_valid_cat_inds: Vec::with_capacity(256),
-            sp_hash_match_inds: Vec::with_capacity(64),
-            sp_keep_for_patterns: Vec::with_capacity(1024),
-            sp_precomputed_angles: Vec::with_capacity(2500),
+            sp_hash_match_inds: Vec::with_capacity(32),
+            sp_keep_for_patterns: vec![false; max_size],
+            sp_precomputed_angles: vec![0.0; max_size * max_size],
+            sp_matched_stars: Vec::with_capacity(256),
+            sp_matched_img_cents: Vec::with_capacity(256),
+            sp_matched_cat_vecs: Vec::with_capacity(256),
+            sp_matched_img_vecs: Vec::with_capacity(256),
+            sp_derotated_matched_cat: Vec::with_capacity(256),
+            sp_final_derotated: Vec::with_capacity(256),
+            sp_distances: Vec::with_capacity(256),
+            sp_matches_scratch: Vec::with_capacity(64),
+            sp_matches1_scratch: Vec::with_capacity(64),
         }
     }
 }
@@ -1279,8 +1326,8 @@ impl Solver {
         star_table_flat: &[CatalogStar],
         linear_probe: bool,
         sp_hash_match_inds: &mut Vec<usize>,
-        out_edges: &mut Vec<Vec<f64>>,
-        out_vectors: &mut Vec<Vec<[f64; 3]>>,
+        out_edges: &mut Vec<[f64; 6]>,
+        out_vectors: &mut Vec<[[f64; 3]; 4]>,
     ) {
         let has_hashes = pattern_key_hashes.is_some();
         let key_hash16 = (pattern_key_hash & 0xffff) as u16;
@@ -1311,10 +1358,10 @@ impl Solver {
 
         let num_matches = sp_hash_match_inds.len();
         while out_edges.len() < num_matches {
-            out_edges.push(Vec::with_capacity(16));
+            out_edges.push([0.0; 6]);
         }
         while out_vectors.len() < num_matches {
-            out_vectors.push(vec![[0.0; 3]; p_size]);
+            out_vectors.push([[0.0; 3]; 4]);
         }
         out_edges.truncate(num_matches);
         out_vectors.truncate(num_matches);
@@ -1324,20 +1371,42 @@ impl Solver {
             let vecs = &mut out_vectors[out_idx];
             for i in 0..p_size {
                 let star_id = pattern_catalog_flat[row_start + i] as usize;
-                vecs[i] = star_table_flat[star_id].vec;
+                let v = star_table_flat[star_id].vec;
+                vecs[i] = [v[0] as f64, v[1] as f64, v[2] as f64];
             }
 
             let edges_vec = &mut out_edges[out_idx];
-            edges_vec.clear();
+            let mut e_idx = 0;
             for i in 0..p_size {
                 for j in (i + 1)..p_size {
                     let d0 = vecs[i][0] - vecs[j][0];
                     let d1 = vecs[i][1] - vecs[j][1];
                     let d2 = vecs[i][2] - vecs[j][2];
-                    edges_vec.push(angle_from_distance((d0 * d0 + d1 * d1 + d2 * d2).sqrt()));
+                    edges_vec[e_idx] = angle_from_distance((d0 * d0 + d1 * d1 + d2 * d2).sqrt());
+                    e_idx += 1;
                 }
             }
-            edges_vec.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            macro_rules! swap_e {
+                ($a:expr, $b:expr) => {
+                    if edges_vec[$a] > edges_vec[$b] {
+                        let tmp = edges_vec[$a];
+                        edges_vec[$a] = edges_vec[$b];
+                        edges_vec[$b] = tmp;
+                    }
+                };
+            }
+            swap_e!(1, 2);
+            swap_e!(4, 5);
+            swap_e!(0, 2);
+            swap_e!(3, 5);
+            swap_e!(0, 1);
+            swap_e!(3, 4);
+            swap_e!(1, 4);
+            swap_e!(0, 3);
+            swap_e!(2, 5);
+            swap_e!(1, 3);
+            swap_e!(2, 4);
+            swap_e!(2, 3);
         }
     }
 
@@ -1526,8 +1595,31 @@ impl Solver {
                             scratch.sp_precomputed_angles[p_k * num_vecs + p_l],
                         ];
 
-                        // Calculate edge angles and sort
-                        edges.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                        // Fast 6-element sorting network
+                        let mut e = edges;
+                        macro_rules! swap {
+                            ($a:expr, $b:expr) => {
+                                if e[$a] > e[$b] {
+                                    let tmp = e[$a];
+                                    e[$a] = e[$b];
+                                    e[$b] = tmp;
+                                }
+                            };
+                        }
+                        swap!(1, 2);
+                        swap!(4, 5);
+                        swap!(0, 2);
+                        swap!(3, 5);
+                        swap!(0, 1);
+                        swap!(3, 4);
+                        swap!(1, 4);
+                        swap!(0, 3);
+                        swap!(2, 5);
+                        swap!(1, 3);
+                        swap!(2, 4);
+                        swap!(2, 3);
+                        let edges = e;
+                        
                         let image_pattern_largest_edge = edges[5];
 
                         // Min/max edge ratio bounds
@@ -1547,23 +1639,23 @@ impl Solver {
                         // Generate search space combinations via zero-allocation DFS (replaces Cartesian product)
                         scratch.sp_pattern_key_list.clear();
                         for k0 in key_space_min[0]..=key_space_max[0] {
-                            for k1 in key_space_min[1]..=key_space_max[1] {
-                                for k2 in key_space_min[2]..=key_space_max[2] {
-                                    for k3 in key_space_min[3]..=key_space_max[3] {
-                                        for k4 in key_space_min[4]..=key_space_max[4] {
-                                            let diff0 = k0 as isize - target_keys[0];
-                                            let diff1 = k1 as isize - target_keys[1];
-                                            let diff2 = k2 as isize - target_keys[2];
-                                            let diff3 = k3 as isize - target_keys[3];
+                            let diff0 = k0 as isize - target_keys[0];
+                            let dist0 = diff0 * diff0;
+                            for k1 in key_space_min[1].max(k0)..=key_space_max[1] {
+                                let diff1 = k1 as isize - target_keys[1];
+                                let dist1 = dist0 + diff1 * diff1;
+                                for k2 in key_space_min[2].max(k1)..=key_space_max[2] {
+                                    let diff2 = k2 as isize - target_keys[2];
+                                    let dist2 = dist1 + diff2 * diff2;
+                                    for k3 in key_space_min[3].max(k2)..=key_space_max[3] {
+                                        let diff3 = k3 as isize - target_keys[3];
+                                        let dist3 = dist2 + diff3 * diff3;
+                                        for k4 in key_space_min[4].max(k3)..=key_space_max[4] {
                                             let diff4 = k4 as isize - target_keys[4];
-                                            let dist = diff0 * diff0
-                                                + diff1 * diff1
-                                                + diff2 * diff2
-                                                + diff3 * diff3
-                                                + diff4 * diff4;
+                                            let dist4 = dist3 + diff4 * diff4;
                                             scratch
                                                 .sp_pattern_key_list
-                                                .push((dist as usize, [k0, k1, k2, k3, k4]));
+                                                .push((dist4 as usize, [k0, k1, k2, k3, k4]));
                                         }
                                     }
                                 }
@@ -1603,19 +1695,40 @@ impl Solver {
                                 &mut scratch.sp_cat_vectors_list,
                             );
 
+                            let inv_img_largest = 1.0 / image_pattern_largest_edge;
+                            let min_0 = edges[0] * inv_img_largest - p_max_err;
+                            let max_0 = edges[0] * inv_img_largest + p_max_err;
+                            let min_1 = edges[1] * inv_img_largest - p_max_err;
+                            let max_1 = edges[1] * inv_img_largest + p_max_err;
+                            let min_2 = edges[2] * inv_img_largest - p_max_err;
+                            let max_2 = edges[2] * inv_img_largest + p_max_err;
+                            let min_3 = edges[3] * inv_img_largest - p_max_err;
+                            let max_3 = edges[3] * inv_img_largest + p_max_err;
+                            let min_4 = edges[4] * inv_img_largest - p_max_err;
+                            let max_4 = edges[4] * inv_img_largest + p_max_err;
+
                             for cat_idx in 0..scratch.sp_cat_edges_list.len() {
-                                let catalog_largest_edge =
-                                    *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
+                                let cat_edges = &scratch.sp_cat_edges_list[cat_idx];
+                                let catalog_largest_edge = cat_edges[5];
+                                let inv_cat = 1.0 / catalog_largest_edge;
+
                                 let mut valid = true;
-                                for x in 0..5 {
-                                    let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x]
-                                        / catalog_largest_edge;
-                                    let img_ratio = edges[x] / image_pattern_largest_edge;
-                                    if cat_ratio < img_ratio - p_max_err
-                                        || cat_ratio > img_ratio + p_max_err
-                                    {
-                                        valid = false;
-                                        break;
+                                let c0 = cat_edges[0] * inv_cat;
+                                if c0 < min_0 || c0 > max_0 { valid = false; }
+                                else {
+                                    let c1 = cat_edges[1] * inv_cat;
+                                    if c1 < min_1 || c1 > max_1 { valid = false; }
+                                    else {
+                                        let c2 = cat_edges[2] * inv_cat;
+                                        if c2 < min_2 || c2 > max_2 { valid = false; }
+                                        else {
+                                            let c3 = cat_edges[3] * inv_cat;
+                                            if c3 < min_3 || c3 > max_3 { valid = false; }
+                                            else {
+                                                let c4 = cat_edges[4] * inv_cat;
+                                                if c4 < min_4 || c4 > max_4 { valid = false; }
+                                            }
+                                        }
                                     }
                                 }
                                 if !valid {
@@ -1698,6 +1811,34 @@ impl Solver {
                                         Some(res) => res,
                                         None => continue,
                                     };
+
+                                // EARLY REJECTION OF FALSE POSITIVES
+                                // SVD will find a rotation matrix even if the geometric shape of the 4 stars is totally wrong.
+                                // If the rotated catalog stars do not closely align with the image stars, it is a false positive.
+                                let mut valid_shape = true;
+                                let r = &rotation_matrix;
+                                // options.match_radius is a fraction of the image width. 
+                                // Multiply by fov to get approximate max error in radians. Use generous 2.0 multiplier.
+                                let max_dist_sq = (options.match_radius * fov * 2.0).powi(2);
+
+                                for i in 0..4 {
+                                    let vec = scratch.sp_catalog_pattern_vectors_sorted[i];
+                                    let img_vec = scratch.sp_image_pattern_vectors_sorted[i];
+                                    
+                                    let v0 = r[(0, 0)] * vec[0] + r[(0, 1)] * vec[1] + r[(0, 2)] * vec[2];
+                                    let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
+                                    let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
+                                    
+                                    let dist_sq = (v0 - img_vec[0]).powi(2) + (v1 - img_vec[1]).powi(2) + (v2 - img_vec[2]).powi(2);
+                                    if dist_sq > max_dist_sq {
+                                        valid_shape = false;
+                                        break;
+                                    }
+                                }
+
+                                if !valid_shape {
+                                    continue;
+                                }
 
                                 if let Some(solution) = verify_and_build_solution(
                                     scratch,

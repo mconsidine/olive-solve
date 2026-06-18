@@ -88,10 +88,13 @@ fn test_solver_consistency_with_testdata() {
 
     let mut all_failures = Vec::new();
     let mut total_solve_micros = 0;
-    let iterations = 738;
+    let samples = 738;
+    let run_times = 100;
+    let iterations = samples * run_times;
 
     // The counter in the JSON zip starts at 1
-    for x in 1..=iterations {
+    for y in 1..=iterations {
+        let x = (y % samples) + 1;
         // Read Input DTO
         let input_filename = format!("input_{}.json", x);
         let mut input_buffer = Vec::new();
