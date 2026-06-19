@@ -450,20 +450,73 @@ fn find_rotation_matrix_and_det_inplace(
     }
 }
 
-// OPTIMIZATION: Zero-allocation inner loop alternative to matching logic
-fn find_centroid_matches_inplace(
+// f32 variants of the verification-stage helpers. They decide which catalog
+// stars match the image (discrete, pixel-tolerance decisions); the f64 rotation
+// matrix and geometry are cast down once per call. Results feeding the final
+// attitude SVD are upcast back to f64 by the caller.
+fn rotate_vectors_inplace_f32(
+    rot: &Matrix3<f64>,
+    vecs: &[[f32; 3]],
+    transpose_rot: bool,
+    out: &mut [[f32; 3]],
+    len: usize,
+) {
+    let r = if transpose_rot { rot.transpose() } else { *rot };
+    let m = [
+        [r[(0, 0)] as f32, r[(0, 1)] as f32, r[(0, 2)] as f32],
+        [r[(1, 0)] as f32, r[(1, 1)] as f32, r[(1, 2)] as f32],
+        [r[(2, 0)] as f32, r[(2, 1)] as f32, r[(2, 2)] as f32],
+    ];
+    for i in 0..len {
+        out[i][0] = m[0][0] * vecs[i][0] + m[0][1] * vecs[i][1] + m[0][2] * vecs[i][2];
+        out[i][1] = m[1][0] * vecs[i][0] + m[1][1] * vecs[i][1] + m[1][2] * vecs[i][2];
+        out[i][2] = m[2][0] * vecs[i][0] + m[2][1] * vecs[i][1] + m[2][2] * vecs[i][2];
+    }
+}
+
+fn compute_centroids_inplace_f32(
+    vectors: &[[f32; 3]],
+    height: f64,
+    width: f64,
+    fov: f64,
+    out_centroids: &mut [[f32; 2]],
+    out_kept: &mut Vec<usize>,
+    len: usize,
+) {
+    out_kept.clear();
+    let scale_factor = (-width / 2.0 / (fov / 2.0).tan()) as f32;
+    let img_center_y = (height / 2.0) as f32;
+    let img_center_x = (width / 2.0) as f32;
+    let h = height as f32;
+    let w = width as f32;
+
+    for i in 0..len {
+        let cy = scale_factor * (vectors[i][2] / vectors[i][0]) + img_center_y;
+        let cx = scale_factor * (vectors[i][1] / vectors[i][0]) + img_center_x;
+        out_centroids[i][0] = cy;
+        out_centroids[i][1] = cx;
+
+        if cy > 0.0 && cx > 0.0 && cy < h && cx < w {
+            out_kept.push(i);
+        }
+    }
+}
+
+fn find_centroid_matches_inplace_f32(
     image_centroids: &[[f64; 2]],
     img_len: usize,
-    catalog_centroids: &[[f64; 2]],
+    catalog_centroids: &[[f32; 2]],
     cat_len: usize,
     r: f64,
 ) -> Vec<(usize, usize)> {
     let mut matches = Vec::new();
-    let r_sq = r * r;
+    let r_sq = (r * r) as f32;
     for i in 0..img_len {
+        let iy = image_centroids[i][0] as f32;
+        let ix = image_centroids[i][1] as f32;
         for j in 0..cat_len {
-            let dy = image_centroids[i][0] - catalog_centroids[j][0];
-            let dx = image_centroids[i][1] - catalog_centroids[j][1];
+            let dy = iy - catalog_centroids[j][0];
+            let dx = ix - catalog_centroids[j][1];
             if (dy * dy + dx * dx) < r_sq {
                 matches.push((i, j));
             }
@@ -616,17 +669,17 @@ fn verify_and_build_solution(
     }
 
     for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
-        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec.map(|v| v as f64);
+        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
     }
 
-    rotate_vectors_inplace(
+    rotate_vectors_inplace_f32(
         rotation_matrix,
         &scratch.sp_nearby_cat_star_vectors[..num_nearby],
         false,
         &mut scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
         num_nearby,
     );
-    compute_centroids_inplace(
+    compute_centroids_inplace_f32(
         &scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
         height,
         width,
@@ -651,7 +704,7 @@ fn verify_and_build_solution(
         scratch.sp_valid_cat_inds.push(nearby_cat_stars_inds[x]);
     }
 
-    let matched_stars = find_centroid_matches_inplace(
+    let matched_stars = find_centroid_matches_inplace_f32(
         image_centroids_undist,
         num_extracted_stars,
         &scratch.sp_valid_cat_centroids,
@@ -673,10 +726,11 @@ fn verify_and_build_solution(
 
     // We passed all checks. Complete the final exact solution details
     let mut matched_img_cents = Vec::with_capacity(num_star_matches);
-    let mut matched_cat_vecs = Vec::with_capacity(num_star_matches);
+    let mut matched_cat_vecs: Vec<[f64; 3]> = Vec::with_capacity(num_star_matches);
     for &(img_idx, cat_idx) in &matched_stars {
         matched_img_cents.push(image_centroids_undist[img_idx]);
-        matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
+        // Upcast the f32 catalog vector to f64 (exact) for the final attitude SVD.
+        matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx].map(|v| v as f64));
     }
 
     let matched_img_vecs = compute_vectors_flat(&matched_img_cents, height, width, fov);
@@ -918,8 +972,8 @@ fn verify_and_build_solution(
                 star.ra.to_degrees(),
                 star.dec.to_degrees(),
                 star.mag,
-                scratch.sp_valid_cat_centroids[c_idx][0],
-                scratch.sp_valid_cat_centroids[c_idx][1],
+                scratch.sp_valid_cat_centroids[c_idx][0] as f64,
+                scratch.sp_valid_cat_centroids[c_idx][1] as f64,
             ));
         }
         solution.catalog_stars = Some(cat_stars);
@@ -1203,12 +1257,17 @@ pub struct Scratchpads {
     pub sp_image_pattern_vectors_sorted: Vec<[f64; 3]>,
     pub sp_radii_scratch: Vec<(f64, usize)>,
     pub sp_catalog_pattern_vectors_sorted: Vec<[f64; 3]>,
-    pub sp_nearby_cat_star_vectors: Vec<[f64; 3]>,
-    pub sp_nearby_cat_star_vectors_derot: Vec<[f64; 3]>,
-    pub sp_nearby_cat_star_centroids_all: Vec<[f64; 2]>,
+    // Verification scratch held at f32: the per-candidate catalog re-association
+    // (derotate, project to pixels, centroid match) only decides *which* stars
+    // match, with pixel-scale tolerances far wider than f32 rounding, so running
+    // it in f32 halves the bandwidth on the A53 without changing the match set.
+    // The matched catalog vectors are upcast to f64 for the final SVD/refine.
+    pub sp_nearby_cat_star_vectors: Vec<[f32; 3]>,
+    pub sp_nearby_cat_star_vectors_derot: Vec<[f32; 3]>,
+    pub sp_nearby_cat_star_centroids_all: Vec<[f32; 2]>,
     pub sp_kept: Vec<usize>,
-    pub sp_valid_cat_centroids: Vec<[f64; 2]>,
-    pub sp_valid_cat_vectors: Vec<[f64; 3]>,
+    pub sp_valid_cat_centroids: Vec<[f32; 2]>,
+    pub sp_valid_cat_vectors: Vec<[f32; 3]>,
     pub sp_valid_cat_inds: Vec<usize>,
     pub sp_hash_match_inds: Vec<usize>,
 }
