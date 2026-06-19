@@ -133,6 +133,21 @@ fn get_test_images() -> Vec<PathBuf> {
     image_paths
 }
 
+/// Image used by the crop sanity checks. `get_test_images` returns paths in
+/// `WalkDir`/`read_dir` order, which is filesystem-dependent and unsorted, and
+/// some sample frames are sparse wide-field shots whose central 512x512 region
+/// holds no stars. Picking a known dense, centered field (orion_belt.jpg,
+/// 512x512, ~23 stars spread across the frame) makes the crop check
+/// deterministic across machines. Falls back to the first image if it's absent.
+fn get_crop_sanity_image() -> PathBuf {
+    let paths = get_test_images();
+    paths
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "orion_belt.jpg"))
+        .cloned()
+        .unwrap_or_else(|| paths[0].clone())
+}
+
 /// Core validation logic that runs the Rust extractor against the pre-generated Python
 /// ground-truth zip fixtures for a specific set of background, sigma modes, and downsampling.
 fn run_validation_suite_from_fixtures(
@@ -470,8 +485,10 @@ fn test_extraction_against_python_sanity() {
     run_validation_suite_from_fixtures(&bg_modes, &sigma_modes, &downsamples);
 
     // Add cropping sanity check (none vs 512x512 center)
-    let image_paths = get_test_images();
-    let path = &image_paths[0];
+    // Use a known dense, centered star field so this check doesn't depend on
+    // (unsorted) directory iteration order — see get_crop_sanity_image.
+    let crop_img = get_crop_sanity_image();
+    let path = &crop_img;
     let img = image::open(path).unwrap().to_luma8();
     let (w, h) = img.dimensions();
     let mut input_img = Array2::<f32>::zeros((h as usize, w as usize));
@@ -917,8 +934,10 @@ fn test_extraction_u8_sanity() {
     run_validation_suite_u8(&bg_modes, &sigma_modes, &downsamples);
 
     // Add cropping sanity check (none vs 512x512 center)
-    let image_paths = get_test_images();
-    let path = &image_paths[0];
+    // Use a known dense, centered star field so this check doesn't depend on
+    // (unsorted) directory iteration order — see get_crop_sanity_image.
+    let crop_img = get_crop_sanity_image();
+    let path = &crop_img;
     let img = image::open(path).unwrap().to_luma8();
     let (w, h) = img.dimensions();
     let mut input_img = Array2::<u8>::zeros((h as usize, w as usize));
