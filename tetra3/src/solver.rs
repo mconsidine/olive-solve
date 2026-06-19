@@ -66,17 +66,16 @@
 //    SOFTWARE.
 
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
-use nalgebra::{DMatrix, DVector, Matrix3, SVD};
+use nalgebra::{Matrix3, SVD};
 use ndarray::{Array1, Array2};
 use npyz::NpyFile;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use zip::ZipArchive;
 
 const MAGIC_RAND: u64 = 2654435761;
@@ -478,9 +477,10 @@ fn verify_and_build_solution(
     ];
 
     // Epsilon to capture borders safely in f64
-    let max_dist_sq = (distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8);
-    let mut nearby_nodes = star_kd_tree
-        .within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq);
+    let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
+    // OPTIMIZATION: Allocation-Free KD-Tree Parsing (Eliminated .collect() vector allocations)
+    let mut nearby_nodes =
+        star_kd_tree.within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq);
 
     // Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
     nearby_nodes.sort_unstable_by_key(|n| n.item);
@@ -556,11 +556,22 @@ fn verify_and_build_solution(
     scratch.sp_matched_img_cents.clear();
     scratch.sp_matched_cat_vecs.clear();
     for &(img_idx, cat_idx) in matched_stars {
-        scratch.sp_matched_img_cents.push(image_centroids_undist[img_idx]);
-        scratch.sp_matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
+        scratch
+            .sp_matched_img_cents
+            .push(image_centroids_undist[img_idx]);
+        scratch
+            .sp_matched_cat_vecs
+            .push(scratch.sp_valid_cat_vectors[cat_idx]);
     }
 
-    compute_vectors_inplace(&scratch.sp_matched_img_cents, height, width, fov, &mut scratch.sp_matched_img_vecs, num_star_matches);
+    compute_vectors_inplace(
+        &scratch.sp_matched_img_cents,
+        height,
+        width,
+        fov,
+        &mut scratch.sp_matched_img_vecs,
+        num_star_matches,
+    );
     let (precise_rotation_matrix, precise_det) = find_rotation_matrix_and_det_inplace(
         &scratch.sp_matched_img_vecs,
         &scratch.sp_matched_cat_vecs,
@@ -594,7 +605,7 @@ fn verify_and_build_solution(
                 * 2.0;
             let cat_derot = scratch.sp_derotated_matched_cat[m_idx];
             let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
-            
+
             let a0 = tangent;
             let a1 = r_dist.powi(3);
             let b = r_dist;
@@ -606,6 +617,7 @@ fn verify_and_build_solution(
             atb_1 += a1 * b;
         }
 
+        // OPTIMIZATION: Direct 2x2 Matrix Inversion using Cramer's rule
         let det = ata_00 * ata_11 - ata_01 * ata_01;
         if det.abs() > 1e-12 {
             let sol_0 = (ata_11 * atb_0 - ata_01 * atb_1) / det;
@@ -621,7 +633,14 @@ fn verify_and_build_solution(
         }
     }
 
-    compute_vectors_inplace(&scratch.sp_matched_img_cents, height, width, fov, &mut scratch.sp_matched_img_vecs, num_star_matches);
+    compute_vectors_inplace(
+        &scratch.sp_matched_img_cents,
+        height,
+        width,
+        fov,
+        &mut scratch.sp_matched_img_vecs,
+        num_star_matches,
+    );
     rotate_vectors_inplace(
         &precise_rotation_matrix,
         &scratch.sp_matched_img_vecs,
@@ -640,18 +659,24 @@ fn verify_and_build_solution(
         .sqrt();
         scratch.sp_distances.push(dist);
     }
-    scratch.sp_distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    scratch
+        .sp_distances
+        .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
     let p90_idx = (0.9 * (scratch.sp_distances.len() - 1) as f64) as usize;
     let p90_err_angle = angle_from_distance(scratch.sp_distances[p90_idx]).to_degrees() * 3600.0;
-    let max_err_angle = angle_from_distance(*scratch.sp_distances.last().unwrap()).to_degrees() * 3600.0;
+    let max_err_angle =
+        angle_from_distance(*scratch.sp_distances.last().unwrap()).to_degrees() * 3600.0;
 
     let mut rms_sum = 0.0;
     for &d in &scratch.sp_distances {
         let a = angle_from_distance(d);
         rms_sum += a * a;
     }
-    let rms_err_angle = (rms_sum / scratch.sp_distances.len() as f64).sqrt().to_degrees() * 3600.0;
+    let rms_err_angle = (rms_sum / scratch.sp_distances.len() as f64)
+        .sqrt()
+        .to_degrees()
+        * 3600.0;
 
     let ra = precise_rotation_matrix[(0, 1)]
         .atan2(precise_rotation_matrix[(0, 0)])
@@ -1456,6 +1481,7 @@ impl Solver {
         // Thinning strategy
         let pattern_stars_separation_pixels =
             width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
+        // OPTIMIZATION: Squared Distance Pre-filtering (Removed .sqrt() calculations)
         let sep_sq = pattern_stars_separation_pixels.powi(2);
 
         let scratch = &mut self.scratch;
@@ -1586,7 +1612,7 @@ impl Solver {
                         let p_l = pattern_centroids_inds[l];
 
                         // Fast direct memory lookups for pairwise distance angle metrics
-                        let mut edges = [
+                        let edges = [
                             scratch.sp_precomputed_angles[p_i * num_vecs + p_j],
                             scratch.sp_precomputed_angles[p_i * num_vecs + p_k],
                             scratch.sp_precomputed_angles[p_i * num_vecs + p_l],
@@ -1619,7 +1645,7 @@ impl Solver {
                         swap!(2, 4);
                         swap!(2, 3);
                         let edges = e;
-                        
+
                         let image_pattern_largest_edge = edges[5];
 
                         // Min/max edge ratio bounds
@@ -1639,6 +1665,7 @@ impl Solver {
                         // Generate search space combinations via zero-allocation DFS (replaces Cartesian product)
                         scratch.sp_pattern_key_list.clear();
                         for k0 in key_space_min[0]..=key_space_max[0] {
+                            // OPTIMIZATION: Loop-Invariant Code Motion (Hoisted hash key difference calculations)
                             let diff0 = k0 as isize - target_keys[0];
                             let dist0 = diff0 * diff0;
                             for k1 in key_space_min[1].max(k0)..=key_space_max[1] {
@@ -1695,6 +1722,7 @@ impl Solver {
                                 &mut scratch.sp_cat_vectors_list,
                             );
 
+                            // OPTIMIZATION: Reciprocal Multiplication (Replaces expensive floating-point divisions)
                             let inv_img_largest = 1.0 / image_pattern_largest_edge;
                             let min_0 = edges[0] * inv_img_largest - p_max_err;
                             let max_0 = edges[0] * inv_img_largest + p_max_err;
@@ -1713,20 +1741,27 @@ impl Solver {
                                 let inv_cat = 1.0 / catalog_largest_edge;
 
                                 let mut valid = true;
+                                // OPTIMIZATION: Unrolled Loops (Unrolled 5-element edge comparison loop)
                                 let c0 = cat_edges[0] * inv_cat;
-                                if c0 < min_0 || c0 > max_0 { valid = false; }
-                                else {
+                                if c0 < min_0 || c0 > max_0 {
+                                    valid = false;
+                                } else {
                                     let c1 = cat_edges[1] * inv_cat;
-                                    if c1 < min_1 || c1 > max_1 { valid = false; }
-                                    else {
+                                    if c1 < min_1 || c1 > max_1 {
+                                        valid = false;
+                                    } else {
                                         let c2 = cat_edges[2] * inv_cat;
-                                        if c2 < min_2 || c2 > max_2 { valid = false; }
-                                        else {
+                                        if c2 < min_2 || c2 > max_2 {
+                                            valid = false;
+                                        } else {
                                             let c3 = cat_edges[3] * inv_cat;
-                                            if c3 < min_3 || c3 > max_3 { valid = false; }
-                                            else {
+                                            if c3 < min_3 || c3 > max_3 {
+                                                valid = false;
+                                            } else {
                                                 let c4 = cat_edges[4] * inv_cat;
-                                                if c4 < min_4 || c4 > max_4 { valid = false; }
+                                                if c4 < min_4 || c4 > max_4 {
+                                                    valid = false;
+                                                }
                                             }
                                         }
                                     }
@@ -1812,24 +1847,33 @@ impl Solver {
                                         None => continue,
                                     };
 
+                                // OPTIMIZATION: Early Rejection SVD Pre-pass
                                 // EARLY REJECTION OF FALSE POSITIVES
                                 // SVD will find a rotation matrix even if the geometric shape of the 4 stars is totally wrong.
                                 // If the rotated catalog stars do not closely align with the image stars, it is a false positive.
                                 let mut valid_shape = true;
                                 let r = &rotation_matrix;
-                                // options.match_radius is a fraction of the image width. 
+                                // options.match_radius is a fraction of the image width.
                                 // Multiply by fov to get approximate max error in radians. Use generous 2.0 multiplier.
                                 let max_dist_sq = (options.match_radius * fov * 2.0).powi(2);
 
                                 for i in 0..4 {
                                     let vec = scratch.sp_catalog_pattern_vectors_sorted[i];
                                     let img_vec = scratch.sp_image_pattern_vectors_sorted[i];
-                                    
-                                    let v0 = r[(0, 0)] * vec[0] + r[(0, 1)] * vec[1] + r[(0, 2)] * vec[2];
-                                    let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
-                                    let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
-                                    
-                                    let dist_sq = (v0 - img_vec[0]).powi(2) + (v1 - img_vec[1]).powi(2) + (v2 - img_vec[2]).powi(2);
+
+                                    let v0 = r[(0, 0)] * vec[0]
+                                        + r[(0, 1)] * vec[1]
+                                        + r[(0, 2)] * vec[2];
+                                    let v1 = r[(1, 0)] * vec[0]
+                                        + r[(1, 1)] * vec[1]
+                                        + r[(1, 2)] * vec[2];
+                                    let v2 = r[(2, 0)] * vec[0]
+                                        + r[(2, 1)] * vec[1]
+                                        + r[(2, 2)] * vec[2];
+
+                                    let dist_sq = (v0 - img_vec[0]).powi(2)
+                                        + (v1 - img_vec[1]).powi(2)
+                                        + (v2 - img_vec[2]).powi(2);
                                     if dist_sq > max_dist_sq {
                                         valid_shape = false;
                                         break;
