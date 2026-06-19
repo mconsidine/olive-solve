@@ -186,7 +186,11 @@ pub struct Solution {
 pub struct CatalogStar {
     pub ra: f64,
     pub dec: f64,
-    pub vec: [f64; 3],
+    // Stored at f32 (the on-disk precision): halves the resident catalog and the
+    // KdTree footprint on the 512 MB Pi Zero 2 W and lets the dominant neighbor
+    // query run in f32. Upcast to f64 (lossless, f32 ⊂ f64) wherever the final
+    // attitude math consumes it, so the solved RA/Dec/Roll/FOV are unchanged.
+    pub vec: [f32; 3],
     pub mag: f64,
 }
 
@@ -552,7 +556,7 @@ fn rotation_matrix_to_quat(r: &Matrix3<f64>) -> [f64; 4] {
 #[allow(clippy::too_many_arguments)]
 fn verify_and_build_solution(
     scratch: &mut Scratchpads,
-    star_kd_tree: &KdTree<f64, 3>,
+    star_kd_tree: &KdTree<f32, 3>,
     star_table_flat: &[CatalogStar],
     star_catalog_ids: &Option<Array2<u32>>,
     db_props: &HashMap<String, f64>,
@@ -576,10 +580,16 @@ fn verify_and_build_solution(
         rotation_matrix[(0, 2)],
     ];
 
-    // Epsilon to capture borders safely in f64
+    // Epsilon to capture borders safely. The KdTree is f32 (matching the on-disk
+    // catalog precision); cast the query point and radius down to f32 to match.
     let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
+    let image_center_vector_f32 = [
+        image_center_vector[0] as f32,
+        image_center_vector[1] as f32,
+        image_center_vector[2] as f32,
+    ];
     let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
-        .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
+        .within::<SquaredEuclidean>(&image_center_vector_f32, max_dist_sq as f32)
         .into_iter()
         .map(|n| n.item as usize)
         .collect();
@@ -606,7 +616,7 @@ fn verify_and_build_solution(
     }
 
     for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
-        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
+        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec.map(|v| v as f64);
     }
 
     rotate_vectors_inplace(
@@ -941,7 +951,7 @@ struct ComboContext<'a> {
     match_threshold: f64,
     options: &'a SolveOptions,
     t0_solve: Instant,
-    star_kd_tree: &'a KdTree<f64, 3>,
+    star_kd_tree: &'a KdTree<f32, 3>,
     star_table_flat: &'a [CatalogStar],
     pattern_catalog_flat: &'a [usize],
     pattern_key_hashes: &'a Option<Array1<u16>>,
@@ -1243,7 +1253,7 @@ pub struct Solver {
     // OPTIMIZATION: Highly optimized cache-aligned struct lists
     pub star_table_flat: Vec<CatalogStar>,
     pub pattern_catalog_flat: Vec<usize>,
-    pub star_kd_tree: KdTree<f64, 3>,
+    pub star_kd_tree: KdTree<f32, 3>,
 
     pub pattern_largest_edge: Option<Array1<f32>>,
     pub pattern_key_hashes: Option<Array1<u16>>,
@@ -1431,9 +1441,9 @@ impl Solver {
                 ra: star_table_arr[[i, 0]],
                 dec: star_table_arr[[i, 1]],
                 vec: [
-                    star_table_arr[[i, 2]],
-                    star_table_arr[[i, 3]],
-                    star_table_arr[[i, 4]],
+                    star_table_arr[[i, 2]] as f32,
+                    star_table_arr[[i, 3]] as f32,
+                    star_table_arr[[i, 4]] as f32,
                 ],
                 mag: star_table_arr[[i, 5]],
             });
@@ -1728,7 +1738,7 @@ impl Solver {
             let vecs = &mut out_vectors[out_idx];
             for i in 0..p_size {
                 let star_id = pattern_catalog_flat[row_start + i];
-                vecs[i] = star_table_flat[star_id].vec;
+                vecs[i] = star_table_flat[star_id].vec.map(|v| v as f64);
             }
 
             let edges_vec = &mut out_edges[out_idx];
