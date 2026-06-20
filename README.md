@@ -82,12 +82,6 @@ source ../cedar-solve/.cedar_venv/bin/activate
 cargo test --release test_performance_vs_python -- --nocapture --test-threads=1 --ignored
 ```
 
-To compare the extraction performance against `cedar-detect`, run:
-
-```
-cargo test --release test_performance_vs_python -- --nocapture --test-threads=1 --ignored
-```
-
 ## FAQ
 
 1\. Why not port the database generation function?
