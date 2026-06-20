@@ -117,8 +117,13 @@ pub struct SolveOptions {
     /// `attitude_hint` is None. Default 15° gives a comfortable margin after
     /// a slow telescope slew; tighten to 2–5° for tracking/stationary use.
     pub hint_uncertainty_deg: f64,
-    /// If true, do not fall back to a blind solve when every candidate is
-    /// outside the hint cone. Useful to enforce strict re-acquisition windows.
+    /// Controls hint-cone failure behavior. When `false` (the default) and an
+    /// `attitude_hint` is set, a hinted pass that matches nothing is followed by
+    /// a second blind pass with the hint cleared, so a stale or mis-pointed hint
+    /// can never permanently prevent re-acquisition. When `true`, no fallback is
+    /// run — the solve returns `NoMatch` if every candidate is outside the hint
+    /// cone — to enforce a strict re-acquisition window. No effect when
+    /// `attitude_hint` is `None`.
     pub strict_hint: bool,
     /// Distribute the pattern-candidate search across the rayon thread pool.
     /// The result is identical to the serial search: the first verified match
@@ -1914,7 +1919,10 @@ impl Solver {
             image_centroids.push([star_centroids[[i, 0]], star_centroids[[i, 1]]]);
         }
 
-        let mut image_centroids_undist = if let Some(k) = options.distortion {
+        // Base undistorted centroids. Each search pass clones this into a local
+        // working buffer (the distortion branch of verification refines its
+        // copy), so the base is never mutated and can be reused across passes.
+        let image_centroids_undist = if let Some(k) = options.distortion {
             undistort_centroids(&image_centroids, height, width, k)
         } else {
             image_centroids.clone()
@@ -1952,48 +1960,29 @@ impl Solver {
             };
         }
 
-        let ctx = ComboContext {
-            precomputed_angles: &precomputed_angles,
-            num_vecs,
-            image_centroids: &image_centroids,
-            num_extracted_stars,
-            height,
-            width,
-            fov_initial,
-            p_bins,
-            p_max_err,
-            presorted,
-            match_threshold,
-            options: &options,
-            t0_solve,
-            star_kd_tree: &self.star_kd_tree,
-            star_table_flat: &self.star_table_flat,
-            pattern_catalog_flat: &self.pattern_catalog_flat,
-            pattern_key_hashes: &self.pattern_key_hashes,
-            pattern_largest_edge: &self.pattern_largest_edge,
-            star_catalog_ids: &self.star_catalog_ids,
-            db_props: &self.db_props,
-            num_patterns: self.num_patterns,
-            linear_probe: self.linear_probe,
-        };
+        // Run the pattern search, optionally twice. Pass 0 honors the caller's
+        // attitude hint (try_pattern_combo skips candidates outside the hint
+        // cone). Unless `strict_hint` is set, a second blind fallback pass then
+        // runs with the hint cleared. Without this fallback a stale or
+        // mis-pointed hint — e.g. the previous solve's attitude after the camera
+        // has slewed several degrees, with no IMU to widen the cone — rejects
+        // every real candidate and solve() returns NoMatch *permanently*, never
+        // re-acquiring. `strict_hint = true` preserves the old hard-window
+        // behavior (no fallback), for callers enforcing a strict re-acquisition
+        // window.
+        let do_blind_fallback = options.attitude_hint.is_some() && !options.strict_hint;
+        let use_parallel = options.parallel && rayon::current_num_threads() > 1;
 
-        if options.parallel && rayon::current_num_threads() > 1 {
-            // -------------------------------------------------------------
-            // Parallel search. The combination list is materialized in the
-            // exact breadth-first order of the serial loop, split into
-            // contiguous chunks, and scanned with find_map_first: the result
-            // is the leftmost (= earliest in serial order) verified solution,
-            // so the answer is identical to the serial path. Each worker gets
-            // its own Scratchpads and undistorted-centroid buffer (the
-            // distortion branch of verification refines the latter).
-            // -------------------------------------------------------------
-            let mut combos: Vec<[usize; 4]> =
+        // The combination list is independent of the hint, so build it once and
+        // reuse it across both passes (only used by the parallel path).
+        let combos: Vec<[usize; 4]> = if use_parallel {
+            let mut c =
                 Vec::with_capacity(n_inds * (n_inds - 1) * (n_inds - 2) * (n_inds - 3) / 24);
             for l in 3..n_inds {
                 for k in 2..l {
                     for j in 1..k {
                         for i in 0..j {
-                            combos.push([
+                            c.push([
                                 pattern_centroids_inds[i],
                                 pattern_centroids_inds[j],
                                 pattern_centroids_inds[k],
@@ -2003,57 +1992,115 @@ impl Solver {
                     }
                 }
             }
-
-            // Small chunks for load balancing; chunks left of a found match
-            // still complete (keeping determinism), so cap the tail latency.
-            let chunk_size = (combos.len() / (rayon::current_num_threads() * 8)).clamp(4, 64);
-            let abort = &self.abort;
-            let is_cancelled = &self.is_cancelled;
-
-            let result = combos.par_chunks(chunk_size).find_map_first(|chunk| {
-                let mut scratch = Scratchpads::new(p_size);
-                let mut undist_local = image_centroids_undist.clone();
-                for &[p_i, p_j, p_k, p_l] in chunk {
-                    // Check abort from watchdog thread or cancel_solve
-                    if abort.load(Ordering::Relaxed) {
-                        return Some(aborted_solution(is_cancelled, t0_solve));
-                    }
-                    if let Some(solution) =
-                        try_pattern_combo(&ctx, &mut scratch, &mut undist_local, p_i, p_j, p_k, p_l)
-                    {
-                        return Some(solution);
-                    }
-                }
-                None
-            });
-
-            if let Some(solution) = result {
-                return solution;
-            }
+            c
         } else {
-            // -------------------------------------------------------------
-            // Allocation-free native iteration mirroring breadth-first order
-            // -------------------------------------------------------------
-            let scratch = &mut self.scratch;
-            for l in 3..n_inds {
-                for k in 2..l {
-                    for j in 1..k {
-                        for i in 0..j {
-                            // Check abort from watchdog thread or cancel_solve
-                            if self.abort.load(Ordering::Relaxed) {
-                                return aborted_solution(&self.is_cancelled, t0_solve);
-                            }
+            Vec::new()
+        };
 
-                            if let Some(solution) = try_pattern_combo(
-                                &ctx,
-                                scratch,
-                                &mut image_centroids_undist,
-                                pattern_centroids_inds[i],
-                                pattern_centroids_inds[j],
-                                pattern_centroids_inds[k],
-                                pattern_centroids_inds[l],
-                            ) {
-                                return solution;
+        let n_passes = if do_blind_fallback { 2 } else { 1 };
+        for pass in 0..n_passes {
+            // Pass 0 uses the caller's options as-is; the fallback pass clears
+            // the attitude hint so every candidate is considered (blind solve).
+            let mut pass_options = options.clone();
+            if pass == 1 {
+                pass_options.attitude_hint = None;
+            }
+
+            let ctx = ComboContext {
+                precomputed_angles: &precomputed_angles,
+                num_vecs,
+                image_centroids: &image_centroids,
+                num_extracted_stars,
+                height,
+                width,
+                fov_initial,
+                p_bins,
+                p_max_err,
+                presorted,
+                match_threshold,
+                options: &pass_options,
+                t0_solve,
+                star_kd_tree: &self.star_kd_tree,
+                star_table_flat: &self.star_table_flat,
+                pattern_catalog_flat: &self.pattern_catalog_flat,
+                pattern_key_hashes: &self.pattern_key_hashes,
+                pattern_largest_edge: &self.pattern_largest_edge,
+                star_catalog_ids: &self.star_catalog_ids,
+                db_props: &self.db_props,
+                num_patterns: self.num_patterns,
+                linear_probe: self.linear_probe,
+            };
+
+            if use_parallel {
+                // ---------------------------------------------------------
+                // Parallel search. The combination list is in the exact
+                // breadth-first order of the serial loop, split into chunks
+                // and scanned with find_map_first: the result is the leftmost
+                // (= earliest in serial order) verified solution, so the answer
+                // is identical to the serial path. Each worker gets its own
+                // Scratchpads and undistorted-centroid buffer (the distortion
+                // branch of verification refines the latter).
+                // ---------------------------------------------------------
+                // Small chunks for load balancing; chunks left of a found match
+                // still complete (keeping determinism), so cap the tail latency.
+                let chunk_size = (combos.len() / (rayon::current_num_threads() * 8)).clamp(4, 64);
+                let abort = &self.abort;
+                let is_cancelled = &self.is_cancelled;
+
+                let result = combos.par_chunks(chunk_size).find_map_first(|chunk| {
+                    let mut scratch = Scratchpads::new(p_size);
+                    let mut undist_local = image_centroids_undist.clone();
+                    for &[p_i, p_j, p_k, p_l] in chunk {
+                        // Check abort from watchdog thread or cancel_solve
+                        if abort.load(Ordering::Relaxed) {
+                            return Some(aborted_solution(is_cancelled, t0_solve));
+                        }
+                        if let Some(solution) = try_pattern_combo(
+                            &ctx,
+                            &mut scratch,
+                            &mut undist_local,
+                            p_i,
+                            p_j,
+                            p_k,
+                            p_l,
+                        ) {
+                            return Some(solution);
+                        }
+                    }
+                    None
+                });
+
+                if let Some(solution) = result {
+                    return solution;
+                }
+            } else {
+                // ---------------------------------------------------------
+                // Allocation-free native iteration mirroring breadth-first
+                // order. Clones the undistorted centroids into a per-pass
+                // working buffer the distortion refinement can mutate freely.
+                // ---------------------------------------------------------
+                let scratch = &mut self.scratch;
+                let mut undist_local = image_centroids_undist.clone();
+                for l in 3..n_inds {
+                    for k in 2..l {
+                        for j in 1..k {
+                            for i in 0..j {
+                                // Check abort from watchdog thread or cancel_solve
+                                if self.abort.load(Ordering::Relaxed) {
+                                    return aborted_solution(&self.is_cancelled, t0_solve);
+                                }
+
+                                if let Some(solution) = try_pattern_combo(
+                                    &ctx,
+                                    scratch,
+                                    &mut undist_local,
+                                    pattern_centroids_inds[i],
+                                    pattern_centroids_inds[j],
+                                    pattern_centroids_inds[k],
+                                    pattern_centroids_inds[l],
+                                ) {
+                                    return solution;
+                                }
                             }
                         }
                     }

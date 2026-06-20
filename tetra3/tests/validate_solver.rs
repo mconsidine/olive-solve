@@ -387,3 +387,110 @@ fn test_solver_mirrored_image() {
     assert!(result.target_ra.is_some());
     assert!(result.target_dec.is_some());
 }
+
+/// Regression test for the attitude-hint blind fallback.
+///
+/// A stale or mis-pointed attitude hint with a tight uncertainty cone (e.g. the
+/// previous solve's attitude after the camera has slewed, with no IMU to widen
+/// the cone) used to reject every real candidate and return NoMatch *forever* —
+/// the solver never re-acquired. With `strict_hint = false` the solver now runs
+/// a blind fallback pass when the hinted pass matches nothing. `strict_hint =
+/// true` preserves the old hard-window behavior.
+#[test]
+fn test_blind_fallback_recovers_from_stale_hint() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+    if !db_path.exists() || !zip_path.exists() {
+        eprintln!("Skipping test: solver fixtures not found.");
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).expect("Failed to load database");
+    let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
+    let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
+
+    // Use the first sample the fixtures expect to solve.
+    let mut input_dto: Option<SolveInputDto> = None;
+    for x in 1..=738 {
+        let mut ob = Vec::new();
+        match archive.by_name(&format!("output_{}.json", x)) {
+            Ok(mut f) => f.read_to_end(&mut ob).unwrap(),
+            Err(_) => continue,
+        };
+        let out: SolutionDto = serde_json::from_slice(&ob).unwrap();
+        if out.status != "MatchFound" {
+            continue;
+        }
+        let mut ib = Vec::new();
+        archive
+            .by_name(&format!("input_{}.json", x))
+            .unwrap()
+            .read_to_end(&mut ib)
+            .unwrap();
+        input_dto = Some(serde_json::from_slice(&ib).unwrap());
+        break;
+    }
+    let input_dto = input_dto.expect("no MatchFound sample in fixtures");
+
+    let mut flat = Vec::with_capacity(input_dto.centroids.len() * 2);
+    for c in &input_dto.centroids {
+        flat.push(c[0]);
+        flat.push(c[1]);
+    }
+    let centroids = Array2::from_shape_vec((input_dto.centroids.len(), 2), flat).unwrap();
+    let size = (input_dto.image_height, input_dto.image_width);
+    let o = &input_dto.options;
+
+    let make_opts = |hint: Option<[f64; 4]>, unc: f64, strict: bool| SolveOptions {
+        fov_estimate: o.fov_estimate,
+        fov_max_error: o.fov_max_error,
+        match_radius: o.match_radius,
+        match_threshold: o.match_threshold,
+        solve_timeout_ms: o.solve_timeout_ms,
+        distortion: o.distortion,
+        match_max_error: o.match_max_error,
+        attitude_hint: hint,
+        hint_uncertainty_deg: unc,
+        strict_hint: strict,
+        ..Default::default()
+    };
+
+    // 1) Blind baseline — establishes the true solution for these centroids.
+    let blind = solver.solve(&centroids, size, make_opts(None, 15.0, false));
+    assert_eq!(
+        blind.status,
+        SolveStatus::MatchFound,
+        "blind solve of a known-good sample should succeed"
+    );
+    let (bra, bdec) = (blind.ra.unwrap(), blind.dec.unwrap());
+
+    // A deliberately wrong, very tight hint: the identity attitude with a
+    // 0.01° cone. This is effectively guaranteed to exclude the true field.
+    let wrong_hint = [1.0, 0.0, 0.0, 0.0];
+
+    // 2) strict_hint = true: the tight wrong hint must exclude the solution.
+    // (If this ever yields MatchFound the hint isn't actually excluding the
+    // field and the next assertion would be vacuous — so assert it here.)
+    let strict = solver.solve(&centroids, size, make_opts(Some(wrong_hint), 0.01, true));
+    assert_eq!(
+        strict.status,
+        SolveStatus::NoMatch,
+        "a tight wrong hint with strict_hint=true must return NoMatch"
+    );
+
+    // 3) strict_hint = false: the blind fallback must recover the same solution.
+    let recovered = solver.solve(&centroids, size, make_opts(Some(wrong_hint), 0.01, false));
+    assert_eq!(
+        recovered.status,
+        SolveStatus::MatchFound,
+        "blind fallback should re-acquire despite a stale/wrong hint"
+    );
+    assert!(
+        (recovered.ra.unwrap() - bra).abs() < 1e-5 && (recovered.dec.unwrap() - bdec).abs() < 1e-5,
+        "fallback solution must match the blind solution: got ({}, {}) vs ({}, {})",
+        recovered.ra.unwrap(),
+        recovered.dec.unwrap(),
+        bra,
+        bdec
+    );
+}
