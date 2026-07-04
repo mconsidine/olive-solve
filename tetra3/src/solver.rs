@@ -2114,6 +2114,103 @@ impl Solver {
             ..Default::default()
         }
     }
+
+    /// Verify-only fast path: skip the 4-star pattern search entirely and run
+    /// the match/verify/refine machinery against a caller-supplied attitude.
+    ///
+    /// `attitude` is a unit quaternion (w, x, y, z) mapping celestial → camera —
+    /// the same convention as [`Solution::quaternion`] and
+    /// [`SolveOptions::attitude_hint`]. Pass the previous frame's solved
+    /// quaternion (optionally propagated by an IMU) to confirm/refine pointing
+    /// without paying for pattern hashing.
+    ///
+    /// Behavior:
+    /// - A correct attitude yields the same verified, refined [`Solution`] a
+    ///   full solve would (statistics, distortion refinement, targets, matched
+    ///   stars — every `options` output flag is honored) in a fraction of the
+    ///   time.
+    /// - A wrong attitude fails the binomial false-positive test and returns
+    ///   `NoMatch` quickly. **No blind fallback runs** — this method never
+    ///   searches; callers wanting re-acquisition must call [`Solver::solve`].
+    /// - `options.fov_estimate` should be supplied (the database FOV midpoint
+    ///   is used otherwise). The hint fields (`attitude_hint`,
+    ///   `hint_uncertainty_deg`, `strict_hint`), `fov_max_error`,
+    ///   `match_max_error`, `parallel`, and `solve_timeout_ms` are ignored —
+    ///   there is no search to bound or time out.
+    pub fn verify_attitude(
+        &mut self,
+        star_centroids: &Array2<f64>,
+        size: (f64, f64),
+        attitude: [f64; 4],
+        options: SolveOptions,
+    ) -> Solution {
+        let t0_solve = Instant::now();
+        let (height, width) = size;
+
+        let fov = options
+            .fov_estimate
+            .map(|f| f.to_radians())
+            .unwrap_or_else(|| {
+                let max_f = self.db_props.get("max_fov").unwrap_or(&20.0);
+                let min_f = self.db_props.get("min_fov").unwrap_or(&10.0);
+                ((max_f + min_f) / 2.0).to_radians()
+            });
+        let verification_stars = *self
+            .db_props
+            .get("verification_stars_per_fov")
+            .unwrap_or(&10.0) as usize;
+        let match_threshold = options.match_threshold / (self.num_patterns as f64);
+
+        let num_centroids_raw = star_centroids.nrows();
+        if num_centroids_raw < 4 {
+            return Solution {
+                status: SolveStatus::TooFew,
+                t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                ..Default::default()
+            };
+        }
+
+        // Same brightest-first crop as solve(): centroids arrive sorted by
+        // brightness and only the top verification_stars participate, so the
+        // binomial statistics stay comparable between the two entry points.
+        let num_extracted_stars = num_centroids_raw.min(verification_stars);
+        let mut image_centroids = Vec::with_capacity(num_extracted_stars);
+        for i in 0..num_extracted_stars {
+            image_centroids.push([star_centroids[[i, 0]], star_centroids[[i, 1]]]);
+        }
+        let mut image_centroids_undist = if let Some(k) = options.distortion {
+            undistort_centroids(&image_centroids, height, width, k)
+        } else {
+            image_centroids.clone()
+        };
+
+        let rotation_matrix = quat_to_matrix(&attitude);
+        match verify_and_build_solution(
+            &mut self.scratch,
+            &self.star_kd_tree,
+            &self.star_table_flat,
+            &self.star_catalog_ids,
+            &self.db_props,
+            self.num_patterns,
+            &rotation_matrix,
+            fov,
+            height,
+            width,
+            &options,
+            &image_centroids,
+            &mut image_centroids_undist,
+            num_extracted_stars,
+            match_threshold,
+            t0_solve,
+        ) {
+            Some(solution) => solution,
+            None => Solution {
+                status: SolveStatus::NoMatch,
+                t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                ..Default::default()
+            },
+        }
+    }
 }
 
 impl Drop for Solver {

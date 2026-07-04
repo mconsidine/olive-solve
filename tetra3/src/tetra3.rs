@@ -72,6 +72,20 @@ impl Tetra3 {
         Ok(solver.solve(centroids, size, options))
     }
 
+    /// Verify-only fast path: match/verify/refine pre-extracted centroids
+    /// against a caller-supplied attitude quaternion (w, x, y, z), skipping
+    /// the pattern search entirely. See [`Solver::verify_attitude`].
+    pub fn verify_attitude(
+        &mut self,
+        centroids: &Array2<f64>,
+        size: (f64, f64),
+        attitude: [f64; 4],
+        options: SolveOptions,
+    ) -> Result<Solution, Box<dyn std::error::Error>> {
+        let solver = self.get_solver()?;
+        Ok(solver.verify_attitude(centroids, size, attitude, options))
+    }
+
     /// Extracts star centroids from an image array.
     #[cfg(feature = "extractor")]
     pub fn get_centroids_from_image<S>(
