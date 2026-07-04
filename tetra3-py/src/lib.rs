@@ -308,6 +308,54 @@ impl PyTetra3 {
         Ok(out_dict)
     }
 
+    /// Verify-only fast path: match/verify/refine pre-extracted centroids
+    /// against a caller-supplied attitude quaternion, skipping the 4-star
+    /// pattern search entirely.
+    ///
+    /// Args:
+    ///     centroids: (N, 2) array of (y, x) centroids, brightest first —
+    ///         same convention as solve_from_centroids.
+    ///     size: (height, width) of the image in pixels.
+    ///     attitude: length-4 sequence (w, x, y, z) unit quaternion mapping
+    ///         celestial -> camera. Pass the 'quaternion' value of a previous
+    ///         solution (optionally propagated by an IMU).
+    ///     **kwargs: same solve options as solve_from_centroids. Supply
+    ///         fov_estimate; match_radius / match_threshold / distortion and
+    ///         all return/target options are honored. The hint options
+    ///         (attitude_hint, hint_uncertainty_deg, strict_hint),
+    ///         fov_max_error, and solve_timeout are ignored — there is no
+    ///         search to bound.
+    ///
+    /// Returns:
+    ///     dict: same shape as solve_from_centroids. A correct attitude
+    ///     returns the fully refined solution (status MATCH_FOUND) in a
+    ///     fraction of a full solve's time; a wrong attitude fails the
+    ///     binomial false-positive test and returns status NO_MATCH quickly.
+    ///     No blind fallback runs — call solve_from_centroids to re-acquire.
+    #[pyo3(signature = (centroids, size, attitude, **kwargs))]
+    fn verify_attitude<'py>(
+        &self,
+        py: Python<'py>,
+        centroids: PyReadonlyArray2<'py, f64>,
+        size: (f64, f64),
+        attitude: [f64; 4],
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let solve_options = parse_solve_options(kwargs)?;
+        let cent_owned = centroids.as_array().to_owned();
+
+        let solution = py
+            .detach(|| {
+                let mut inner = self.inner.lock().unwrap();
+                inner
+                    .verify_attitude(&cent_owned, size, attitude, solve_options)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        solution_to_dict(py, solution, None)
+    }
+
     /// Runs extraction and plate solving in one uninterrupted pipeline using the fast path.
     /// Returns a dictionary containing the solution and execution times.
     #[cfg(feature = "extractor")]

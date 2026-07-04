@@ -148,27 +148,22 @@ a prerelease first and gets validated via diofinder's offline bundle replay
 
 ## 5. Backlog
 
-### Task: verify-only solve entry point (unlocks diofinder's tracking fast path)
+### DONE (v0.1.6): verify-only solve entry point (`verify_attitude`)
 
-diofinder's experimental tracking mode does ROI-windowed detection + a
-tight-hint solve, but still pays the 4-star pattern-hash on every frame
-because this API has **no verify-only path**. Add one:
+Shipped in v0.1.6. `Solver::verify_attitude` /
+`Tetra3::verify_attitude(centroids, size, attitude, options)` and the
+tetra3-py binding `t3.verify_attitude(centroids, size, attitude, **kwargs)`
+run the existing KD-tree + `verify_and_build_solution` machinery against a
+caller-supplied (w, x, y, z) quaternion, skipping the 4-star pattern search
+entirely. Same solution dict as `solve_from_centroids`; wrong attitude →
+fast `NoMatch`, < 4 centroids → `TooFew`; **no blind fallback** — callers
+re-acquire with `solve_from_centroids`. Additive only; diofinder
+capability-probes `hasattr(t3, "verify_attitude")`. Measured on a real
+bundle frame (960×760, 11 centroids, default_database): identical RA/Dec
+to the full solve (0.00″ delta), median 0.01 ms vs 0.5 ms for the full
+solve; wrong 5° hint rejects in 0.03 ms.
 
-- **API sketch**: `verify_attitude(centroids, size, attitude_hint,
-  fov_estimate, match_radius, match_threshold, distortion=0.0, ...)` →
-  same solution dict. Implementation: project the catalog neighborhood
-  through the hinted attitude (the KD-tree + `verify_and_build_solution`
-  machinery already exists in `solver.rs`), match, refine — skipping
-  candidate enumeration entirely. Fail fast (status `NoMatch`) if the
-  match fraction is below threshold; the caller falls back to the full
-  solve.
-- **Constraints**: additive only (new method; do not change
-  `solve_from_centroids`); expose via tetra3-py with keyword-only args;
-  diofinder will capability-probe with `hasattr(t3, "verify_attitude")`.
-- **Acceptance**: on a synthetic field with a correct hint, verify-only
-  returns the same attitude as the full solve in a fraction of the time;
-  with a wrong hint (> match radius) it returns NoMatch quickly; wheel
-  builds abi3 as before.
+(no open tasks)
 
 When you complete or add a task, update this section in the same PR — this
 file is the durable task queue across sessions and agent frameworks.
