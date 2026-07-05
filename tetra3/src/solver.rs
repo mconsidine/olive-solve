@@ -66,7 +66,7 @@
 //    SOFTWARE.
 
 use kiddo::{KdTree, SquaredEuclidean};
-use nalgebra::{DMatrix, DVector, Matrix3, SVD};
+use nalgebra::{Matrix3, SVD};
 use ndarray::{Array1, Array2};
 use npyz::NpyFile;
 use rayon::prelude::*;
@@ -749,9 +749,9 @@ fn verify_and_build_solution(
     if options.distortion.is_some() {
         // Refine fov & distortion using Least Squares System
         // A = [tangent, radius^3], b = [radius]
-        // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
-        let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
-        let mut b_na = DVector::<f64>::zeros(num_star_matches);
+        // Solved via the 2x2 normal equations (A^T A) x = A^T b directly,
+        // rather than building a DMatrix/DVector and running a full SVD
+        // pseudo-inverse for what is always exactly a 2-unknown system.
         let mut derotated_matched_cat = vec![[0.0; 3]; num_star_matches];
         rotate_vectors_inplace(
             &precise_rotation_matrix,
@@ -761,6 +761,12 @@ fn verify_and_build_solution(
             num_star_matches,
         );
 
+        let mut ata_00 = 0.0;
+        let mut ata_01 = 0.0;
+        let mut ata_11 = 0.0;
+        let mut atb_0 = 0.0;
+        let mut atb_1 = 0.0;
+
         for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
             let r_cent = image_centroids[img_idx];
             let r_dist = ((r_cent[0] - height / 2.0).powi(2) + (r_cent[1] - width / 2.0).powi(2))
@@ -769,19 +775,28 @@ fn verify_and_build_solution(
                 * 2.0;
             let cat_derot = derotated_matched_cat[m_idx];
             let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
-            a_na[(m_idx, 0)] = tangent;
-            a_na[(m_idx, 1)] = r_dist.powi(3);
-            b_na[m_idx] = r_dist;
+
+            let a0 = tangent;
+            let a1 = r_dist.powi(3);
+            let b = r_dist;
+
+            ata_00 += a0 * a0;
+            ata_01 += a0 * a1;
+            ata_11 += a1 * a1;
+            atb_0 += a0 * b;
+            atb_1 += a1 * b;
         }
 
-        // Pure-Rust SVD pseudo-inverse for distortions
-        let svd = SVD::new(a_na, true, true);
-        if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
-            let sol = pseudo_inv * b_na;
-            let f_val = sol[0] / (1.0 - sol[1]);
-            k_final = Some(sol[1]);
+        // Direct 2x2 matrix inversion via Cramer's rule.
+        let det = ata_00 * ata_11 - ata_01 * ata_01;
+        if det.abs() > 1e-12 {
+            let sol_0 = (ata_11 * atb_0 - ata_01 * atb_1) / det;
+            let sol_1 = (ata_00 * atb_1 - ata_01 * atb_0) / det;
+
+            let f_val = sol_0 / (1.0 - sol_1);
+            k_final = Some(sol_1);
             fov = 2.0 * (1.0 / f_val).atan();
-            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol[1]);
+            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol_1);
             for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
                 matched_img_cents[m_idx] = image_centroids_undist[img_idx];
             }
@@ -1132,12 +1147,17 @@ fn try_pattern_combo(
             &mut scratch.sp_cat_vectors_list,
         );
 
+        // Reciprocal multiplication: both edge lists are divided by their
+        // largest edge once per x below; hoist the two reciprocals out of
+        // the loop and multiply instead of dividing per-comparison.
+        let inv_image_pattern_largest_edge = 1.0 / image_pattern_largest_edge;
         for cat_idx in 0..scratch.sp_cat_edges_list.len() {
             let catalog_largest_edge = *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
+            let inv_catalog_largest_edge = 1.0 / catalog_largest_edge;
             let mut valid = true;
             for x in 0..5 {
-                let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x] / catalog_largest_edge;
-                let img_ratio = edges[x] / image_pattern_largest_edge;
+                let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x] * inv_catalog_largest_edge;
+                let img_ratio = edges[x] * inv_image_pattern_largest_edge;
                 if cat_ratio < img_ratio - ctx.p_max_err || cat_ratio > img_ratio + ctx.p_max_err {
                     valid = false;
                     break;
@@ -1222,6 +1242,36 @@ fn try_pattern_combo(
                 if geodesic_angle_deg(hint_q, &rotation_matrix) > ctx.options.hint_uncertainty_deg {
                     continue;
                 }
+            }
+
+            // Early rejection SVD pre-pass: the SVD above will find *some*
+            // rotation matrix even when the geometric shape of the 4 stars is
+            // totally wrong. If the rotated catalog vectors don't closely
+            // align with the image vectors, this candidate is a false
+            // positive and the expensive KD-tree verification below can be
+            // skipped. match_radius is a fraction of the image width; scale
+            // by fov for an approximate max error in radians, with a
+            // generous 2.0 multiplier.
+            let mut valid_shape = true;
+            let r = &rotation_matrix;
+            let max_dist_sq = (ctx.options.match_radius * fov * 2.0).powi(2);
+            for i in 0..4 {
+                let vec = scratch.sp_catalog_pattern_vectors_sorted[i];
+                let img_vec = scratch.sp_image_pattern_vectors_sorted[i];
+
+                let v0 = r[(0, 0)] * vec[0] + r[(0, 1)] * vec[1] + r[(0, 2)] * vec[2];
+                let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
+                let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
+
+                let dist_sq =
+                    (v0 - img_vec[0]).powi(2) + (v1 - img_vec[1]).powi(2) + (v2 - img_vec[2]).powi(2);
+                if dist_sq > max_dist_sq {
+                    valid_shape = false;
+                    break;
+                }
+            }
+            if !valid_shape {
+                continue;
             }
 
             if let Some(solution) = verify_and_build_solution(
