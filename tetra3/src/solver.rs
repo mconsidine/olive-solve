@@ -1997,6 +1997,17 @@ impl Solver {
             Vec::new()
         };
 
+        // NOTE: pass 1 re-runs the full nested hash-lookup/Wahba search from
+        // scratch rather than reusing the rotation matrices pass 0 already
+        // computed for candidates it hint-rejected (see try_pattern_combo's
+        // hint check below, which runs after the rotation matrix is already
+        // in hand). Measured cost: 4.8x-120x a blind solve per hint-rejected
+        // attempt. A caching fix was investigated and deliberately rejected
+        // — see AGENTS.md "REJECTED: caching hint-rejected candidates across
+        // the two-pass fallback" for the bound that makes it not worth the
+        // risk (shared mutable undistorted-centroid state refined across
+        // passes, parallel-search determinism). Don't re-attempt this without
+        // re-reading that reasoning.
         let n_passes = if do_blind_fallback { 2 } else { 1 };
         for pass in 0..n_passes {
             // Pass 0 uses the caller's options as-is; the fallback pass clears

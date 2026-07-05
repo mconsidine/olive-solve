@@ -163,6 +163,37 @@ bundle frame (960×760, 11 centroids, default_database): identical RA/Dec
 to the full solve (0.00″ delta), median 0.01 ms vs 0.5 ms for the full
 solve; wrong 5° hint rejects in 0.03 ms.
 
+### REJECTED: caching hint-rejected candidates across the two-pass fallback
+
+`Solver::solve_from_centroids`'s two-pass fallback (`tetra3/src/solver.rs`
+~1973-2116): when `attitude_hint` is set and `strict_hint` is false, pass 0
+runs hinted and pass 1 re-clears the hint and re-runs the ENTIRE nested
+hash-lookup/Wahba search from scratch, even though pass 0 already computed a
+rotation matrix for every candidate it hint-rejected (`try_pattern_combo`,
+lines 1208-1225 — the hint check runs *after* the rotation matrix is already
+in hand). Measured: a hint-rejected candidate costs 4.8×-120× a blind solve
+per attempt (serial 0.042ms -> 5.078ms) because of this re-enumeration.
+
+Investigated as a caching fix (cache hint-rejected candidates' rotation
+matrix + FOV during pass 0, have pass 1 replay just that list instead of
+re-running the nested search) and **rejected** — not because the fix
+wouldn't work, but because the consumer-side (diofinder) usage pattern
+bounds the payoff to nearly nothing: diofinder drops `attitude_hint` entirely
+after 5 consecutive failed solves, so this re-enumeration can only ever
+occur across at most 5 attempts per reacquisition episode, at
+microsecond-to-millisecond absolute costs — tens of milliseconds of total
+waste at the very worst, against reacquisition episodes that in practice ran
+for minutes for unrelated reasons (a diofinder-side auto-exposure bug, since
+fixed). Meanwhile the fix itself carries real risk: `image_centroids_undist`
+is threaded through and refined across the whole pass by verification's
+distortion correction, so replaying only the hint-rejected subset in pass 1
+changes the refinement trajectory those candidates see relative to today;
+and the parallel path's `find_map_first` determinism guarantee (leftmost
+serial-order match wins) would need to be preserved across a cache merged
+from per-chunk workers. Revisit only with a concrete measurement showing the
+bound above no longer holds (e.g. a consumer that keeps a hint alive past 5
+fails, or a use case where hinted attempts get much more expensive).
+
 (no open tasks)
 
 When you complete or add a task, update this section in the same PR — this
