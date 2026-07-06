@@ -148,6 +148,53 @@ a prerelease first and gets validated via diofinder's offline bundle replay
 
 ## 5. Backlog
 
+### DONE (v0.1.7): five micro-optimizations ported from upstream `oakamil/olive-solve`
+
+Reviewed the 3 commits the upstream project (this fork's tracking source) was
+ahead by, and ported the following into `tetra3/src/solver.rs`. All are
+either algebraically equivalent reformulations or provably output-equivalent
+early exits — no intended behavior change, validated against the
+`validate_solver` integration suite (consistency, mirrored-image, and
+blind-fallback tests) after each change:
+
+- **Early-rejection SVD pre-pass** (`try_pattern_combo`): reject a candidate
+  rotation right after the SVD if the rotated catalog pattern doesn't align
+  with the image pattern within a generous tolerance, before paying for the
+  KD-tree verification pass.
+- **Reciprocal multiplication** (`try_pattern_combo`): hoist the two
+  loop-invariant largest-edge reciprocals out of the 5-edge ratio-check loop
+  instead of dividing per comparison.
+- **Direct 2×2 Cramer's-rule solve** (`verify_and_build_solution`): the
+  distortion/FOV least-squares refinement is always a 2-unknown system;
+  solve it via the normal equations + closed-form 2×2 inverse instead of a
+  full `DMatrix`/`DVector` SVD pseudo-inverse.
+- **`ImmutableKdTree`** (`Solver::star_kd_tree`): switched from
+  `kiddo::KdTree` to `kiddo::ImmutableKdTree`, staying at `f32` (unlike
+  upstream's `f64`) to preserve this fork's memory-bandwidth design intent.
+  Item ids are assigned positionally in build order by `new_from_slice`,
+  which already matches `star_table_flat`'s own indexing. Also swapped the
+  initial nearby-star KD-tree query from `.within()` to `.within_unsorted()`,
+  since the result is immediately re-sorted by star index anyway.
+- **Lazy verification early-break** (`verify_and_build_solution`): replaced
+  the batched rotate+project passes over every nearby catalog star with a
+  single streaming per-star loop that stops once `target_crop_len`
+  (`2 * num_extracted_stars`) in-frame candidates are found — same
+  traversal order and in-frame predicate as before, so it selects the exact
+  same star set, just without projecting stars past the cutoff in dense
+  fields.
+
+**Considered and explicitly not ported**: the 6-element sorting network
+(replacing `edges.sort_unstable_by` with 12 hand-unrolled compare-swaps) and
+monotonic key-space pruning (constraining the pattern-key DFS to
+non-decreasing tuples). The sorting-network swap is real but sub-nanosecond
+relative to the SVD/KD-tree work already dominating this function. The
+monotonic pruning is provably correct (catalog pattern keys are inherently
+non-decreasing, since patterns are canonicalized by sorted edge order) but
+prunes a search space that's already ~1 bin wide in this fork's actual
+tuning (`match_max_error`/`pattern_max_error` default 0.002, `pattern_bins`
+default 50 ⇒ per-dimension window ≈ 0.2 bins) — there's essentially nothing
+left to prune here, even though it might matter for upstream's own tuning.
+
 ### DONE (v0.1.6): verify-only solve entry point (`verify_attitude`)
 
 Shipped in v0.1.6. `Solver::verify_attitude` /
