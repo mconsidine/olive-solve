@@ -65,8 +65,8 @@
 //    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //    SOFTWARE.
 
-use kiddo::{KdTree, SquaredEuclidean};
-use nalgebra::{DMatrix, DVector, Matrix3, SVD};
+use kiddo::{ImmutableKdTree, SquaredEuclidean};
+use nalgebra::{Matrix3, SVD};
 use ndarray::{Array1, Array2};
 use npyz::NpyFile;
 use rayon::prelude::*;
@@ -455,58 +455,11 @@ fn find_rotation_matrix_and_det_inplace(
     }
 }
 
-// f32 variants of the verification-stage helpers. They decide which catalog
-// stars match the image (discrete, pixel-tolerance decisions); the f64 rotation
-// matrix and geometry are cast down once per call. Results feeding the final
-// attitude SVD are upcast back to f64 by the caller.
-fn rotate_vectors_inplace_f32(
-    rot: &Matrix3<f64>,
-    vecs: &[[f32; 3]],
-    transpose_rot: bool,
-    out: &mut [[f32; 3]],
-    len: usize,
-) {
-    let r = if transpose_rot { rot.transpose() } else { *rot };
-    let m = [
-        [r[(0, 0)] as f32, r[(0, 1)] as f32, r[(0, 2)] as f32],
-        [r[(1, 0)] as f32, r[(1, 1)] as f32, r[(1, 2)] as f32],
-        [r[(2, 0)] as f32, r[(2, 1)] as f32, r[(2, 2)] as f32],
-    ];
-    for i in 0..len {
-        out[i][0] = m[0][0] * vecs[i][0] + m[0][1] * vecs[i][1] + m[0][2] * vecs[i][2];
-        out[i][1] = m[1][0] * vecs[i][0] + m[1][1] * vecs[i][1] + m[1][2] * vecs[i][2];
-        out[i][2] = m[2][0] * vecs[i][0] + m[2][1] * vecs[i][1] + m[2][2] * vecs[i][2];
-    }
-}
-
-fn compute_centroids_inplace_f32(
-    vectors: &[[f32; 3]],
-    height: f64,
-    width: f64,
-    fov: f64,
-    out_centroids: &mut [[f32; 2]],
-    out_kept: &mut Vec<usize>,
-    len: usize,
-) {
-    out_kept.clear();
-    let scale_factor = (-width / 2.0 / (fov / 2.0).tan()) as f32;
-    let img_center_y = (height / 2.0) as f32;
-    let img_center_x = (width / 2.0) as f32;
-    let h = height as f32;
-    let w = width as f32;
-
-    for i in 0..len {
-        let cy = scale_factor * (vectors[i][2] / vectors[i][0]) + img_center_y;
-        let cx = scale_factor * (vectors[i][1] / vectors[i][0]) + img_center_x;
-        out_centroids[i][0] = cy;
-        out_centroids[i][1] = cx;
-
-        if cy > 0.0 && cx > 0.0 && cy < h && cx < w {
-            out_kept.push(i);
-        }
-    }
-}
-
+// f32 variant of the verification-stage centroid matcher. It decides which
+// catalog stars match the image (discrete, pixel-tolerance decisions); the
+// f64 rotation matrix and geometry are cast down once per call in
+// verify_and_build_solution's lazy-verification loop. Results feeding the
+// final attitude SVD are upcast back to f64 by the caller.
 fn find_centroid_matches_inplace_f32(
     image_centroids: &[[f64; 2]],
     img_len: usize,
@@ -614,7 +567,7 @@ fn rotation_matrix_to_quat(r: &Matrix3<f64>) -> [f64; 4] {
 #[allow(clippy::too_many_arguments)]
 fn verify_and_build_solution(
     scratch: &mut Scratchpads,
-    star_kd_tree: &KdTree<f32, 3>,
+    star_kd_tree: &ImmutableKdTree<f32, 3>,
     star_table_flat: &[CatalogStar],
     star_catalog_ids: &Option<Array2<u32>>,
     db_props: &HashMap<String, f64>,
@@ -646,8 +599,10 @@ fn verify_and_build_solution(
         image_center_vector[1] as f32,
         image_center_vector[2] as f32,
     ];
+    // Unsorted: the list is immediately re-sorted by star index below anyway,
+    // so the tree's internal distance-sort would just be wasted work.
     let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
-        .within::<SquaredEuclidean>(&image_center_vector_f32, max_dist_sq as f32)
+        .within_unsorted::<SquaredEuclidean>(&image_center_vector_f32, max_dist_sq as f32)
         .into_iter()
         .map(|n| n.item as usize)
         .collect();
@@ -660,53 +615,57 @@ fn verify_and_build_solution(
         return None;
     }
 
-    if scratch.sp_nearby_cat_star_vectors.len() < num_nearby {
-        let new_size = num_nearby.max(scratch.sp_nearby_cat_star_vectors.len() * 2);
-        scratch
-            .sp_nearby_cat_star_vectors
-            .resize(new_size, [0.0; 3]);
-        scratch
-            .sp_nearby_cat_star_vectors_derot
-            .resize(new_size, [0.0; 3]);
-        scratch
-            .sp_nearby_cat_star_centroids_all
-            .resize(new_size, [0.0; 2]);
-    }
+    // Lazy verification: stream catalog stars in brightness-priority order
+    // (nearby_cat_stars_inds is already sorted by index above), rotating and
+    // projecting one at a time, and stop the moment target_crop_len in-frame
+    // candidates have been found. This selects exactly the same star set as
+    // computing centroids for every nearby star and truncating to
+    // min(kept.len(), target_crop_len) afterward (same traversal order, same
+    // in-frame predicate) but skips the wasted rotate/project work past the
+    // cutoff in dense fields where num_nearby exceeds the target.
+    let target_crop_len = 2 * num_extracted_stars;
 
-    for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
-        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
-    }
-
-    rotate_vectors_inplace_f32(
-        rotation_matrix,
-        &scratch.sp_nearby_cat_star_vectors[..num_nearby],
-        false,
-        &mut scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
-        num_nearby,
-    );
-    compute_centroids_inplace_f32(
-        &scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
-        height,
-        width,
-        fov,
-        &mut scratch.sp_nearby_cat_star_centroids_all[..num_nearby],
-        &mut scratch.sp_kept,
-        num_nearby,
-    );
-
-    let crop_len = scratch.sp_kept.len().min(2 * num_extracted_stars);
-
-    if scratch.sp_valid_cat_centroids.len() < crop_len {
-        let new_size = crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
+    if scratch.sp_valid_cat_centroids.len() < target_crop_len {
+        let new_size = target_crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
         scratch.sp_valid_cat_centroids.resize(new_size, [0.0; 2]);
         scratch.sp_valid_cat_vectors.resize(new_size, [0.0; 3]);
     }
     scratch.sp_valid_cat_inds.clear();
 
-    for (c_idx, &x) in scratch.sp_kept.iter().take(crop_len).enumerate() {
-        scratch.sp_valid_cat_centroids[c_idx] = scratch.sp_nearby_cat_star_centroids_all[x];
-        scratch.sp_valid_cat_vectors[c_idx] = scratch.sp_nearby_cat_star_vectors[x];
-        scratch.sp_valid_cat_inds.push(nearby_cat_stars_inds[x]);
+    // Matches rotate_vectors_inplace_f32(rotation_matrix, ..., transpose_rot:
+    // false, ...) followed by compute_centroids_inplace_f32, just fused into
+    // a single per-star pass instead of two full-length batch passes.
+    let r = rotation_matrix;
+    let m = [
+        [r[(0, 0)] as f32, r[(0, 1)] as f32, r[(0, 2)] as f32],
+        [r[(1, 0)] as f32, r[(1, 1)] as f32, r[(1, 2)] as f32],
+        [r[(2, 0)] as f32, r[(2, 1)] as f32, r[(2, 2)] as f32],
+    ];
+    let scale_factor = (-width / 2.0 / (fov / 2.0).tan()) as f32;
+    let img_center_y = (height / 2.0) as f32;
+    let img_center_x = (width / 2.0) as f32;
+    let h = height as f32;
+    let w = width as f32;
+
+    let mut crop_len = 0;
+    for &star_idx in &nearby_cat_stars_inds {
+        let vec = star_table_flat[star_idx].vec;
+        let v0 = m[0][0] * vec[0] + m[0][1] * vec[1] + m[0][2] * vec[2];
+        let v1 = m[1][0] * vec[0] + m[1][1] * vec[1] + m[1][2] * vec[2];
+        let v2 = m[2][0] * vec[0] + m[2][1] * vec[1] + m[2][2] * vec[2];
+
+        let cy = scale_factor * (v2 / v0) + img_center_y;
+        let cx = scale_factor * (v1 / v0) + img_center_x;
+
+        if cy > 0.0 && cx > 0.0 && cy < h && cx < w {
+            scratch.sp_valid_cat_centroids[crop_len] = [cy, cx];
+            scratch.sp_valid_cat_vectors[crop_len] = vec;
+            scratch.sp_valid_cat_inds.push(star_idx);
+            crop_len += 1;
+            if crop_len >= target_crop_len {
+                break;
+            }
+        }
     }
 
     let matched_stars = find_centroid_matches_inplace_f32(
@@ -749,9 +708,9 @@ fn verify_and_build_solution(
     if options.distortion.is_some() {
         // Refine fov & distortion using Least Squares System
         // A = [tangent, radius^3], b = [radius]
-        // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
-        let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
-        let mut b_na = DVector::<f64>::zeros(num_star_matches);
+        // Solved via the 2x2 normal equations (A^T A) x = A^T b directly,
+        // rather than building a DMatrix/DVector and running a full SVD
+        // pseudo-inverse for what is always exactly a 2-unknown system.
         let mut derotated_matched_cat = vec![[0.0; 3]; num_star_matches];
         rotate_vectors_inplace(
             &precise_rotation_matrix,
@@ -761,6 +720,12 @@ fn verify_and_build_solution(
             num_star_matches,
         );
 
+        let mut ata_00 = 0.0;
+        let mut ata_01 = 0.0;
+        let mut ata_11 = 0.0;
+        let mut atb_0 = 0.0;
+        let mut atb_1 = 0.0;
+
         for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
             let r_cent = image_centroids[img_idx];
             let r_dist = ((r_cent[0] - height / 2.0).powi(2) + (r_cent[1] - width / 2.0).powi(2))
@@ -769,19 +734,28 @@ fn verify_and_build_solution(
                 * 2.0;
             let cat_derot = derotated_matched_cat[m_idx];
             let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
-            a_na[(m_idx, 0)] = tangent;
-            a_na[(m_idx, 1)] = r_dist.powi(3);
-            b_na[m_idx] = r_dist;
+
+            let a0 = tangent;
+            let a1 = r_dist.powi(3);
+            let b = r_dist;
+
+            ata_00 += a0 * a0;
+            ata_01 += a0 * a1;
+            ata_11 += a1 * a1;
+            atb_0 += a0 * b;
+            atb_1 += a1 * b;
         }
 
-        // Pure-Rust SVD pseudo-inverse for distortions
-        let svd = SVD::new(a_na, true, true);
-        if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
-            let sol = pseudo_inv * b_na;
-            let f_val = sol[0] / (1.0 - sol[1]);
-            k_final = Some(sol[1]);
+        // Direct 2x2 matrix inversion via Cramer's rule.
+        let det = ata_00 * ata_11 - ata_01 * ata_01;
+        if det.abs() > 1e-12 {
+            let sol_0 = (ata_11 * atb_0 - ata_01 * atb_1) / det;
+            let sol_1 = (ata_00 * atb_1 - ata_01 * atb_0) / det;
+
+            let f_val = sol_0 / (1.0 - sol_1);
+            k_final = Some(sol_1);
             fov = 2.0 * (1.0 / f_val).atan();
-            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol[1]);
+            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol_1);
             for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
                 matched_img_cents[m_idx] = image_centroids_undist[img_idx];
             }
@@ -1010,7 +984,7 @@ struct ComboContext<'a> {
     match_threshold: f64,
     options: &'a SolveOptions,
     t0_solve: Instant,
-    star_kd_tree: &'a KdTree<f32, 3>,
+    star_kd_tree: &'a ImmutableKdTree<f32, 3>,
     star_table_flat: &'a [CatalogStar],
     pattern_catalog_flat: &'a [usize],
     pattern_key_hashes: &'a Option<Array1<u16>>,
@@ -1132,12 +1106,17 @@ fn try_pattern_combo(
             &mut scratch.sp_cat_vectors_list,
         );
 
+        // Reciprocal multiplication: both edge lists are divided by their
+        // largest edge once per x below; hoist the two reciprocals out of
+        // the loop and multiply instead of dividing per-comparison.
+        let inv_image_pattern_largest_edge = 1.0 / image_pattern_largest_edge;
         for cat_idx in 0..scratch.sp_cat_edges_list.len() {
             let catalog_largest_edge = *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
+            let inv_catalog_largest_edge = 1.0 / catalog_largest_edge;
             let mut valid = true;
             for x in 0..5 {
-                let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x] / catalog_largest_edge;
-                let img_ratio = edges[x] / image_pattern_largest_edge;
+                let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x] * inv_catalog_largest_edge;
+                let img_ratio = edges[x] * inv_image_pattern_largest_edge;
                 if cat_ratio < img_ratio - ctx.p_max_err || cat_ratio > img_ratio + ctx.p_max_err {
                     valid = false;
                     break;
@@ -1224,6 +1203,36 @@ fn try_pattern_combo(
                 }
             }
 
+            // Early rejection SVD pre-pass: the SVD above will find *some*
+            // rotation matrix even when the geometric shape of the 4 stars is
+            // totally wrong. If the rotated catalog vectors don't closely
+            // align with the image vectors, this candidate is a false
+            // positive and the expensive KD-tree verification below can be
+            // skipped. match_radius is a fraction of the image width; scale
+            // by fov for an approximate max error in radians, with a
+            // generous 2.0 multiplier.
+            let mut valid_shape = true;
+            let r = &rotation_matrix;
+            let max_dist_sq = (ctx.options.match_radius * fov * 2.0).powi(2);
+            for i in 0..4 {
+                let vec = scratch.sp_catalog_pattern_vectors_sorted[i];
+                let img_vec = scratch.sp_image_pattern_vectors_sorted[i];
+
+                let v0 = r[(0, 0)] * vec[0] + r[(0, 1)] * vec[1] + r[(0, 2)] * vec[2];
+                let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
+                let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
+
+                let dist_sq =
+                    (v0 - img_vec[0]).powi(2) + (v1 - img_vec[1]).powi(2) + (v2 - img_vec[2]).powi(2);
+                if dist_sq > max_dist_sq {
+                    valid_shape = false;
+                    break;
+                }
+            }
+            if !valid_shape {
+                continue;
+            }
+
             if let Some(solution) = verify_and_build_solution(
                 scratch,
                 ctx.star_kd_tree,
@@ -1267,10 +1276,6 @@ pub struct Scratchpads {
     // match, with pixel-scale tolerances far wider than f32 rounding, so running
     // it in f32 halves the bandwidth on the A53 without changing the match set.
     // The matched catalog vectors are upcast to f64 for the final SVD/refine.
-    pub sp_nearby_cat_star_vectors: Vec<[f32; 3]>,
-    pub sp_nearby_cat_star_vectors_derot: Vec<[f32; 3]>,
-    pub sp_nearby_cat_star_centroids_all: Vec<[f32; 2]>,
-    pub sp_kept: Vec<usize>,
     pub sp_valid_cat_centroids: Vec<[f32; 2]>,
     pub sp_valid_cat_vectors: Vec<[f32; 3]>,
     pub sp_valid_cat_inds: Vec<usize>,
@@ -1290,11 +1295,6 @@ impl Scratchpads {
             sp_image_pattern_vectors_sorted: vec![[0.0; 3]; max_size],
             sp_radii_scratch: Vec::with_capacity(max_size),
             sp_catalog_pattern_vectors_sorted: vec![[0.0; 3]; max_size],
-
-            sp_nearby_cat_star_vectors: Vec::with_capacity(256),
-            sp_nearby_cat_star_vectors_derot: Vec::with_capacity(256),
-            sp_nearby_cat_star_centroids_all: Vec::with_capacity(256),
-            sp_kept: Vec::with_capacity(256),
 
             sp_valid_cat_centroids: Vec::with_capacity(256),
             sp_valid_cat_vectors: Vec::with_capacity(256),
@@ -1317,7 +1317,7 @@ pub struct Solver {
     // OPTIMIZATION: Highly optimized cache-aligned struct lists
     pub star_table_flat: Vec<CatalogStar>,
     pub pattern_catalog_flat: Vec<usize>,
-    pub star_kd_tree: KdTree<f32, 3>,
+    pub star_kd_tree: ImmutableKdTree<f32, 3>,
 
     pub pattern_largest_edge: Option<Array1<f32>>,
     pub pattern_key_hashes: Option<Array1<u16>>,
@@ -1518,10 +1518,11 @@ impl Solver {
             pattern_catalog_flat.push(val);
         }
 
-        let mut star_kd_tree = KdTree::new();
-        for (i, star) in star_table_flat.iter().enumerate() {
-            star_kd_tree.add(&star.vec, i as u64);
-        }
+        // ImmutableKdTree assigns item ids positionally (0..N in slice order),
+        // matching star_table_flat's own indexing exactly, so no explicit ids
+        // are needed. The tree is built once here and never mutated again.
+        let star_points: Vec<[f32; 3]> = star_table_flat.iter().map(|s| s.vec).collect();
+        let star_kd_tree = ImmutableKdTree::new_from_slice(&star_points);
 
         let mut num_patterns = pattern_catalog_arr.nrows() / 2;
         let mut db_props = HashMap::new();
