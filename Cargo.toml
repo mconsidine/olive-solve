@@ -3,6 +3,7 @@ members = [
     "tetra3",
     "tetra3-py",
     "server",
+    "olive-imu",
 ]
 resolver = "2"
 
