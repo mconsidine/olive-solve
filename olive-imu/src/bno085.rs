@@ -50,17 +50,25 @@ impl ImuDevice for Bno085Device {
         Ok(())
     }
 
-    fn poll_gyro(&mut self) -> Result<Option<Vector3<f64>>, String> {
-        let msg_count = self.imu.handle_all_messages(&mut self.delay, 5);
-        if msg_count > 0 {
-            if let Ok(gyro_data) = self.imu.gyro() {
-                let wx = gyro_data[0] as f64;
-                let wy = gyro_data[1] as f64;
-                let wz = gyro_data[2] as f64;
-                return Ok(Some(Vector3::new(wx, wy, wz)));
+    fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
+        let mut readings = Vec::new();
+        let hw_dt = (self.report_interval_ms as f64) / 1000.0;
+
+        loop {
+            let msg_count = self.imu.handle_one_message(&mut self.delay, 1);
+            if msg_count > 0 {
+                if let Ok(gyro_data) = self.imu.gyro() {
+                    let wx = gyro_data[0] as f64;
+                    let wy = gyro_data[1] as f64;
+                    let wz = gyro_data[2] as f64;
+                    readings.push((Vector3::new(wx, wy, wz), hw_dt));
+                }
+            } else {
+                break;
             }
         }
-        Ok(None)
+
+        Ok(readings)
     }
 
     fn revive(&mut self) -> Result<(), String> {

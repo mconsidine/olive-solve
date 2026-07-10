@@ -11,7 +11,7 @@ use tokio::sync::{RwLock, watch};
 
 use crate::storage::PersistentStorage;
 
-const CALIBRATION_FILE: &str = "imu_calibration.txt";
+const CALIBRATION_KEY: &str = "imu_calibration";
 
 // --- SVD CONFIGURATION CONSTANTS ---
 const SVD_MATURITY_SIZE: usize = 15;
@@ -102,7 +102,7 @@ impl Default for AlignmentState {
 
 pub trait ImuDevice: Send + 'static {
     fn init(&mut self) -> Result<(), String>;
-    fn poll_gyro(&mut self) -> Result<Option<Vector3<f64>>, String>;
+    fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String>;
     fn revive(&mut self) -> Result<(), String>;
 }
 
@@ -138,7 +138,7 @@ impl Imu {
         let mut initial_alignment = AlignmentState::default();
 
         // Load previous calibration (Strictly requires the 5-part format)
-        if let Some(data) = storage.as_ref().and_then(|s| s.get(CALIBRATION_FILE)) {
+        if let Some(data) = storage.as_ref().and_then(|s| s.get(CALIBRATION_KEY)) {
             let parts: Vec<&str> = data.trim().split(',').collect();
             if parts.len() == 5 {
                 if let (Ok(x), Ok(y), Ok(z), Ok(w), Ok(confidence)) = (
@@ -180,7 +180,6 @@ impl Imu {
         // blocking and we strictly do not want to stall the async Tokio runtime.
         std::thread::spawn(move || {
             let mut prev_quat = UnitQuaternion::identity();
-            let mut prev_time = SystemTime::now();
             let boot_time = SystemTime::now();
             let warm_up_duration = Duration::from_secs(3);
             let mut last_msg_time = SystemTime::now(); // Hardware watchdog tracker
@@ -190,111 +189,113 @@ impl Imu {
             loop {
                 std::thread::sleep(Duration::from_millis(5));
 
-                match device.poll_gyro() {
-                    Ok(Some(raw_gyro)) => {
+                match device.poll_gyros() {
+                    Ok(readings) => {
+                        if readings.is_empty() {
+                            // Hardware watchdog: The BNO085 occasionally locks up over I2C.
+                            // If we haven't seen a packet in 2 seconds, we re-send the enable command.
+                            if last_msg_time.elapsed().unwrap_or_default() > Duration::from_secs(2)
+                            {
+                                if let Err(e) = device.revive() {
+                                    error!("Failed to revive device: {}", e);
+                                }
+                                last_msg_time = SystemTime::now();
+                            }
+                            continue;
+                        }
+
                         let now = SystemTime::now();
                         last_msg_time = now; // Kick the watchdog
 
-                        // Calculate bias and magnitude
-                        let bias = {
-                            let cal = calibration_clone.lock().unwrap();
-                            cal.bias_offset
-                        };
+                        let mut current_motion_state = MotionState::Stable;
+                        let mut final_gyro_vec_rad = Vector3::zeros();
+                        let mut final_gyro_mag = 0.0;
 
-                        let gyro_vec_rad = raw_gyro - bias;
-                        let dt = now
-                            .duration_since(prev_time)
-                            .unwrap_or(Duration::from_millis(10))
-                            .as_secs_f64();
-                        let gyro_mag = gyro_vec_rad.norm();
+                        for (raw_gyro, hw_dt) in readings {
+                            // Calculate bias and magnitude
+                            let bias = {
+                                let cal = calibration_clone.lock().unwrap();
+                                cal.bias_offset
+                            };
 
-                        // 0.001 rad/s is approx 0.057 deg/s, a better deadband for stationary drift
-                        let delta_q = if gyro_mag > 0.001 {
-                            UnitQuaternion::new(gyro_vec_rad * dt)
-                        } else {
-                            UnitQuaternion::identity()
-                        };
+                            let gyro_vec_rad = raw_gyro - bias;
+                            let gyro_mag = gyro_vec_rad.norm();
+                            final_gyro_vec_rad = gyro_vec_rad;
+                            final_gyro_mag = gyro_mag;
 
-                        let current_quat = prev_quat * delta_q;
+                            // 0.001 rad/s is approx 0.057 deg/s, a better deadband for stationary drift
+                            let delta_q = if gyro_mag > 0.001 {
+                                UnitQuaternion::new(gyro_vec_rad * hw_dt)
+                            } else {
+                                UnitQuaternion::identity()
+                            };
 
-                        let is_warming_up =
-                            boot_time.elapsed().unwrap_or_default() < warm_up_duration;
+                            prev_quat *= delta_q;
 
-                        if gyro_mag > 0.05 {
-                            last_motion_time = now;
+                            let is_warming_up =
+                                boot_time.elapsed().unwrap_or_default() < warm_up_duration;
+
+                            if gyro_mag > 0.05 {
+                                last_motion_time = now;
+                            }
+
+                            // We enforce a time-based settling period after any motion ends. This
+                            // prevents heavy vibrations or structural settling in the telescope mount
+                            // from polluting our zero-bias baseline.
+                            current_motion_state = if is_warming_up {
+                                MotionState::Initializing
+                            } else if now.duration_since(last_motion_time).unwrap_or_default()
+                                < Duration::from_millis(SETTLE_TIME_MS)
+                            {
+                                MotionState::Moving
+                            } else {
+                                MotionState::Stable
+                            };
+
+                            // Continuous zero-bias EMA tracking
+                            if current_motion_state == MotionState::Stable {
+                                let mut cal = calibration_clone.lock().unwrap();
+                                cal.total_samples += 1;
+
+                                // Dynamic Alpha:
+                                // Phase 1 (1.0 / samples): Acts as a mathematically pure cumulative average to
+                                // rapidly lock in a highly accurate baseline over the first ~50 seconds (2500 samples).
+                                // Phase 2 (max 0.0004): Permanently transforms into a rolling Exponential Moving Average
+                                // that slowly tracks thermal drift without dragging the heavy anchor of historical data.
+                                let alpha = (1.0 / (cal.total_samples as f64)).max(0.0004);
+
+                                cal.bias_offset.x =
+                                    (raw_gyro.x * alpha) + (cal.bias_offset.x * (1.0 - alpha));
+                                cal.bias_offset.y =
+                                    (raw_gyro.y * alpha) + (cal.bias_offset.y * (1.0 - alpha));
+                                cal.bias_offset.z =
+                                    (raw_gyro.z * alpha) + (cal.bias_offset.z * (1.0 - alpha));
+                            }
                         }
-
-                        // We enforce a time-based settling period after any motion ends. This 
-                        // prevents heavy vibrations or structural settling in the telescope mount
-                        // from polluting our zero-bias baseline.
-                        let motion_state = if is_warming_up {
-                            MotionState::Initializing
-                        } else if now.duration_since(last_motion_time).unwrap_or_default()
-                            < Duration::from_millis(SETTLE_TIME_MS)
-                        {
-                            MotionState::Moving
-                        } else {
-                            MotionState::Stable
-                        };
-
-                        // Continuous zero-bias EMA tracking
-                        if motion_state == MotionState::Stable {
-                            let mut cal = calibration_clone.lock().unwrap();
-                            cal.total_samples += 1;
-
-                            // Dynamic Alpha:
-                            // Phase 1 (1.0 / samples): Acts as a mathematically pure cumulative average to
-                            // rapidly lock in a highly accurate baseline over the first ~50 seconds (2500 samples).
-                            // Phase 2 (max 0.0004): Permanently transforms into a rolling Exponential Moving Average
-                            // that slowly tracks thermal drift without dragging the heavy anchor of historical data.
-                            let alpha = (1.0 / (cal.total_samples as f64)).max(0.0004);
-
-                            cal.bias_offset.x =
-                                (raw_gyro.x * alpha) + (cal.bias_offset.x * (1.0 - alpha));
-                            cal.bias_offset.y =
-                                (raw_gyro.y * alpha) + (cal.bias_offset.y * (1.0 - alpha));
-                            cal.bias_offset.z =
-                                (raw_gyro.z * alpha) + (cal.bias_offset.z * (1.0 - alpha));
-                        }
-
-                        let gyro_vec_deg = gyro_vec_rad * (180.0 / std::f64::consts::PI);
 
                         let update = ImuUpdate {
                             timestamp: now,
                             gyro: RawSensorData {
-                                x: gyro_vec_rad.x,
-                                y: gyro_vec_rad.y,
-                                z: gyro_vec_rad.z,
+                                x: final_gyro_vec_rad.x,
+                                y: final_gyro_vec_rad.y,
+                                z: final_gyro_vec_rad.z,
                             },
-                            quaternion: current_quat,
-                            angular_velocity: gyro_mag,
-                            motion_state,
+                            quaternion: prev_quat,
+                            angular_velocity: final_gyro_mag,
+                            motion_state: current_motion_state,
                         };
 
-                        if state_tx.send(Some(update)).is_err() {
-                            log::info!("IMU state channel disconnected. Stopping polling thread.");
-                            break;
-                        }
+                        // Drop any stale updates and push the newest one
+                        let _ = state_tx.send(Some(update));
+
+                        let gyro_vec_deg = final_gyro_vec_rad * (180.0 / std::f64::consts::PI);
 
                         {
                             let mut hist = history_clone.lock().unwrap();
-                            hist.push_back((now, current_quat, motion_state, gyro_vec_deg));
+                            hist.push_back((now, prev_quat, current_motion_state, gyro_vec_deg));
                             if hist.len() > 300 {
                                 hist.pop_front();
                             }
-                        }
-
-                        prev_quat = current_quat;
-                        prev_time = now;
-                    }
-                    Ok(None) => {
-                        // Hardware watchdog: The BNO085 occasionally locks up over I2C.
-                        // If we haven't seen a packet in 2 seconds, we re-send the enable command.
-                        if last_msg_time.elapsed().unwrap_or_default() > Duration::from_secs(2) {
-                            if let Err(e) = device.revive() {
-                                error!("Failed to revive device: {}", e);
-                            }
-                            last_msg_time = SystemTime::now();
                         }
                     }
                     Err(e) => {
@@ -434,7 +435,7 @@ impl Imu {
                 mount_q[0], mount_q[1], mount_q[2], mount_q[3], confidence
             );
             std::thread::spawn(move || {
-                storage.set(CALIBRATION_FILE, &data);
+                storage.set(CALIBRATION_KEY, &data);
                 debug!("Successfully wrote calibration back to storage");
             });
         }
@@ -478,10 +479,24 @@ impl Imu {
                             let t_vec = axis_true.into_inner();
                             let i_vec = axis_imu.into_inner();
 
-                            align.calibration_axes.push((t_vec, i_vec));
+                            let mut replaced = false;
+                            for (existing_t, existing_i) in align.calibration_axes.iter_mut() {
+                                // If the new physical axis is highly parallel to an existing one (cos(11 deg) ≈ 0.98)
+                                if existing_t.dot(&t_vec).abs() > 0.98 {
+                                    // Overwrite it! This keeps the calibration mathematically fresh
+                                    // without destroying our hard-earned 3D spatial diversity!
+                                    *existing_t = t_vec;
+                                    *existing_i = i_vec;
+                                    replaced = true;
+                                    break;
+                                }
+                            }
 
-                            if align.calibration_axes.len() > 100 {
-                                align.calibration_axes.remove(0);
+                            if !replaced {
+                                align.calibration_axes.push((t_vec, i_vec));
+                                if align.calibration_axes.len() > 100 {
+                                    align.calibration_axes.remove(0);
+                                }
                             }
 
                             let mut is_rank_sufficient = false;
@@ -736,7 +751,7 @@ impl Imu {
 
         if let Some(storage) = self.storage.clone() {
             std::thread::spawn(move || {
-                storage.remove(CALIBRATION_FILE);
+                storage.remove(CALIBRATION_KEY);
                 info!("Deleted IMU calibration file from persistent storage.");
             });
         }

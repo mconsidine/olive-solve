@@ -12,6 +12,7 @@ use crate::imu::ImuDevice;
 
 pub struct Bmi160Device {
     imu: Bmi160<I2cInterface<I2cdev>>,
+    last_sensor_time: Option<u32>,
 }
 
 impl Bmi160Device {
@@ -28,7 +29,10 @@ impl Bmi160Device {
         };
         let imu = Bmi160::new_with_i2c(i2c, address);
 
-        Ok(Self { imu })
+        Ok(Self {
+            imu,
+            last_sensor_time: None,
+        })
     }
 }
 
@@ -51,12 +55,12 @@ impl ImuDevice for Bmi160Device {
         Ok(())
     }
 
-    fn poll_gyro(&mut self) -> Result<Option<Vector3<f64>>, String> {
-        // We only care about the gyro right now, so we select just the gyro
-        let selector = SensorSelector::new().gyro();
+    fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
+        // We select the gyro and the hardware sensor time
+        let selector = SensorSelector::new().gyro().time();
         match self.imu.data_scaled(selector) {
             Ok(data) => {
-                if let Some(gyro) = data.gyro {
+                if let (Some(gyro), Some(current_time)) = (data.gyro, data.time) {
                     // data_scaled returns values in deg/sec
                     // We need to convert them to radians/sec for the Imu abstraction
                     let deg_to_rad = std::f64::consts::PI / 180.0;
@@ -65,15 +69,28 @@ impl ImuDevice for Bmi160Device {
                     let wy = gyro.y as f64 * deg_to_rad;
                     let wz = gyro.z as f64 * deg_to_rad;
 
-                    Ok(Some(Vector3::new(wx, wy, wz)))
+                    let dt = if let Some(last_time) = self.last_sensor_time {
+                        // SENSORTIME is a 24-bit counter with 39us resolution
+                        let mut diff = current_time as i64 - last_time as i64;
+                        if diff < 0 {
+                            diff += 0x1000000;
+                        }
+                        (diff as f64) * 39.0e-6
+                    } else {
+                        0.01 // Initial fallback dt
+                    };
+
+                    self.last_sensor_time = Some(current_time);
+
+                    Ok(vec![(Vector3::new(wx, wy, wz), dt)])
                 } else {
-                    Ok(None)
+                    Ok(Vec::new())
                 }
             }
             Err(_) => {
-                // Return Ok(None) on transient read errors rather than crashing the system.
+                // Return empty vec on transient read errors rather than crashing the system.
                 // The Imu watchdog will handle revive() if it drops too many packets.
-                Ok(None)
+                Ok(Vec::new())
             }
         }
     }
