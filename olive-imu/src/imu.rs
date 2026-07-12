@@ -185,9 +185,9 @@ impl Imu {
             let mut last_msg_time = SystemTime::now(); // Hardware watchdog tracker
             let mut last_motion_time = SystemTime::now();
 
-            // Main hardware polling loop. Extracts messages from the I2C bus as fast as they arrive.
+            // Main hardware polling loop. Extracts messages from the I2C bus.
             loop {
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(10));
 
                 match device.poll_gyros() {
                     Ok(readings) => {
@@ -206,6 +206,11 @@ impl Imu {
 
                         let now = SystemTime::now();
                         last_msg_time = now; // Kick the watchdog
+
+                        let total_batch_dt: f64 = readings.iter().map(|(_, dt)| dt).sum();
+                        let mut current_event_time = now
+                            .checked_sub(Duration::from_secs_f64(total_batch_dt))
+                            .unwrap_or(now);
 
                         let mut current_motion_state = MotionState::Stable;
                         let mut final_gyro_vec_rad = Vector3::zeros();
@@ -271,6 +276,24 @@ impl Imu {
                                 cal.bias_offset.z =
                                     (raw_gyro.z * alpha) + (cal.bias_offset.z * (1.0 - alpha));
                             }
+
+                            current_event_time = current_event_time
+                                .checked_add(Duration::from_secs_f64(hw_dt))
+                                .unwrap_or(now);
+                            let gyro_vec_deg = gyro_vec_rad * (180.0 / std::f64::consts::PI);
+
+                            {
+                                let mut hist = history_clone.lock().unwrap();
+                                hist.push_back((
+                                    current_event_time,
+                                    prev_quat,
+                                    current_motion_state,
+                                    gyro_vec_deg,
+                                ));
+                                if hist.len() > 500 {
+                                    hist.pop_front();
+                                }
+                            }
                         }
 
                         let update = ImuUpdate {
@@ -287,16 +310,6 @@ impl Imu {
 
                         // Drop any stale updates and push the newest one
                         let _ = state_tx.send(Some(update));
-
-                        let gyro_vec_deg = final_gyro_vec_rad * (180.0 / std::f64::consts::PI);
-
-                        {
-                            let mut hist = history_clone.lock().unwrap();
-                            hist.push_back((now, prev_quat, current_motion_state, gyro_vec_deg));
-                            if hist.len() > 300 {
-                                hist.pop_front();
-                            }
-                        }
                     }
                     Err(e) => {
                         error!("Device poll error: {}", e);

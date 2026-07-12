@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
-bmi160 = "1.1.0"
+bmi160 = { git = "https://github.com/oakamil/bmi160-rs.git" }
 linux-embedded-hal = "0.4.0"
 log = "0.4"
 nalgebra = "0.32"
