@@ -4,7 +4,9 @@ A fast, robust, and async-friendly Rust implementation and optimization of the [
 
 ## Unique Features
 
-This project is not just a straight port of the upstream Python logic. It introduces several performance optimizations and unique extraction features designed for constrained hardware and specific sensor characteristics:
+This project is not just a straight port of the upstream Python logic. It introduces several performance optimizations and unique extraction features designed for constrained hardware and specific sensor characteristics.
+
+**NEW** Olive Solve now includes a complete IMU implementation for tracking movement between camera plate solves.
 
 ### Extractor
 
@@ -18,6 +20,18 @@ This project is not just a straight port of the upstream Python logic. It introd
 * **Database Support**: Supports both `tetra3` and `cedar-solve` database formats.
 * **Performance**: Blazingly fast single-threaded performance - centroids generated from clean images typically solve in under 1ms on a Raspberry Pi Zero 2W.
 
+### Olive IMU
+
+A robust integration framework for inertial measurement units.
+
+* **Supported Sensors**: Integration with the Bosch BMI160 and Ceva BNO085 sensors is included. The ImuDevice trait can be implemented for other sensors.
+* **Real-time SVD Alignment**: Implements continuous Singular Value Decomposition to mathematically derive the optimal transformation matrix,
+  keeping the camera and IMU reference frames synchronized.
+* **Continuous Bias Compensation**: Uses rolling variance windows and an exponential moving average to actively calculate and eliminate zero-
+  rate gyroscope drift.
+* **Timing Synchronization**: Employs queue-draining and back-dating timestamp strategies to map sensor-relative measurements to host wall-clock time, absorbing I2C jitter and preventing timeline drift.
+* **Asynchronous Polling**: A dedicated OS thread handles blocking I2C transactions to maintain high polling rates (100 Hz+) without stalling the main `tokio` async runtime.
+
 ## Repository Structure
 
 This workspace is divided into two primary crates:
@@ -25,6 +39,7 @@ This workspace is divided into two primary crates:
 * **`tetra3`**: The core algorithms. `solver.rs` is a Rust port of the [Tetra3](https://github.com/smroid/cedar-solve/blob/master/tetra3/tetra3.py) `solve_from_centroids` function. `extractor.rs` is a Rust port of the `get_centroids_from_image` function. `tetra3.rs` provides the standard interface corresponding to the Python project.
 * **`tetra3-py`**: Python bindings for the optimized tetra3 Rust implementation.
 * **`server`**: A gRPC server that exposes tetra3's algorithms as a service.
+* **`olive-imu`**: A specialized IMU driver library providing real-time kinematic integration for telescope orientation.
 
 ## Getting Started
 
