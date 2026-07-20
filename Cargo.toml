@@ -1,3 +1,20 @@
+[package]
+name = "olive-solve"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tetra3 = { path = "tetra3" }
+olive-imu = { path = "olive-imu" }
+bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
+bmi160 = { git = "https://github.com/oakamil/bmi160-rs.git" }
+tokio = { version = "1.36", features = ["sync", "rt", "macros", "time"] }
+chrono = "0.4"
+log = "0.4"
+async-trait = "0.1"
+ndarray = "0.17.2"
+nalgebra = "0.32"
+
 [workspace]
 members = [
     "tetra3",
