@@ -772,17 +772,19 @@ impl Imu {
     }
 
     // IMU-derived estimate of camera pointing as of the given time.
+    // The boolean in the Result tuple is `true` if the returned position is an updated estimate
+    // using IMU data, and `false` if it is falling back to the static anchor itself.
     pub async fn get_estimated_pointing(
         &self,
         timestamp: &SystemTime,
-    ) -> Result<MountCoordinates, &'static str> {
+    ) -> Result<(MountCoordinates, bool), &'static str> {
         let align = self.alignment.read().await.clone();
 
         if let (Some(anchor_horiz), Some(anchor_quat)) =
             (align.last_camera_position, align.imu_anchor_state)
         {
             if !align.loaded_from_disk && align.calibration_axes.len() < 3 {
-                return Ok(anchor_horiz);
+                return Ok((anchor_horiz, false));
             }
 
             // 1. Fetch the raw IMU state for the requested time
@@ -802,7 +804,7 @@ impl Imu {
 
             // Reject tiny movements to avoid reporting stationary drift
             if imu_local_delta.angle().to_degrees() < 0.05 {
-                return Ok(anchor_horiz);
+                return Ok((anchor_horiz, false));
             }
 
             // 3. Coordinate Transformation (Similarity Transform / Change of Basis).
@@ -819,7 +821,7 @@ impl Imu {
             // 5. Apply the correctly transformed movement delta directly to the true sky anchor
             let est_q = anchor_true_q * cam_local_delta;
 
-            Ok(Self::quat_to_mount(&est_q))
+            Ok((Self::quat_to_mount(&est_q), true))
         } else {
             Err("No plate solve anchor established yet.")
         }

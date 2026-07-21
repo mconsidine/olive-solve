@@ -295,7 +295,8 @@ impl FusedSolver {
         let last_solve = self.latest_solve_position.read().await.clone();
 
         if let Some(ref imu) = *self.imu.read().await {
-            if let Ok(est) = imu.get_estimated_pointing(&SystemTime::now()).await {
+            if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&SystemTime::now()).await
+            {
                 let lat_opt = *self.latitude.read().await;
                 let lon_opt = *self.longitude.read().await;
 
@@ -308,7 +309,11 @@ impl FusedSolver {
                         ra: current_ra,
                         dec: current_dec,
                         roll: current_roll,
-                        source: PositionSource::Imu,
+                        source: if is_imu_estimate {
+                            PositionSource::Imu
+                        } else {
+                            PositionSource::Solver
+                        },
                         timestamp: SystemTime::now(),
                     });
                 }
