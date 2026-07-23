@@ -839,6 +839,11 @@ impl Imu {
         self.alignment.read().await.transform_metrics.clone()
     }
 
+    pub async fn is_calibrated(&self) -> bool {
+        let align = self.alignment.read().await;
+        align.loaded_from_disk || align.calibration_axes.len() >= 3
+    }
+
     pub fn get_latest_state(&self) -> Option<ImuUpdate> {
         *self.state_rx.borrow()
     }

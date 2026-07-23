@@ -39,6 +39,10 @@ pub enum PositionSource {
     Solver,
     /// Position estimated by the IMU using the last known solver anchor.
     Imu,
+    /// The solver recently failed (e.g. due to movement or obstruction),
+    /// and the IMU is unavailable to provide a real-time estimate.
+    /// This represents the last known good plate-solved anchor, but it is physically stale.
+    SolverStale,
 }
 
 /// A unified representation of the device's celestial orientation.
@@ -65,6 +69,7 @@ pub struct FusedSolver {
     imu_type: Arc<RwLock<ImuType>>,
     storage: Option<Arc<dyn PersistentStorage>>,
     latest_solve_position: Arc<RwLock<Option<Position>>>,
+    last_solve_failed: Arc<RwLock<bool>>,
 
     // Observer location required for Alt/Az IMU coordinate mapping
     latitude: Arc<RwLock<Option<f64>>>,
@@ -91,6 +96,7 @@ impl FusedSolver {
             imu_type: Arc::new(RwLock::new(imu_type.unwrap_or(ImuType::Auto))),
             storage,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         })
@@ -214,7 +220,10 @@ impl FusedSolver {
         };
 
         if solution.status == SolveStatus::MatchFound {
+            *self.last_solve_failed.write().await = false;
             self.update_anchor_from_solution(&solution, time).await;
+        } else {
+            *self.last_solve_failed.write().await = true;
         }
 
         Ok(solution)
@@ -229,9 +238,18 @@ impl FusedSolver {
         options: SolveOptions,
         timestamp: Option<SystemTime>,
     ) -> Result<Solution, String> {
-        let centroids = self.extract(image_data).await?;
-        self.solve_from_centroids(&centroids, size, options, timestamp)
-            .await
+        let centroids_result = self.extract(image_data).await;
+
+        match centroids_result {
+            Ok(centroids) => {
+                self.solve_from_centroids(&centroids, size, options, timestamp)
+                    .await
+            }
+            Err(e) => {
+                *self.last_solve_failed.write().await = true;
+                Err(e)
+            }
+        }
     }
 
     async fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
@@ -300,7 +318,8 @@ impl FusedSolver {
     /// If the IMU is actively tracking and has a valid plate solve anchor, this returns the real-time IMU estimate.
     /// Otherwise, it safely falls back to returning the position from the last successful plate solve.
     pub async fn get_latest_position(&self) -> Option<Position> {
-        let last_solve = self.latest_solve_position.read().await.clone();
+        let mut last_solve = self.latest_solve_position.read().await.clone();
+        let last_failed = *self.last_solve_failed.read().await;
 
         if let Some(ref imu) = *self.imu.read().await {
             if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&SystemTime::now()).await
@@ -313,18 +332,30 @@ impl FusedSolver {
                     let (current_ra, current_dec, current_roll) =
                         alt_az_to_ra_dec(est.pitch, est.yaw, est.roll, lat, lon, dt_now);
 
+                    let source = if is_imu_estimate {
+                        PositionSource::Imu
+                    } else if imu.is_calibrated().await {
+                        PositionSource::Solver
+                    } else if last_failed {
+                        PositionSource::SolverStale
+                    } else {
+                        PositionSource::Solver
+                    };
+
                     return Some(Position {
                         ra: current_ra,
                         dec: current_dec,
                         roll: current_roll,
-                        source: if is_imu_estimate {
-                            PositionSource::Imu
-                        } else {
-                            PositionSource::Solver
-                        },
+                        source,
                         timestamp: SystemTime::now(),
                     });
                 }
+            }
+        }
+
+        if let Some(pos) = &mut last_solve {
+            if last_failed {
+                pos.source = PositionSource::SolverStale;
             }
         }
 
@@ -502,6 +533,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -523,6 +555,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(Some(0.0))),
             longitude: Arc::new(RwLock::new(Some(0.0))),
         };
@@ -544,6 +577,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImu)))),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(Some(0.0))),
             longitude: Arc::new(RwLock::new(Some(0.0))),
         };
@@ -565,6 +599,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -587,6 +622,7 @@ mod tests {
                 source: PositionSource::Solver,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
             }))),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -633,6 +669,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImu)))),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -670,6 +707,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -698,6 +736,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -720,6 +759,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
