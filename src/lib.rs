@@ -235,8 +235,16 @@ impl FusedSolver {
     }
 
     async fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
-        let ra = solution.ra.unwrap_or(0.0);
-        let dec = solution.dec.unwrap_or(0.0);
+        let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
+            t_ra[0]
+        } else {
+            solution.ra.unwrap_or(0.0)
+        };
+        let dec = if let (Some(_t_ra), Some(t_dec)) = (&solution.target_ra, &solution.target_dec) {
+            t_dec[0]
+        } else {
+            solution.dec.unwrap_or(0.0)
+        };
         let roll = solution.roll.unwrap_or(0.0);
 
         if let Some(ref imu) = *self.imu.read().await {
