@@ -379,7 +379,7 @@ fn ra_dec_to_alt_az(
     let lat_rad = lat_deg.to_radians();
 
     let sin_alt = dec_rad.sin() * lat_rad.sin() + dec_rad.cos() * lat_rad.cos() * ha_rad.cos();
-    let alt_rad = sin_alt.asin();
+    let alt_rad = sin_alt.clamp(-1.0, 1.0).asin();
     let alt_deg = alt_rad.to_degrees();
 
     let cos_az = (dec_rad.sin() - sin_alt * lat_rad.sin()) / (alt_rad.cos() * lat_rad.cos());
@@ -442,7 +442,7 @@ fn alt_az_to_ra_dec(
     let lat_rad = lat_deg.to_radians();
 
     let sin_dec = alt_rad.sin() * lat_rad.sin() + alt_rad.cos() * lat_rad.cos() * az_rad.cos();
-    let dec_rad = sin_dec.asin();
+    let dec_rad = sin_dec.clamp(-1.0, 1.0).asin();
     let dec_deg = dec_rad.to_degrees();
 
     let cos_ha = (alt_rad.sin() - sin_dec * lat_rad.sin()) / (dec_rad.cos() * lat_rad.cos());
