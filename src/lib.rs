@@ -339,7 +339,7 @@ impl FusedSolver {
                     } else if imu.is_calibrated().await {
                         // In this case our position estimate is stale, but the IMU hasn't detected enough
                         // movement so we consider the estimate as coming from the IMU.
-                        PositionSource::Imu 
+                        PositionSource::Imu
                     } else {
                         PositionSource::SolverStale
                     };
