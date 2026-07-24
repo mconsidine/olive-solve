@@ -340,7 +340,7 @@ impl FusedSolver {
                         // In this case our position estimate is stale, but the IMU hasn't detected enough
                         // movement so we consider the estimate as coming from the IMU.
                         PositionSource::Imu 
-                    } else
+                    } else {
                         PositionSource::SolverStale
                     };
 
