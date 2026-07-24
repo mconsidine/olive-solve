@@ -334,12 +334,14 @@ impl FusedSolver {
 
                     let source = if is_imu_estimate {
                         PositionSource::Imu
+                    } else if !last_failed {
+                        PositionSource::Solver
                     } else if imu.is_calibrated().await {
-                        PositionSource::Solver
-                    } else if last_failed {
+                        // In this case our position estimate is stale, but the IMU hasn't detected enough
+                        // movement so we consider the estimate as coming from the IMU.
+                        PositionSource::Imu 
+                    } else
                         PositionSource::SolverStale
-                    } else {
-                        PositionSource::Solver
                     };
 
                     return Some(Position {
