@@ -84,7 +84,7 @@ pub enum SigmaMode {
     GlobalRootSquare,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Crop {
     /// Scalar: Image is cropped to given fraction (e.g. 2 gives 1/2 size image out).
     Fraction(usize),

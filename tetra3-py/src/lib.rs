@@ -70,7 +70,10 @@ use pyo3::types::{PyDict, PyTuple};
 use std::path::PathBuf;
 
 use tetra3_core::Tetra3;
-use tetra3_core::extractor::{BgSubMode, ExtractOptions, SigmaMode};
+use tetra3_core::extractor::{BgSubMode, Crop, ExtractOptions, SigmaMode};
+use tetra3_core::fast_extractor::{
+    FastBgSubMode, FastDownsample, FastExtractOptions, FastSigmaMode,
+};
 use tetra3_core::solver::SolveOptions;
 
 use std::sync::Mutex;
@@ -207,6 +210,11 @@ impl PyTetra3 {
 
     /// Extracts centroids from a 2D NumPy array using the fast sequential path.
     /// Supports both u8 and f32 images.
+    ///
+    /// Returns:
+    ///     numpy.ndarray or tuple: If no virtual_crops are provided, an array of shape (N,2)
+    ///     is returned with centroid positions (y down, x right). If virtual_crops are provided,
+    ///     a tuple is returned containing (base_centroids, (crop_1_centroids, crop_2_centroids, ...))
     #[pyo3(signature = (image, **kwargs))]
     fn get_centroids_from_image_fast<'py>(
         &self,
@@ -214,7 +222,7 @@ impl PyTetra3 {
         image: Bound<'py, PyAny>,
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let options = parse_extract_options(kwargs)?;
+        let options = parse_fast_extract_options(kwargs)?;
 
         // Try extracting as u8 first, then f32
         let result = if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
@@ -235,7 +243,18 @@ impl PyTetra3 {
             ));
         };
 
-        Ok(centroids_to_numpy(py, &result.centroids))
+        let core_result = fast_centroids_to_numpy(py, &result.centroids);
+        if let Some(crop_results) = &result.virtual_crop_centroids {
+            let mut crop_list = Vec::with_capacity(crop_results.len());
+            for crop in crop_results {
+                crop_list.push(fast_centroids_to_numpy(py, crop));
+            }
+            let elements: Vec<Bound<'py, pyo3::types::PyAny>> =
+                vec![core_result, PyTuple::new(py, crop_list).unwrap().into_any()];
+            Ok(PyTuple::new(py, elements).unwrap().into_any())
+        } else {
+            Ok(core_result)
+        }
     }
 
     /// Runs plate solving from pre-extracted centroids.
@@ -310,7 +329,7 @@ impl PyTetra3 {
         image: Bound<'py, PyAny>,
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let extract_options = parse_extract_options(kwargs)?;
+        let extract_options = parse_fast_extract_options(kwargs)?;
         let solve_options = parse_solve_options(kwargs)?;
 
         let (solution, ext_time) =
@@ -376,6 +395,22 @@ impl PyTetra3 {
 fn centroids_to_numpy<'py>(
     py: Python<'py>,
     centroids: &[tetra3_core::extractor::CentroidResult],
+) -> Bound<'py, pyo3::types::PyAny> {
+    let num_centroids = centroids.len();
+    let mut cents = Vec::with_capacity(num_centroids * 2);
+    for c in centroids {
+        cents.push(c.y);
+        cents.push(c.x);
+    }
+    numpy::PyArray1::from_slice(py, &cents)
+        .reshape([num_centroids, 2])
+        .unwrap()
+        .into_any()
+}
+
+fn fast_centroids_to_numpy<'py>(
+    py: Python<'py>,
+    centroids: &[tetra3_core::fast_extractor::FastCentroidResult],
 ) -> Bound<'py, pyo3::types::PyAny> {
     let num_centroids = centroids.len();
     let mut cents = Vec::with_capacity(num_centroids * 2);
@@ -544,6 +579,129 @@ fn parse_extract_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Extract
                     )));
                 }
             };
+        }
+    }
+    Ok(options)
+}
+
+fn parse_fast_extract_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<FastExtractOptions> {
+    let mut options = FastExtractOptions::default();
+    options.approximate_background = true; // Default to true for fast path
+
+    if let Some(dict) = kwargs {
+        if let Some(val) = dict.get_item("sigma")? {
+            options.sigma = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("downsample")? {
+            let ds: Option<usize> = val.extract()?;
+            options.downsample = match ds {
+                None | Some(1) => FastDownsample::None,
+                Some(2) => FastDownsample::X2,
+                Some(4) => FastDownsample::X4,
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "Invalid downsample for fast path",
+                    ));
+                }
+            };
+        }
+        if let Some(val) = dict.get_item("binary_open")? {
+            options.binary_open = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("centroid_window")? {
+            options.centroid_window = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("min_area")? {
+            options.min_area = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("max_area")? {
+            options.max_area = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("min_sum")? {
+            options.min_sum = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("max_sum")? {
+            options.max_sum = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("max_axis_ratio")? {
+            options.max_axis_ratio = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("approximate_background")? {
+            options.approximate_background = val.extract()?;
+        }
+
+        // Background Subtraction Mode
+        if let Some(val) = dict.get_item("bg_sub_mode")? {
+            if val.is_none() {
+                options.bg_sub_mode = None;
+            } else {
+                let mode_str: String = val.extract()?;
+                options.bg_sub_mode = match mode_str.to_lowercase().as_str() {
+                    "local_median" | "block_median" => {
+                        Some(FastBgSubMode::BlockMedian { block_size: 32 })
+                    }
+                    "line_median" => Some(FastBgSubMode::LineMedian),
+                    "global_median" => Some(FastBgSubMode::GlobalMedian),
+                    "global_mean" => Some(FastBgSubMode::GlobalMean),
+                    "none" => None,
+                    _ => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "Invalid bg_sub_mode for fast path: {}",
+                            mode_str
+                        )));
+                    }
+                };
+            }
+        }
+
+        // Sigma Threshold Mode
+        if let Some(val) = dict.get_item("sigma_mode")? {
+            let mode_str: String = val.extract()?;
+            options.sigma_mode = match mode_str.to_lowercase().as_str() {
+                "global_median_abs" => FastSigmaMode::GlobalMedianAbs,
+                "global_root_square" => FastSigmaMode::GlobalRootSquare,
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid sigma_mode for fast path: {}",
+                        mode_str
+                    )));
+                }
+            };
+        }
+
+        // Virtual crops
+        if let Some(val) = dict.get_item("virtual_crops")? {
+            if !val.is_none() {
+                let py_list: Vec<Bound<'_, pyo3::types::PyTuple>> = val.extract()?;
+                let mut crops = Vec::new();
+                for py_crop in py_list {
+                    let len = py_crop.len();
+                    if len == 1 {
+                        let fraction: usize = py_crop.get_item(0)?.extract()?;
+                        crops.push(Crop::Fraction(fraction));
+                    } else if len == 2 {
+                        let height: usize = py_crop.get_item(0)?.extract()?;
+                        let width: usize = py_crop.get_item(1)?.extract()?;
+                        crops.push(Crop::Center { height, width });
+                    } else if len == 4 {
+                        let height: usize = py_crop.get_item(0)?.extract()?;
+                        let width: usize = py_crop.get_item(1)?.extract()?;
+                        let offset_y: isize = py_crop.get_item(2)?.extract()?;
+                        let offset_x: isize = py_crop.get_item(3)?.extract()?;
+                        crops.push(Crop::Region {
+                            height,
+                            width,
+                            offset_y,
+                            offset_x,
+                        });
+                    } else {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Invalid virtual crop format",
+                        ));
+                    }
+                }
+                options.virtual_crops = Some(crops);
+            }
         }
     }
     Ok(options)

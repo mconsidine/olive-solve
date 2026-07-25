@@ -1,10 +1,12 @@
 use chrono::{Datelike, Timelike};
-use ndarray::Array2;
+use ndarray::{Array2, ArrayBase, Data, Ix2};
 use olive_imu::storage::PersistentStorage;
 use olive_imu::{Imu, ImuDevice, MountCoordinates};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tetra3::extractor::Extractor;
+use tetra3::FastPixel;
+use tetra3::extractor::{ExtractOptions, ExtractionResult, Extractor};
+use tetra3::fast_extractor::{FastExtractOptions, FastExtractionResult, FastExtractor};
 use tetra3::solver::{Solution, SolveOptions, SolveStatus, Solver};
 use tokio::sync::RwLock;
 
@@ -65,6 +67,7 @@ pub struct Position {
 pub struct FusedSolver {
     solver: Arc<RwLock<Option<Solver>>>,
     extractor: Arc<RwLock<Option<Extractor>>>,
+    fast_extractor: Arc<RwLock<Option<FastExtractor>>>,
     imu: Arc<RwLock<Option<Arc<Imu>>>>,
     imu_type: Arc<RwLock<ImuType>>,
     storage: Option<Arc<dyn PersistentStorage>>,
@@ -92,6 +95,7 @@ impl FusedSolver {
         Ok(Self {
             solver: Arc::new(RwLock::new(Some(solver))),
             extractor: Arc::new(RwLock::new(Some(extractor))),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(imu_type.unwrap_or(ImuType::Auto))),
             storage,
@@ -192,11 +196,49 @@ impl FusedSolver {
     // TETRA3 WRAPPERS
     // ==========================================
 
-    /// Extracts star centroids from raw image data (stub implementation).
-    pub async fn extract(&self, _image_data: &[u8]) -> Result<Array2<f64>, String> {
-        let _extractor_guard = self.extractor.write().await;
-        // Extractor::extract is not fully wrapped here for arbitrary byte buffers.
-        Ok(Array2::zeros((0, 2)))
+    /// Extracts star centroids using the standard pipeline.
+    pub async fn extract<S>(
+        &self,
+        image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> Result<ExtractionResult, String>
+    where
+        S: Data<Elem = f32>,
+    {
+        let mut extractor_guard = self.extractor.write().await;
+        if let Some(extractor) = extractor_guard.as_mut() {
+            Ok(extractor.extract(image, options))
+        } else {
+            Err("Extractor is not initialized.".into())
+        }
+    }
+
+    /// Extracts star centroids using the fast sequential pipeline.
+    pub async fn extract_fast<S, T>(
+        &self,
+        image: &ArrayBase<S, Ix2>,
+        options: FastExtractOptions,
+    ) -> Result<FastExtractionResult, String>
+    where
+        S: Data<Elem = T>,
+        T: FastPixel,
+    {
+        let mut extractor_guard = self.fast_extractor.write().await;
+        let (height, width) = image.dim();
+
+        let reinit = match extractor_guard.as_ref() {
+            Some(fe) => {
+                fe.orig_width() != width || fe.orig_height() != height || fe.options() != &options
+            }
+            None => true,
+        };
+
+        if reinit {
+            *extractor_guard = Some(FastExtractor::new(width, height, options));
+        }
+
+        let fe = extractor_guard.as_mut().unwrap();
+        Ok(T::extract_sequential(fe, image))
     }
 
     /// Performs a plate solve using pre-extracted centroids and given image dimensions.
@@ -208,16 +250,39 @@ impl FusedSolver {
         options: SolveOptions,
         timestamp: Option<SystemTime>,
     ) -> Result<Solution, String> {
+        self.solve_from_centroids_batch(&[centroids.clone()], size, options, timestamp)
+            .await
+    }
+
+    /// Attempts to solve from multiple centroid sets in order, stopping when a solution is found.
+    /// Updates internal solve state only when a solution is found or all given centroid sets fail.
+    pub async fn solve_from_centroids_batch(
+        &self,
+        centroids_batch: &[Array2<f64>],
+        size: (f64, f64),
+        options: SolveOptions,
+        timestamp: Option<SystemTime>,
+    ) -> Result<Solution, String> {
         let time = timestamp.unwrap_or_else(SystemTime::now);
 
-        let solution = {
-            let mut solver_guard = self.solver.write().await;
-            if let Some(solver) = solver_guard.as_mut() {
-                solver.solve(centroids, size, options)
-            } else {
-                return Err("Solver is not initialized.".into());
+        let mut last_solution = None;
+
+        let mut solver_guard = self.solver.write().await;
+        let solver = solver_guard
+            .as_mut()
+            .ok_or_else(|| "Solver is not initialized.".to_string())?;
+
+        for centroids in centroids_batch {
+            let solution = solver.solve(centroids, size, options.clone());
+            let found = solution.status == SolveStatus::MatchFound;
+            last_solution = Some(solution);
+
+            if found {
+                break;
             }
-        };
+        }
+
+        let solution = last_solution.ok_or_else(|| "No centroid sets provided.".to_string())?;
 
         if solution.status == SolveStatus::MatchFound {
             *self.last_solve_failed.write().await = false;
@@ -227,29 +292,6 @@ impl FusedSolver {
         }
 
         Ok(solution)
-    }
-
-    /// Extracts star centroids from the image and performs a plate solve.
-    /// If successful, the solver automatically updates the IMU anchor internally.
-    pub async fn solve_from_image(
-        &self,
-        image_data: &[u8],
-        size: (f64, f64),
-        options: SolveOptions,
-        timestamp: Option<SystemTime>,
-    ) -> Result<Solution, String> {
-        let centroids_result = self.extract(image_data).await;
-
-        match centroids_result {
-            Ok(centroids) => {
-                self.solve_from_centroids(&centroids, size, options, timestamp)
-                    .await
-            }
-            Err(e) => {
-                *self.last_solve_failed.write().await = true;
-                Err(e)
-            }
-        }
     }
 
     async fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
