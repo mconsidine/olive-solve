@@ -136,8 +136,12 @@ impl FastExtractOptions {
     pub fn from_kwargs(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let mut options = FastExtractOptions::default();
         options.approximate_background = true; // Default to true for fast path
+        let mut block_size = 32;
 
         if let Some(dict) = kwargs {
+            if let Some(val) = dict.get_item("filtsize")? {
+                block_size = val.extract()?;
+            }
             if let Some(val) = dict.get_item("sigma")? {
                 options.sigma = val.extract()?;
             }
@@ -187,7 +191,7 @@ impl FastExtractOptions {
                     let mode_str: String = val.extract()?;
                     options.bg_sub_mode = match mode_str.to_lowercase().as_str() {
                         "local_median" | "block_median" => {
-                            Some(FastBgSubMode::BlockMedian { block_size: 32 })
+                            Some(FastBgSubMode::BlockMedian { block_size })
                         }
                         "line_median" => Some(FastBgSubMode::LineMedian),
                         "global_median" => Some(FastBgSubMode::GlobalMedian),

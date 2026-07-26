@@ -206,6 +206,10 @@ impl PyTetra3 {
     /// Extracts centroids from a 2D NumPy array using the fast sequential path.
     /// Supports both u8 and f32 images.
     ///
+    /// Note: In the fast path, if `bg_sub_mode="local_median"` or `"block_median"`, the
+    /// algorithm will use a grid-based block median approximation. The `filtsize` keyword
+    /// argument is used directly as the `block_size` for this mode.
+    ///
     /// Returns:
     ///     numpy.ndarray or tuple: If no virtual_crops are provided, an array of shape (N,2)
     ///     is returned with centroid positions (y down, x right). If virtual_crops are provided,
@@ -317,6 +321,10 @@ impl PyTetra3 {
 
     /// Runs extraction and plate solving in one uninterrupted pipeline using the fast path.
     /// Returns a dictionary containing the solution and execution times.
+    ///
+    /// Note: In the fast path, if `bg_sub_mode="local_median"` or `"block_median"`, the
+    /// algorithm will use a grid-based block median approximation. The `filtsize` keyword
+    /// argument is used directly as the `block_size` for this mode.
     #[pyo3(signature = (image, **kwargs))]
     fn solve_from_image_fast<'py>(
         &self,
