@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+#![allow(missing_docs)]
+
 pub mod extractor;
 pub mod fast_extractor;
 pub mod solver;

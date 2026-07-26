@@ -2040,7 +2040,9 @@ dependencies = [
  "log",
  "nalgebra 0.32.6",
  "ndarray",
+ "numpy",
  "olive-imu",
+ "pyo3",
  "tetra3",
 ]
 

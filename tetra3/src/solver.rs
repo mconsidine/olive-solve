@@ -83,6 +83,8 @@ const MAGIC_RAND: u64 = 2654435761;
 // --- Data Structures & Options ---
 
 #[derive(Debug, Clone, PartialEq, Default)]
+#[allow(missing_docs)]
+/// Indicates the status of a plate solve attempt.
 pub enum SolveStatus {
     MatchFound,
     #[default]
@@ -93,6 +95,8 @@ pub enum SolveStatus {
 }
 
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
+/// Configuration options for the plate solving process.
 pub struct SolveOptions {
     pub fov_estimate: Option<f64>,
     pub fov_max_error: Option<f64>,
@@ -128,6 +132,8 @@ impl Default for SolveOptions {
 }
 
 #[derive(Debug, Default)]
+#[allow(missing_docs)]
+/// Contains the result of a plate solve attempt.
 pub struct Solution {
     pub ra: Option<f64>,
     pub dec: Option<f64>,
@@ -156,6 +162,8 @@ pub struct Solution {
 }
 
 #[derive(Clone, Copy)]
+#[allow(missing_docs)]
+/// Internal representation of a star loaded from the cedar-solve database.
 pub struct CatalogStar {
     pub ra: f64,
     pub dec: f64,
@@ -850,6 +858,8 @@ fn separation_for_density(fov: f64, stars_per_fov: f64) -> f64 {
 
 // --- Scratchpad for Zero-Allocation Combinatorics ---
 #[derive(Default)]
+#[doc(hidden)]
+#[allow(missing_docs)]
 pub struct Scratchpads {
     pub sp_pattern_key_list: Vec<(usize, [usize; 5])>,
 
@@ -883,6 +893,7 @@ pub struct Scratchpads {
 }
 
 impl Scratchpads {
+    #[allow(missing_docs)]
     pub fn new(p_size: usize) -> Self {
         let max_size = p_size.max(6);
         Self {
@@ -929,6 +940,9 @@ impl Scratchpads {
 // The original tetra3 algorithm seems to have settled on 4 as the optimal pattern size - its name
 // includes 'tetra' after all.
 //
+//
+#[allow(missing_docs)]
+/// The main solver engine. Highly optimized for plate solving using cedar-solve databases.
 pub struct Solver {
     // OPTIMIZATION: Highly optimized cache-aligned struct lists
     pub star_table_flat: Vec<CatalogStar>,
@@ -949,6 +963,7 @@ pub struct Solver {
 }
 
 impl Solver {
+    /// Loads a cedar-solve database from the given path.
     pub fn load_database(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
         let mut archive = ZipArchive::new(file)?;
@@ -1284,6 +1299,7 @@ impl Solver {
         })
     }
 
+    /// Cancels an ongoing plate solve attempt (usually called from another thread).
     pub fn cancel_solve(&self) {
         self.is_cancelled.store(true, Ordering::Relaxed);
     }
@@ -1435,6 +1451,7 @@ impl Solver {
         }
     }
 
+    /// Attempts to plate solve using the given pre-extracted star centroids.
     pub fn solve(
         &mut self,
         star_centroids: &Array2<f64>,

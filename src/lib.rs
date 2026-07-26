@@ -4,6 +4,9 @@ use olive_imu::storage::PersistentStorage;
 use olive_imu::{Imu, ImuDevice, MountCoordinates};
 use std::sync::Arc;
 use std::sync::RwLock;
+
+#[cfg(feature = "python")]
+pub mod python;
 use std::time::SystemTime;
 use tetra3::FastPixel;
 use tetra3::extractor::{ExtractOptions, ExtractionResult, Extractor};
@@ -238,7 +241,7 @@ impl FusedSolver {
         }
 
         let fe = extractor_guard.as_mut().unwrap();
-        Ok(T::extract_sequential(fe, image))
+        Ok(T::extract_fast(fe, image))
     }
 
     /// Performs a plate solve using pre-extracted centroids and given image dimensions.

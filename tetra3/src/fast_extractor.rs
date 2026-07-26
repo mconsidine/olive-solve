@@ -9,10 +9,12 @@
 // A copy of the License is located in the LICENSE.md file in the root of this
 // repository.
 //
+#![allow(missing_docs)]
 use ndarray::{ArrayBase, Data, Ix2};
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum FastDownsample {
     None,
     X2,
@@ -30,6 +32,7 @@ impl FastDownsample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum FastBgSubMode {
     GlobalMedian,
     GlobalMean,
@@ -38,12 +41,14 @@ pub enum FastBgSubMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum FastSigmaMode {
     GlobalMedianAbs,
     GlobalRootSquare,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(missing_docs)]
 pub struct FastExtractOptions {
     pub sigma: f32,
     pub downsample: FastDownsample,
@@ -62,6 +67,7 @@ pub struct FastExtractOptions {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(missing_docs)]
 pub struct FastExtractOptionsUpdate {
     pub sigma: Option<f32>,
     pub noise_filter: Option<bool>,
@@ -91,6 +97,7 @@ impl Default for FastExtractOptions {
 }
 
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub struct FastCentroidResult {
     pub y: f64,
     pub x: f64,
@@ -100,6 +107,7 @@ pub struct FastCentroidResult {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(missing_docs)]
 pub struct FastExtractionResult {
     pub centroids: Vec<FastCentroidResult>,
     pub virtual_crop_centroids: Option<Vec<Vec<FastCentroidResult>>>,

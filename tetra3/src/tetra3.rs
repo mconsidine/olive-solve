@@ -84,8 +84,7 @@ impl Tetra3 {
         extractor.extract_u8(image, options)
     }
 
-    /// Explicitly triggers the fast sequential extraction path.
-    /// Falls back to the normal extractor if parameters are incompatible.
+    /// Extracts star centroids using the fast extraction path.
     pub fn get_centroids_from_image_fast<S, T>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -108,10 +107,10 @@ impl Tetra3 {
             self.fast_extractor = Some(FastExtractor::new(width, height, fast_options));
         }
         let fe = self.fast_extractor.as_mut().unwrap();
-        T::extract_sequential(fe, image)
+        T::extract_fast(fe, image)
     }
 
-    /// Runs the full pipeline using the fast sequential path.
+    /// Runs the full pipeline using the fast extraction path.
     pub fn solve_from_image_fast<S, T>(
         &mut self,
         image: &ArrayBase<S, Ix2>,
@@ -182,12 +181,15 @@ impl Tetra3 {
 
 /// Internal trait to unify dispatch between f32 and u8 for fast extraction.
 pub trait FastPixel: Copy {
-    fn extract_sequential<S>(
+    /// Executes the fast extraction path.
+    fn extract_fast<S>(
         fe: &mut FastExtractor,
         image: &ArrayBase<S, Ix2>,
     ) -> crate::fast_extractor::FastExtractionResult
     where
         S: Data<Elem = Self>;
+
+    /// Executes the standard extraction path.
     fn extract_normal<S>(
         t3: &mut Tetra3,
         image: &ArrayBase<S, Ix2>,
@@ -198,7 +200,7 @@ pub trait FastPixel: Copy {
 }
 
 impl FastPixel for f32 {
-    fn extract_sequential<S>(
+    fn extract_fast<S>(
         fe: &mut FastExtractor,
         image: &ArrayBase<S, Ix2>,
     ) -> crate::fast_extractor::FastExtractionResult
@@ -220,7 +222,7 @@ impl FastPixel for f32 {
 }
 
 impl FastPixel for u8 {
-    fn extract_sequential<S>(
+    fn extract_fast<S>(
         fe: &mut FastExtractor,
         image: &ArrayBase<S, Ix2>,
     ) -> crate::fast_extractor::FastExtractionResult

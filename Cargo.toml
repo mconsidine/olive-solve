@@ -3,7 +3,15 @@ name = "olive-solve"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+python = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
+pyo3 = { version = "0.28.2", features = ["extension-module"], optional = true }
+numpy = { version = "0.28.0", optional = true }
 tetra3 = { path = "tetra3" }
 olive-imu = { path = "olive-imu" }
 bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }

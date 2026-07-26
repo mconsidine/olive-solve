@@ -64,6 +64,7 @@
 //    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //    SOFTWARE.
 
+#![allow(missing_docs)]
 use ndarray::{Array2, ArrayBase, Data, Ix2, s};
 
 use std::cmp::Ordering;
@@ -576,6 +577,7 @@ impl Default for Extractor {
 }
 
 impl Extractor {
+    #[allow(missing_docs)]
     pub fn new() -> Self {
         Self {
             image_vec: Vec::new(),
