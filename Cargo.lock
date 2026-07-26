@@ -1817,7 +1817,6 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
- "rayon",
 ]
 
 [[package]]
@@ -3001,7 +3000,6 @@ dependencies = [
  "numpy",
  "pyo3",
  "pyo3-build-config",
- "rayon",
  "serde",
  "serde_json",
  "tonic-build",
@@ -3026,7 +3024,6 @@ dependencies = [
  "image",
  "ndarray",
  "prost",
- "rayon",
  "shared_memory",
  "tetra3",
  "tokio",
