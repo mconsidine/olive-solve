@@ -107,8 +107,6 @@ fn map_extract_options(opt: proto::ExtractOptions) -> ExtractOptions {
         sigma: opt.sigma.unwrap_or(def.sigma),
         image_th: opt.image_th.or(def.image_th),
         crop,
-        virtual_crops: None,
-        approximate_background: false,
         downsample: opt.downsample.map(|v| v as usize).or(def.downsample),
         filtsize: opt.filtsize.map(|v| v as usize).unwrap_or(def.filtsize),
         bg_sub_mode,

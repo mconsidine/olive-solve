@@ -3,12 +3,12 @@ use ndarray::{Array2, ArrayBase, Data, Ix2};
 use olive_imu::storage::PersistentStorage;
 use olive_imu::{Imu, ImuDevice, MountCoordinates};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::SystemTime;
 use tetra3::FastPixel;
 use tetra3::extractor::{ExtractOptions, ExtractionResult, Extractor};
 use tetra3::fast_extractor::{FastExtractOptions, FastExtractionResult, FastExtractor};
 use tetra3::solver::{Solution, SolveOptions, SolveStatus, Solver};
-use tokio::sync::RwLock;
 
 /// Wrapper to inject custom IMU devices (e.g. for testing)
 pub struct CustomImuWrapper(pub Box<dyn ImuDevice + Send>);
@@ -83,7 +83,7 @@ impl FusedSolver {
     /// Initialize the unified solver.
     /// Takes in the database location, an optional IMU type (defaults to Auto),
     /// and an optional storage implementation. Location must be set later.
-    pub async fn new(
+    pub fn new(
         database_path: &std::path::Path,
         imu_type: Option<ImuType>,
         storage: Option<Arc<dyn PersistentStorage>>,
@@ -107,23 +107,23 @@ impl FusedSolver {
     }
 
     /// Sets the observer location. Must be called before IMU mapping can occur.
-    pub async fn set_observer_location(&self, lat: f64, lon: f64) {
-        *self.latitude.write().await = Some(lat);
-        *self.longitude.write().await = Some(lon);
+    pub fn set_observer_location(&self, lat: f64, lon: f64) {
+        *self.latitude.write().unwrap() = Some(lat);
+        *self.longitude.write().unwrap() = Some(lon);
     }
 
     /// Starts the IMU. Requires location to be set first. Returns true if successful.
-    pub async fn start_imu(&self) -> Result<bool, String> {
-        if self.latitude.read().await.is_none() || self.longitude.read().await.is_none() {
+    pub fn start_imu(&self) -> Result<bool, String> {
+        if self.latitude.read().unwrap().is_none() || self.longitude.read().unwrap().is_none() {
             return Err("Observer location must be set before starting the IMU.".into());
         }
 
-        let mut imu_lock = self.imu.write().await;
+        let mut imu_lock = self.imu.write().unwrap();
         if imu_lock.is_some() {
             return Err("IMU is already running.".into());
         }
 
-        let mut imu_type = self.imu_type.write().await;
+        let mut imu_type = self.imu_type.write().unwrap();
         let imu_instance = match &mut *imu_type {
             ImuType::None => return Err("Cannot start IMU because ImuType is None.".into()),
             ImuType::Auto => {
@@ -178,16 +178,16 @@ impl FusedSolver {
     }
 
     /// Stops the IMU and drops the background polling thread. Safe to call if not started.
-    pub async fn stop_imu(&self) -> Result<(), String> {
-        let mut imu_lock = self.imu.write().await;
+    pub fn stop_imu(&self) -> Result<(), String> {
+        let mut imu_lock = self.imu.write().unwrap();
         *imu_lock = None;
         Ok(())
     }
 
     /// Resets the internal IMU zero-bias and deletes the SVD calibration matrix from persistent storage.
-    pub async fn reset_calibration(&self) {
-        if let Some(ref imu) = *self.imu.read().await {
-            imu.clear_calibration().await;
+    pub fn reset_calibration(&self) {
+        if let Some(ref imu) = *self.imu.read().unwrap() {
+            imu.clear_calibration();
             imu.reset_bias_calibration();
         }
     }
@@ -197,7 +197,7 @@ impl FusedSolver {
     // ==========================================
 
     /// Extracts star centroids using the standard pipeline.
-    pub async fn extract<S>(
+    pub fn extract<S>(
         &self,
         image: &ArrayBase<S, Ix2>,
         options: ExtractOptions,
@@ -205,7 +205,7 @@ impl FusedSolver {
     where
         S: Data<Elem = f32>,
     {
-        let mut extractor_guard = self.extractor.write().await;
+        let mut extractor_guard = self.extractor.write().unwrap();
         if let Some(extractor) = extractor_guard.as_mut() {
             Ok(extractor.extract(image, options))
         } else {
@@ -214,7 +214,7 @@ impl FusedSolver {
     }
 
     /// Extracts star centroids using the fast sequential pipeline.
-    pub async fn extract_fast<S, T>(
+    pub fn extract_fast<S, T>(
         &self,
         image: &ArrayBase<S, Ix2>,
         options: FastExtractOptions,
@@ -223,7 +223,7 @@ impl FusedSolver {
         S: Data<Elem = T>,
         T: FastPixel,
     {
-        let mut extractor_guard = self.fast_extractor.write().await;
+        let mut extractor_guard = self.fast_extractor.write().unwrap();
         let (height, width) = image.dim();
 
         let reinit = match extractor_guard.as_ref() {
@@ -243,7 +243,7 @@ impl FusedSolver {
 
     /// Performs a plate solve using pre-extracted centroids and given image dimensions.
     /// If successful, the solver automatically updates the IMU anchor internally.
-    pub async fn solve_from_centroids(
+    pub fn solve_from_centroids(
         &self,
         centroids: &Array2<f64>,
         size: (f64, f64),
@@ -251,12 +251,11 @@ impl FusedSolver {
         timestamp: Option<SystemTime>,
     ) -> Result<Solution, String> {
         self.solve_from_centroids_batch(&[centroids.clone()], size, options, timestamp)
-            .await
     }
 
     /// Attempts to solve from multiple centroid sets in order, stopping when a solution is found.
     /// Updates internal solve state only when a solution is found or all given centroid sets fail.
-    pub async fn solve_from_centroids_batch(
+    pub fn solve_from_centroids_batch(
         &self,
         centroids_batch: &[Array2<f64>],
         size: (f64, f64),
@@ -267,7 +266,7 @@ impl FusedSolver {
 
         let mut last_solution = None;
 
-        let mut solver_guard = self.solver.write().await;
+        let mut solver_guard = self.solver.write().unwrap();
         let solver = solver_guard
             .as_mut()
             .ok_or_else(|| "Solver is not initialized.".to_string())?;
@@ -285,10 +284,10 @@ impl FusedSolver {
         let solution = last_solution.ok_or_else(|| "No centroid sets provided.".to_string())?;
 
         if solution.status == SolveStatus::MatchFound {
-            *self.last_solve_failed.write().await = false;
-            self.update_anchor_from_solution(&solution, time).await;
+            *self.last_solve_failed.write().unwrap() = false;
+            self.update_anchor_from_solution(&solution, time);
         } else {
-            *self.last_solve_failed.write().await = true;
+            *self.last_solve_failed.write().unwrap() = true;
         }
 
         Ok(solution)
@@ -296,7 +295,7 @@ impl FusedSolver {
 
     /// Extracts star centroids from the image and performs a plate solve.
     /// If successful, the solver automatically updates the IMU anchor internally.
-    pub async fn solve_from_image<S>(
+    pub fn solve_from_image<S>(
         &self,
         image: &ArrayBase<S, Ix2>,
         extract_options: ExtractOptions,
@@ -306,7 +305,7 @@ impl FusedSolver {
     where
         S: Data<Elem = f32>,
     {
-        let centroids_result = self.extract(image, extract_options).await?;
+        let centroids_result = self.extract(image, extract_options)?;
 
         let num_centroids = centroids_result.centroids.len();
         let mut centroids_arr = Array2::zeros((num_centroids, 2));
@@ -322,12 +321,11 @@ impl FusedSolver {
             solve_options,
             timestamp,
         )
-        .await
     }
 
     /// Extracts star centroids from the image using the fast pipeline and performs a plate solve.
     /// If virtual crops are provided, they are attempted first, and the full image is appended at the end as a fallback.
-    pub async fn solve_from_image_fast<S, T>(
+    pub fn solve_from_image_fast<S, T>(
         &self,
         image: &ArrayBase<S, Ix2>,
         extract_options: FastExtractOptions,
@@ -338,7 +336,7 @@ impl FusedSolver {
         S: Data<Elem = T>,
         T: FastPixel,
     {
-        let extract_result = self.extract_fast(image, extract_options).await?;
+        let extract_result = self.extract_fast(image, extract_options)?;
 
         let mut centroid_arrays = Vec::new();
 
@@ -367,10 +365,9 @@ impl FusedSolver {
             solve_options,
             timestamp,
         )
-        .await
     }
 
-    async fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
+    fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
         let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
             t_ra[0]
         } else {
@@ -383,9 +380,9 @@ impl FusedSolver {
         };
         let roll = solution.roll.unwrap_or(0.0);
 
-        if let Some(ref imu) = *self.imu.read().await {
-            let lat_opt = *self.latitude.read().await;
-            let lon_opt = *self.longitude.read().await;
+        if let Some(ref imu) = *self.imu.read().unwrap() {
+            let lat_opt = *self.latitude.read().unwrap();
+            let lon_opt = *self.longitude.read().unwrap();
 
             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                 let dt: chrono::DateTime<chrono::Utc> = time.into();
@@ -397,11 +394,11 @@ impl FusedSolver {
                     yaw: az,
                     roll: alt_az_roll,
                 };
-                imu.update_anchor(&mount_coords, &time).await;
+                imu.update_anchor(&mount_coords, &time);
             }
         }
 
-        *self.latest_solve_position.write().await = Some(Position {
+        *self.latest_solve_position.write().unwrap() = Some(Position {
             ra,
             dec,
             roll,
@@ -415,17 +412,17 @@ impl FusedSolver {
     // ==========================================
 
     /// Retrieves the real-time calibration metrics from the IMU hardware, if running.
-    pub async fn get_calibration_status(&self) -> Option<olive_imu::TransformMetrics> {
-        if let Some(ref imu) = *self.imu.read().await {
-            imu.get_calibration_metrics().await
+    pub fn get_calibration_status(&self) -> Option<olive_imu::TransformMetrics> {
+        if let Some(ref imu) = *self.imu.read().unwrap() {
+            imu.get_calibration_metrics()
         } else {
             None
         }
     }
 
     /// Retrieves the real-time motion stability state from the IMU hardware, if running.
-    pub async fn get_motion_state(&self) -> Option<olive_imu::MotionState> {
-        if let Some(ref imu) = *self.imu.read().await {
+    pub fn get_motion_state(&self) -> Option<olive_imu::MotionState> {
+        if let Some(ref imu) = *self.imu.read().unwrap() {
             Some(imu.get_motion_state())
         } else {
             None
@@ -435,15 +432,14 @@ impl FusedSolver {
     /// Fetches the latest known orientation of the device.
     /// If the IMU is actively tracking and has a valid plate solve anchor, this returns the real-time IMU estimate.
     /// Otherwise, it safely falls back to returning the position from the last successful plate solve.
-    pub async fn get_latest_position(&self) -> Option<Position> {
-        let mut last_solve = self.latest_solve_position.read().await.clone();
-        let last_failed = *self.last_solve_failed.read().await;
+    pub fn get_latest_position(&self) -> Option<Position> {
+        let mut last_solve = self.latest_solve_position.read().unwrap().clone();
+        let last_failed = *self.last_solve_failed.read().unwrap();
 
-        if let Some(ref imu) = *self.imu.read().await {
-            if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&SystemTime::now()).await
-            {
-                let lat_opt = *self.latitude.read().await;
-                let lon_opt = *self.longitude.read().await;
+        if let Some(ref imu) = *self.imu.read().unwrap() {
+            if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&SystemTime::now()) {
+                let lat_opt = *self.latitude.read().unwrap();
+                let lon_opt = *self.longitude.read().unwrap();
 
                 if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                     let dt_now = chrono::Utc::now();
@@ -454,7 +450,7 @@ impl FusedSolver {
                         PositionSource::Imu
                     } else if !last_failed {
                         PositionSource::Solver
-                    } else if imu.is_calibrated().await {
+                    } else if imu.is_calibrated() {
                         // In this case our position estimate is stale, but the IMU hasn't detected enough
                         // movement so we consider the estimate as coming from the IMU.
                         PositionSource::Imu
@@ -644,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_imu_without_location_fails() {
+    fn test_start_imu_without_location_fails() {
         // Dummy logic
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
@@ -658,7 +654,7 @@ mod tests {
             longitude: Arc::new(RwLock::new(None)),
         };
 
-        let result = fs.start_imu().await;
+        let result = fs.start_imu();
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -667,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_imu_not_found() {
+    fn test_start_imu_not_found() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -680,7 +676,7 @@ mod tests {
             longitude: Arc::new(RwLock::new(Some(0.0))),
         };
 
-        let result = fs.start_imu().await;
+        let result = fs.start_imu();
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -689,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_imu_double_start() {
+    fn test_start_imu_double_start() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -702,16 +698,16 @@ mod tests {
             longitude: Arc::new(RwLock::new(Some(0.0))),
         };
 
-        let first = fs.start_imu().await;
+        let first = fs.start_imu();
         assert!(first.is_ok());
 
-        let second = fs.start_imu().await;
+        let second = fs.start_imu();
         assert!(second.is_err());
         assert_eq!(second.unwrap_err(), "IMU is already running.");
     }
 
     #[tokio::test]
-    async fn test_safe_stop() {
+    fn test_safe_stop() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -724,11 +720,11 @@ mod tests {
             longitude: Arc::new(RwLock::new(None)),
         };
 
-        let result = fs.stop_imu().await;
+        let result = fs.stop_imu();
         assert!(result.is_ok()); // Safe to call even when not started
     }
     #[tokio::test]
-    async fn test_fallback_position() {
+    fn test_fallback_position() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -747,7 +743,7 @@ mod tests {
             longitude: Arc::new(RwLock::new(None)),
         };
 
-        let pos = fs.get_latest_position().await;
+        let pos = fs.get_latest_position();
         assert!(pos.is_some());
         let pos = pos.unwrap();
         assert_eq!(pos.ra, 10.0);
@@ -755,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_coordinate_transforms() {
+    fn test_coordinate_transforms() {
         use crate::{alt_az_to_ra_dec, ra_dec_to_alt_az};
         use chrono::TimeZone;
 
@@ -781,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_imu_fallback_when_no_anchor() {
+    fn test_imu_fallback_when_no_anchor() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -794,8 +790,8 @@ mod tests {
             longitude: Arc::new(RwLock::new(None)),
         };
 
-        fs.set_observer_location(34.0, -118.0).await;
-        fs.start_imu().await.unwrap();
+        fs.set_observer_location(34.0, -118.0);
+        fs.start_imu().unwrap();
 
         let sol = tetra3::solver::Solution {
             ra: Some(100.0),
@@ -805,12 +801,11 @@ mod tests {
             ..Default::default()
         };
 
-        fs.update_anchor_from_solution(&sol, std::time::SystemTime::now())
-            .await;
+        fs.update_anchor_from_solution(&sol, std::time::SystemTime::now());
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50));
 
-        let pos = fs.get_latest_position().await;
+        let pos = fs.get_latest_position();
         assert!(pos.is_some());
         let pos = pos.unwrap();
         // The IMU hasn't received any gyro data to establish a history, so update_anchor will silently fail.
@@ -819,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_uninitialized_solver_fails() {
+    fn test_uninitialized_solver_fails() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)), // Solver not initialized
             extractor: Arc::new(RwLock::new(None)),
@@ -834,21 +829,19 @@ mod tests {
 
         use tetra3::solver::SolveOptions;
         let options = SolveOptions::default();
-        let result = fs
-            .solve_from_centroids(
-                &ndarray::Array2::zeros((0, 2)),
-                (100.0, 100.0),
-                options,
-                None,
-            )
-            .await;
+        let result = fs.solve_from_centroids(
+            &ndarray::Array2::zeros((0, 2)),
+            (100.0, 100.0),
+            options,
+            None,
+        );
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Solver is not initialized.");
     }
 
     #[tokio::test]
-    async fn test_observer_location_updates() {
+    fn test_observer_location_updates() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -861,17 +854,17 @@ mod tests {
             longitude: Arc::new(RwLock::new(None)),
         };
 
-        assert!(fs.latitude.read().await.is_none());
-        assert!(fs.longitude.read().await.is_none());
+        assert!(fs.latitude.read().unwrap().is_none());
+        assert!(fs.longitude.read().unwrap().is_none());
 
-        fs.set_observer_location(45.0, -90.0).await;
+        fs.set_observer_location(45.0, -90.0);
 
-        assert_eq!(*fs.latitude.read().await, Some(45.0));
-        assert_eq!(*fs.longitude.read().await, Some(-90.0));
+        assert_eq!(*fs.latitude.read().unwrap(), Some(45.0));
+        assert_eq!(*fs.longitude.read().unwrap(), Some(-90.0));
     }
 
     #[tokio::test]
-    async fn test_imu_status_wrappers_without_imu() {
+    fn test_imu_status_wrappers_without_imu() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
@@ -885,10 +878,10 @@ mod tests {
         };
 
         // When IMU isn't running, these should safely return None without panicking
-        assert!(fs.get_calibration_status().await.is_none());
-        assert!(fs.get_motion_state().await.is_none());
+        assert!(fs.get_calibration_status().is_none());
+        assert!(fs.get_motion_state().is_none());
 
         // Resetting calibration should also safely do nothing
-        fs.reset_calibration().await;
+        fs.reset_calibration();
     }
 }

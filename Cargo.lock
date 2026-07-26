@@ -2035,7 +2035,6 @@ dependencies = [
 name = "olive-solve"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bmi160",
  "bno080",
  "chrono",
@@ -2044,7 +2043,6 @@ dependencies = [
  "ndarray",
  "olive-imu",
  "tetra3",
- "tokio",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use log::{debug, error, info, warn};
 use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
-use tokio::sync::{RwLock, watch};
+use std::sync::RwLock;
 
 use crate::storage::PersistentStorage;
 
@@ -121,7 +121,7 @@ impl Default for CalibrationState {
 }
 
 pub struct Imu {
-    state_rx: watch::Receiver<Option<ImuUpdate>>,
+    state: Arc<RwLock<Option<ImuUpdate>>>,
     alignment: Arc<RwLock<AlignmentState>>,
     history: Arc<Mutex<VecDeque<(SystemTime, UnitQuaternion<f64>, MotionState, Vector3<f64>)>>>,
     calibration: Arc<Mutex<CalibrationState>>,
@@ -133,7 +133,8 @@ impl Imu {
         mut device: D,
         storage: Option<Arc<dyn PersistentStorage>>,
     ) -> Result<Self, String> {
-        let (state_tx, state_rx) = watch::channel(None);
+        let state = Arc::new(RwLock::new(None));
+        let state_clone = Arc::clone(&state);
 
         let mut initial_alignment = AlignmentState::default();
 
@@ -309,7 +310,7 @@ impl Imu {
                         };
 
                         // Drop any stale updates and push the newest one
-                        let _ = state_tx.send(Some(update));
+                        *state_clone.write().unwrap() = Some(update);
                     }
                     Err(e) => {
                         error!("Device poll error: {}", e);
@@ -319,7 +320,7 @@ impl Imu {
         });
 
         Ok(Self {
-            state_rx,
+            state,
             alignment,
             history: Arc::clone(&history),
             calibration: Arc::clone(&calibration),
@@ -454,8 +455,8 @@ impl Imu {
         }
     }
 
-    pub async fn update_anchor(&self, camera_pointing: &MountCoordinates, timestamp: &SystemTime) {
-        let imu_state = *self.state_rx.borrow();
+    pub fn update_anchor(&self, camera_pointing: &MountCoordinates, timestamp: &SystemTime) {
+        let imu_state = *self.state.read().unwrap();
 
         if imu_state.is_some() {
             // Find the exact historical quaternion that matches the image timestamp
@@ -469,7 +470,7 @@ impl Imu {
                     return;
                 }
 
-                let mut align = self.alignment.write().await;
+                let mut align = self.alignment.write().unwrap();
                 let new_true_q = Self::mount_to_quat(camera_pointing);
 
                 if let (Some(old_mount), Some(old_quat)) =
@@ -745,9 +746,9 @@ impl Imu {
     // Clears the active session anchors and telemetry, but strictly preserves
     // the SVD calibration pool, mount_q, and disk file to support file-less recalibration and
     // uninterrupted EQ tracking.
-    pub async fn reset_anchors(&self) {
+    pub fn reset_anchors(&self) {
         debug!("reset called. Clearing anchors but preserving calibration matrix.");
-        let mut align = self.alignment.write().await;
+        let mut align = self.alignment.write().unwrap();
         align.last_camera_position = None;
         align.imu_anchor_state = None;
         align.transform_metrics = None;
@@ -755,8 +756,8 @@ impl Imu {
     }
 
     // Clears the entire calibration matrix, history, and deletes the persistent file.
-    pub async fn clear_calibration(&self) {
-        let mut align = self.alignment.write().await;
+    pub fn clear_calibration(&self) {
+        let mut align = self.alignment.write().unwrap();
         align.mount_q = UnitQuaternion::identity();
         align.calibration_axes.clear();
         align.loaded_from_disk = false;
@@ -774,11 +775,11 @@ impl Imu {
     // IMU-derived estimate of camera pointing as of the given time.
     // The boolean in the Result tuple is `true` if the returned position is an updated estimate
     // using IMU data, and `false` if it is falling back to the static anchor itself.
-    pub async fn get_estimated_pointing(
+    pub fn get_estimated_pointing(
         &self,
         timestamp: &SystemTime,
     ) -> Result<(MountCoordinates, bool), &'static str> {
-        let align = self.alignment.read().await.clone();
+        let align = self.alignment.read().unwrap().clone();
 
         if let (Some(anchor_horiz), Some(anchor_quat)) =
             (align.last_camera_position, align.imu_anchor_state)
@@ -793,7 +794,7 @@ impl Imu {
                 .map(|h| h.0)
                 .unwrap_or_else(|| {
                     debug!("get_estimated falling back to real-time quaternion");
-                    self.state_rx.borrow().unwrap().quaternion
+                    self.state.read().unwrap().unwrap().quaternion
                 });
 
             // 2. Calculate the raw physical movement of the IMU chip itself.
@@ -828,23 +829,24 @@ impl Imu {
     }
 
     pub fn get_motion_state(&self) -> MotionState {
-        self.state_rx
-            .borrow()
+        self.state
+            .read()
+            .unwrap()
             .as_ref()
             .map(|s| s.motion_state)
             .unwrap_or(MotionState::Initializing)
     }
 
-    pub async fn get_calibration_metrics(&self) -> Option<TransformMetrics> {
-        self.alignment.read().await.transform_metrics.clone()
+    pub fn get_calibration_metrics(&self) -> Option<TransformMetrics> {
+        self.alignment.read().unwrap().transform_metrics.clone()
     }
 
-    pub async fn is_calibrated(&self) -> bool {
-        let align = self.alignment.read().await;
+    pub fn is_calibrated(&self) -> bool {
+        let align = self.alignment.read().unwrap();
         align.loaded_from_disk || align.calibration_axes.len() >= 3
     }
 
     pub fn get_latest_state(&self) -> Option<ImuUpdate> {
-        *self.state_rx.borrow()
+        *self.state.read().unwrap()
     }
 }
