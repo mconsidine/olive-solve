@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE file in root directory for license terms.
+
 use chrono::{Datelike, Timelike};
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use olive_imu::storage::PersistentStorage;
@@ -425,11 +428,7 @@ impl FusedSolver {
 
     /// Retrieves the real-time motion stability state from the IMU hardware, if running.
     pub fn get_motion_state(&self) -> Option<olive_imu::MotionState> {
-        if let Some(ref imu) = *self.imu.read().unwrap() {
-            Some(imu.get_motion_state())
-        } else {
-            None
-        }
+        (*self.imu.read().unwrap()).as_ref().map(|imu| imu.get_motion_state())
     }
 
     /// Fetches the latest known orientation of the device.

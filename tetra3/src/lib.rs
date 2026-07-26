@@ -8,6 +8,9 @@ pub mod fast_extractor;
 pub mod solver;
 pub mod tetra3;
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub use crate::extractor::*;
 pub use crate::fast_extractor::*;
 pub use crate::solver::*;
