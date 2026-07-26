@@ -428,7 +428,9 @@ impl FusedSolver {
 
     /// Retrieves the real-time motion stability state from the IMU hardware, if running.
     pub fn get_motion_state(&self) -> Option<olive_imu::MotionState> {
-        (*self.imu.read().unwrap()).as_ref().map(|imu| imu.get_motion_state())
+        (*self.imu.read().unwrap())
+            .as_ref()
+            .map(|imu| imu.get_motion_state())
     }
 
     /// Fetches the latest known orientation of the device.
@@ -641,12 +643,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
     fn test_start_imu_without_location_fails() {
         // Dummy logic
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
@@ -664,11 +667,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     fn test_start_imu_not_found() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
@@ -686,11 +690,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     fn test_start_imu_double_start() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImu)))),
             storage: None,
@@ -708,11 +713,12 @@ mod tests {
         assert_eq!(second.unwrap_err(), "IMU is already running.");
     }
 
-    #[tokio::test]
+    #[test]
     fn test_safe_stop() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
@@ -725,11 +731,12 @@ mod tests {
         let result = fs.stop_imu();
         assert!(result.is_ok()); // Safe to call even when not started
     }
-    #[tokio::test]
+    #[test]
     fn test_fallback_position() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
@@ -752,7 +759,7 @@ mod tests {
         assert_eq!(pos.source, PositionSource::Solver);
     }
 
-    #[tokio::test]
+    #[test]
     fn test_coordinate_transforms() {
         use crate::{alt_az_to_ra_dec, ra_dec_to_alt_az};
         use chrono::TimeZone;
@@ -778,11 +785,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     fn test_imu_fallback_when_no_anchor() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImu)))),
             storage: None,
@@ -805,7 +813,7 @@ mod tests {
 
         fs.update_anchor_from_solution(&sol, std::time::SystemTime::now());
 
-        tokio::time::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         let pos = fs.get_latest_position();
         assert!(pos.is_some());
@@ -815,11 +823,12 @@ mod tests {
         assert_eq!(pos.source, PositionSource::Solver);
     }
 
-    #[tokio::test]
+    #[test]
     fn test_uninitialized_solver_fails() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)), // Solver not initialized
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
@@ -842,11 +851,12 @@ mod tests {
         assert_eq!(result.unwrap_err(), "Solver is not initialized.");
     }
 
-    #[tokio::test]
+    #[test]
     fn test_observer_location_updates() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
@@ -865,11 +875,12 @@ mod tests {
         assert_eq!(*fs.longitude.read().unwrap(), Some(-90.0));
     }
 
-    #[tokio::test]
+    #[test]
     fn test_imu_status_wrappers_without_imu() {
         let fs = FusedSolver {
             solver: Arc::new(RwLock::new(None)),
             extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
             imu: Arc::new(RwLock::new(None)),
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,

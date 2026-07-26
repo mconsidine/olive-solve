@@ -9,7 +9,6 @@ use pyo3::types::{PyDict, PyTuple};
 // --- We will append the helpers here ---
 // --- Helper Functions to Map Python kwargs to Rust Structs ---
 
-
 #[pyclass(name = "FusedSolver")]
 /// A Python wrapper for the FusedSolver, providing plate solving and star extraction.
 /// The `FusedSolver` unifies standard and fast extraction pipelines, along with IMU support.
