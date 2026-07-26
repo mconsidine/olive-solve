@@ -294,6 +294,82 @@ impl FusedSolver {
         Ok(solution)
     }
 
+    /// Extracts star centroids from the image and performs a plate solve.
+    /// If successful, the solver automatically updates the IMU anchor internally.
+    pub async fn solve_from_image<S>(
+        &self,
+        image: &ArrayBase<S, Ix2>,
+        extract_options: ExtractOptions,
+        solve_options: SolveOptions,
+        timestamp: Option<SystemTime>,
+    ) -> Result<Solution, String>
+    where
+        S: Data<Elem = f32>,
+    {
+        let centroids_result = self.extract(image, extract_options).await?;
+
+        let num_centroids = centroids_result.centroids.len();
+        let mut centroids_arr = Array2::zeros((num_centroids, 2));
+        for (i, c) in centroids_result.centroids.iter().enumerate() {
+            centroids_arr[[i, 0]] = c.y;
+            centroids_arr[[i, 1]] = c.x;
+        }
+
+        let (height, width) = image.dim();
+        self.solve_from_centroids(
+            &centroids_arr,
+            (height as f64, width as f64),
+            solve_options,
+            timestamp,
+        )
+        .await
+    }
+
+    /// Extracts star centroids from the image using the fast pipeline and performs a plate solve.
+    /// If virtual crops are provided, they are attempted first, and the full image is appended at the end as a fallback.
+    pub async fn solve_from_image_fast<S, T>(
+        &self,
+        image: &ArrayBase<S, Ix2>,
+        extract_options: FastExtractOptions,
+        solve_options: SolveOptions,
+        timestamp: Option<SystemTime>,
+    ) -> Result<Solution, String>
+    where
+        S: Data<Elem = T>,
+        T: FastPixel,
+    {
+        let extract_result = self.extract_fast(image, extract_options).await?;
+
+        let mut centroid_arrays = Vec::new();
+
+        if let Some(crops) = extract_result.virtual_crop_centroids {
+            for crop in crops {
+                let mut crop_arr = Array2::zeros((crop.len(), 2));
+                for (i, c) in crop.iter().enumerate() {
+                    crop_arr[[i, 0]] = c.y;
+                    crop_arr[[i, 1]] = c.x;
+                }
+                centroid_arrays.push(crop_arr);
+            }
+        }
+
+        let mut base_arr = Array2::zeros((extract_result.centroids.len(), 2));
+        for (i, c) in extract_result.centroids.iter().enumerate() {
+            base_arr[[i, 0]] = c.y;
+            base_arr[[i, 1]] = c.x;
+        }
+        centroid_arrays.push(base_arr);
+
+        let (height, width) = image.dim();
+        self.solve_from_centroids_batch(
+            &centroid_arrays,
+            (height as f64, width as f64),
+            solve_options,
+            timestamp,
+        )
+        .await
+    }
+
     async fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
         let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
             t_ra[0]

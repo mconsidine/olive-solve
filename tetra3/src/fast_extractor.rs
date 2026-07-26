@@ -335,8 +335,8 @@ impl FastExtractor {
         }
     }
 
-    /// Parallel version of the extractor for f32 input images.
-    /// Performs an extremely fast parallel conversion to u8 internally.
+    /// Fast version of the extractor for f32 input images.
+    /// Performs an extremely fast sequential conversion to u8 internally.
     pub fn extract_f32<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> FastExtractionResult
     where
         S: Data<Elem = f32>,
@@ -751,7 +751,7 @@ impl FastExtractor {
                                 // Instead of interpolating the exact background for all 4 pixels, we evaluate it once
                                 // and apply it to the whole chunk. This eliminates 75% of LUT accesses and math.
                                 // Manually unrolled loop with multiple independent accumulators
-                                // improves instruction-level parallelism.
+                                // improves instruction-level throughput.
                                 if self.options.approximate_background {
                                     for (((o, s), gx), tx) in out_chunks
                                         .by_ref()
@@ -1121,7 +1121,7 @@ impl FastExtractor {
                                 // Instead of interpolating the exact background for all 4 pixels, we evaluate it once
                                 // and apply it to the whole chunk. This eliminates 75% of LUT accesses and math.
                                 // Manually unrolled loop with multiple independent integer accumulators
-                                // improves instruction-level parallelism.
+                                // improves instruction-level throughput.
                                 for (((o, s), gx), tx) in out_chunks
                                     .by_ref()
                                     .zip(src_chunks.by_ref())
