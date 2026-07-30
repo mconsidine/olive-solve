@@ -358,6 +358,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bno055"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20ae371e0ae10daadee46116bcbf64ead594b5f83fb0e50f380eca3dcf5b853a"
+dependencies = [
+ "bitflags 2.11.0",
+ "byteorder",
+ "embedded-hal",
+ "mint",
+ "num-derive",
+ "num-traits",
+]
+
+[[package]]
 name = "bno080"
 version = "0.1.3"
 source = "git+https://github.com/oakamil/bno080.git?branch=arvr#2e153b8d0b2793213d2d2fe79688c96133276213"
@@ -1702,6 +1716,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mint"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e53debba6bda7a793e5f99b8dacf19e626084f525f7829104ba9898f367d85ff"
+
+[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2021,6 +2041,7 @@ name = "olive-imu"
 version = "0.1.0"
 dependencies = [
  "bmi160",
+ "bno055",
  "bno080",
  "env_logger 0.11.11",
  "linux-embedded-hal",

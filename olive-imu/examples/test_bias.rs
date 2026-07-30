@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use olive_imu::{Imu, bmi160::Bmi160Device, bno085::Bno085Device};
+use olive_imu::{Imu, bmi160::Bmi160Device, bno055::Bno055Device, bno085::Bno085Device};
 use pico_args::Arguments;
 
 #[tokio::main]
@@ -43,6 +43,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BNO085 successfully initialized at 0x4A!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
+    // Try BNO055 at 0x28
+    if imu_engine.is_none() {
+        if let Ok(device) = Bno055Device::new(10, 0x28) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("BNO055 successfully initialized at 0x28!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
+    // Try BNO055 at 0x29
+    if imu_engine.is_none() {
+        if let Ok(device) = Bno055Device::new(10, 0x29) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("BNO055 successfully initialized at 0x29!");
                 imu_engine = Some(engine);
             }
         }

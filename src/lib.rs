@@ -36,6 +36,7 @@ pub enum ImuType {
     None,
     Auto,
     Bno085,
+    Bno055,
     Bmi160,
     Custom(Box<dyn ImuDevice + Send + Sync>),
 }
@@ -138,6 +139,10 @@ impl FusedSolver {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true) {
                     Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x28) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x29) {
+                    Some(Imu::start(dev, self.storage.clone())?)
                 } else if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x68) {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x69) {
@@ -153,6 +158,15 @@ impl FusedSolver {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("BNO085 hardware not found on I2C bus.".into());
+                }
+            }
+            ImuType::Bno055 => {
+                if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x28) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x29) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else {
+                    return Err("BNO055 hardware not found on I2C bus.".into());
                 }
             }
             ImuType::Bmi160 => {
