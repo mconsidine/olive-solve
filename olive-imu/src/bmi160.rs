@@ -196,9 +196,11 @@ mod stub {
     use crate::imu::ImuDevice;
     use nalgebra::Vector3;
 
+    /// Implementation of `ImuDevice` for the BMI160 IMU.
     pub struct Bmi160Device;
 
     impl Bmi160Device {
+        /// Creates a new `Bmi160Device`.
         pub fn new(_address: u8) -> Result<Self, String> {
             Err("Hardware I2C is only supported on Linux/Android".into())
         }

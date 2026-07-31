@@ -1451,6 +1451,113 @@ impl Solver {
         }
     }
 
+    /// Evaluates a plate solution against an arbitrary list of image centroids to
+    /// determine the actual matching centroids.
+    ///
+    /// The function takes the sky attitude (rotation matrix) and Field of View (FOV)
+    /// from the provided `Solution`, queries the star catalog KD-Tree for nearby stars,
+    /// projects them back onto the image plane, and runs the centroid matching algorithm
+    /// against the provided `image_centroids`.
+    ///
+    /// # Arguments
+    ///
+    /// * `solution` - The successful `Solution` containing the rotation matrix and FOV.
+    /// * `image_centroids` - A slice of `[y, x]` coordinates representing the centroids to match.
+    /// * `size` - The `(height, width)` of the sensor image.
+    /// * `options` - The `SolveOptions` that supply the maximum match radius.
+    ///
+    /// # Returns
+    /// Returns `Some(Vec<[f64; 2]>)` containing the actual provided `image_centroids` that
+    /// matched with projected catalog stars, or `None` if the provided solution
+    /// is missing a rotation matrix or FOV.
+    pub fn get_matches_for_centroids(
+        &self,
+        solution: &Solution,
+        image_centroids: &[[f64; 2]],
+        size: (f64, f64),
+        options: &SolveOptions,
+    ) -> Option<Vec<[f64; 2]>> {
+        let (height, width) = size;
+        let fov = solution.fov?.to_radians();
+        let rotation_matrix = solution.rotation_matrix.as_ref()?;
+        let num_extracted_stars = image_centroids.len();
+
+        let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
+        let image_center_vector = [
+            rotation_matrix[(0, 0)],
+            rotation_matrix[(0, 1)],
+            rotation_matrix[(0, 2)],
+        ];
+
+        let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
+        let mut nearby_nodes = self
+            .star_kd_tree
+            .within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq);
+
+        nearby_nodes.sort_unstable_by_key(|n| n.item);
+
+        let num_nearby = nearby_nodes.len();
+        if num_nearby == 0 {
+            return Some(Vec::new());
+        }
+
+        let scale_factor_cent = -width / 2.0 / (fov / 2.0).tan();
+        let img_center_y = height / 2.0;
+        let img_center_x = width / 2.0;
+
+        let r = rotation_matrix;
+
+        let mut valid_cat_centroids = Vec::with_capacity(nearby_nodes.len());
+
+        for node in &nearby_nodes {
+            let star_idx = node.item as usize;
+            let vec = self.star_table_flat[star_idx].vec;
+
+            let v0 =
+                r[(0, 0)] * vec[0] as f64 + r[(0, 1)] * vec[1] as f64 + r[(0, 2)] * vec[2] as f64;
+            let v1 =
+                r[(1, 0)] * vec[0] as f64 + r[(1, 1)] * vec[1] as f64 + r[(1, 2)] * vec[2] as f64;
+            let v2 =
+                r[(2, 0)] * vec[0] as f64 + r[(2, 1)] * vec[1] as f64 + r[(2, 2)] * vec[2] as f64;
+
+            let cy = scale_factor_cent * (v2 / v0) + img_center_y;
+            let cx = scale_factor_cent * (v1 / v0) + img_center_x;
+
+            if cy > 0.0 && cx > 0.0 && cy < height && cx < width {
+                valid_cat_centroids.push([cy, cx]);
+            }
+        }
+
+        let mut image_centroids_undist = undistort_centroids(
+            image_centroids,
+            height,
+            width,
+            solution.distortion.unwrap_or(0.0),
+        );
+
+        let mut sp_matched_stars = Vec::new();
+        let mut sp_matches_scratch = Vec::new();
+        let mut sp_matches1_scratch = Vec::new();
+
+        find_centroid_matches_inplace(
+            &image_centroids_undist,
+            num_extracted_stars,
+            &valid_cat_centroids,
+            valid_cat_centroids.len(),
+            width * options.match_radius,
+            &mut sp_matched_stars,
+            &mut sp_matches_scratch,
+            &mut sp_matches1_scratch,
+        );
+
+        let mut result_centroids = Vec::with_capacity(sp_matched_stars.len());
+        for (img_idx, _) in sp_matched_stars {
+            result_centroids.push(image_centroids[img_idx]);
+        }
+
+        Some(result_centroids)
+    }
+
     /// Attempts to plate solve using the given pre-extracted star centroids.
     pub fn solve(
         &mut self,

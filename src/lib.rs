@@ -1,6 +1,10 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+//! The `olive-solve` crate provides a robust celestial plate solver for stellar navigation.
+//! It integrates the `tetra3` solver with hardware sensors (via `olive-imu`) to estimate
+//! sky attitudes quickly and accurately.
+
 use chrono::{Datelike, Timelike};
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use olive_imu::storage::PersistentStorage;
@@ -33,11 +37,17 @@ impl ImuDevice for CustomImuWrapper {
 
 /// Defines the type of hardware IMU to start or fallback to.
 pub enum ImuType {
+    /// No IMU device used
     None,
+    /// Automatically probe and use the first available supported IMU
     Auto,
+    /// The BNO085 IMU over I2C
     Bno085,
+    /// The BNO055 IMU over I2C
     Bno055,
+    /// The BMI160 IMU over I2C
     Bmi160,
+    /// A custom mock or external IMU device
     Custom(Box<dyn ImuDevice + Send + Sync>),
 }
 
@@ -311,6 +321,44 @@ impl FusedSolver {
         }
 
         Ok(solution)
+    }
+
+    /// Evaluates a pre-computed `Solution` against an arbitrary list of centroids to
+    /// determine the actual matching centroids.
+    ///
+    /// This is particularly useful when the original plate solve was performed on a
+    /// truncated or cropped set of centroids (to improve performance), but you need
+    /// to know which of the *full* image's centroids actually align with the
+    /// recovered star field.
+    ///
+    /// # Arguments
+    ///
+    /// * `solution` - The `Solution` object returned from a successful plate solve.
+    /// * `centroids` - An N x 2 array of `[y, x]` image centroids to test against the solution.
+    /// * `size` - A tuple representing the `(height, width)` of the image.
+    /// * `options` - The `SolveOptions` used to perform the solve, which supplies the matching radius.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(Vec<[f64; 2]>)` containing the actual provided `image_centroids` that matched catalog stars,
+    /// or `None` if the underlying solver has not been instantiated or the solution lacks
+    /// a valid rotation matrix or FOV.
+    pub fn get_matches_for_centroids(
+        &self,
+        solution: &Solution,
+        centroids: &Array2<f64>,
+        size: (f64, f64),
+        options: &SolveOptions,
+    ) -> Option<Vec<[f64; 2]>> {
+        let mut solver_guard = self.solver.write().unwrap();
+        let solver = solver_guard.as_mut()?;
+
+        let mut centroids_vec = Vec::with_capacity(centroids.nrows());
+        for row in centroids.rows() {
+            centroids_vec.push([row[0], row[1]]);
+        }
+
+        solver.get_matches_for_centroids(solution, &centroids_vec, size, options)
     }
 
     /// Extracts star centroids from the image and performs a plate solve.

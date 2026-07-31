@@ -23,64 +23,89 @@ const HARDWARE_ALTERATION_THRESHOLD_DEG: f64 = 10.0;
 // Time to allow sensor to settle before considering it to be motionless.
 const SETTLE_TIME_MS: u64 = 100;
 
+/// Represents the current physical motion state of the IMU.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MotionState {
+    /// IMU is starting up or calibrating
     Initializing,
+    /// IMU is detecting physical movement
     Moving,
+    /// IMU is stationary
     Stable,
 }
 
+/// Raw 3-axis sensor data (e.g. from gyroscope or accelerometer).
 #[derive(Clone, Copy, Debug)]
 pub struct RawSensorData {
+    /// X axis measurement
     pub x: f64,
+    /// Y axis measurement
     pub y: f64,
+    /// Z axis measurement
     pub z: f64,
 }
 
+/// Euler angle representation of the mount's orientation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MountCoordinates {
+    /// Roll angle in degrees
     pub roll: f64,
+    /// Pitch angle in degrees
     pub pitch: f64,
+    /// Yaw angle in degrees
     pub yaw: f64,
 }
 
+/// Metrics tracking the health and alignment of the IMU-to-Camera coordinate transformation.
 #[derive(Clone, Debug)]
 pub struct TransformMetrics {
+    /// The proportion of total variation that cannot be explained by the current mount transform
     pub transform_error_fraction: f64,
+    /// The gyro axis most aligned with the camera's view axis
     pub camera_view_gyro_axis: String,
+    /// The angular misalignment between the camera view axis and the closest gyro axis (degrees)
     pub camera_view_misalignment: f64,
+    /// The gyro axis most aligned with the camera's up axis
     pub camera_up_gyro_axis: String,
+    /// The angular misalignment between the camera up axis and the closest gyro axis (degrees)
     pub camera_up_misalignment: f64,
 }
 
+/// A single snapshot of IMU state.
 #[derive(Clone, Copy, Debug)]
 pub struct ImuUpdate {
+    /// Time when the update was recorded
     pub timestamp: SystemTime,
+    /// Raw gyroscope readings
     pub gyro: RawSensorData,
+    /// Current IMU orientation quaternion
     pub quaternion: UnitQuaternion<f64>,
+    /// Absolute angular velocity magnitude
     pub angular_velocity: f64,
+    /// Classified state of motion
     pub motion_state: MotionState,
 }
 
+/// Internal state tracking the alignment and calibration between the IMU and camera.
 #[derive(Clone)]
 pub struct AlignmentState {
-    // The known true camera pointing from the most recent successful plate solve.
+    /// The known true camera pointing from the most recent successful plate solve.
     pub last_camera_position: Option<MountCoordinates>,
-    // The IMU's raw quaternion recorded at the exact time the plate solve image was taken.
+    /// The IMU's raw quaternion recorded at the exact time the plate solve image was taken.
     pub imu_anchor_state: Option<UnitQuaternion<f64>>,
-    // The dynamically calculated physical mounting rotation of the IMU relative to the camera.
+    /// The dynamically calculated physical mounting rotation of the IMU relative to the camera.
     pub mount_q: UnitQuaternion<f64>,
-    // The calculated calibration health between the camera and IMU.
+    /// The calculated calibration health between the camera and IMU.
     pub transform_metrics: Option<TransformMetrics>,
-    // Store distinct rotational axes to continuously refine the 3D calibration
+    /// Store distinct rotational axes to continuously refine the 3D calibration
     pub calibration_axes: Vec<(Vector3<f64>, Vector3<f64>)>,
-    // Flag to track if the current mount_q was loaded from disk or previously locked
+    /// Flag to track if the current mount_q was loaded from disk or previously locked
     pub loaded_from_disk: bool,
-    // The highest confidence score achieved by the currently locked mount_q
+    /// The highest confidence score achieved by the currently locked mount_q
     pub best_calibration_confidence: f64,
-    // Counter to throttle SD card writes
+    /// Counter to throttle SD card writes
     pub calibration_updates_since_save: usize,
-    // Rolling history of expected vs true error for metric tracking
+    /// Rolling history of expected vs true error for metric tracking
     pub error_history: Vec<f64>,
 }
 
@@ -100,9 +125,13 @@ impl Default for AlignmentState {
     }
 }
 
+/// Generic interface for communicating with physical IMU hardware.
 pub trait ImuDevice: Send + 'static {
+    /// Initializes and configures the hardware device.
     fn init(&mut self) -> Result<(), String>;
+    /// Reads the latest gyroscope data from the device.
     fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String>;
+    /// Attempts to soft-reset or revive an unresponsive device.
     fn revive(&mut self) -> Result<(), String>;
 }
 
@@ -120,6 +149,7 @@ impl Default for CalibrationState {
     }
 }
 
+/// High-level interface that manages hardware communication, calibration, and state tracking.
 pub struct Imu {
     state: Arc<RwLock<Option<ImuUpdate>>>,
     alignment: Arc<RwLock<AlignmentState>>,
@@ -129,6 +159,7 @@ pub struct Imu {
 }
 
 impl Imu {
+    /// Starts the background thread to poll the given IMU hardware continuously.
     pub fn start<D: ImuDevice>(
         mut device: D,
         storage: Option<Arc<dyn PersistentStorage>>,
@@ -328,16 +359,19 @@ impl Imu {
         })
     }
 
+    /// Returns the number of stationary samples collected for bias calibration.
     pub fn get_bias_samples(&self) -> usize {
         let cal = self.calibration.lock().unwrap();
         cal.total_samples
     }
 
+    /// Returns the current hardware gyroscope bias vector.
     pub fn get_bias(&self) -> Vector3<f64> {
         let cal = self.calibration.lock().unwrap();
         cal.bias_offset
     }
 
+    /// Resets the internal bias calibration, restarting the sampling process.
     pub fn reset_bias_calibration(&self) {
         let mut cal = self.calibration.lock().unwrap();
         cal.total_samples = 0;
@@ -455,6 +489,8 @@ impl Imu {
         }
     }
 
+    /// Updates the IMU anchor based on a true camera position from a successful plate solve.
+    /// Returns early if no valid quaternion was found in history near `timestamp`.
     pub fn update_anchor(&self, camera_pointing: &MountCoordinates, timestamp: &SystemTime) {
         let imu_state = *self.state.read().unwrap();
 
@@ -746,6 +782,7 @@ impl Imu {
     // Clears the active session anchors and telemetry, but strictly preserves
     // the SVD calibration pool, mount_q, and disk file to support file-less recalibration and
     // uninterrupted EQ tracking.
+    /// Resets the IMU anchor state, clearing the `last_camera_position`.
     pub fn reset_anchors(&self) {
         debug!("reset called. Clearing anchors but preserving calibration matrix.");
         let mut align = self.alignment.write().unwrap();
@@ -756,6 +793,7 @@ impl Imu {
     }
 
     // Clears the entire calibration matrix, history, and deletes the persistent file.
+    /// Clears the 3D calibration between the IMU and camera, resetting `mount_q` to identity.
     pub fn clear_calibration(&self) {
         let mut align = self.alignment.write().unwrap();
         align.mount_q = UnitQuaternion::identity();
@@ -775,6 +813,8 @@ impl Imu {
     // IMU-derived estimate of camera pointing as of the given time.
     // The boolean in the Result tuple is `true` if the returned position is an updated estimate
     // using IMU data, and `false` if it is falling back to the static anchor itself.
+    /// Computes the camera's estimated pointing by advancing the last known
+    /// camera position using the IMU's rotational delta since the anchor time.
     pub fn get_estimated_pointing(
         &self,
         timestamp: &SystemTime,
@@ -828,6 +868,7 @@ impl Imu {
         }
     }
 
+    /// Returns the current classification of the IMU's physical motion.
     pub fn get_motion_state(&self) -> MotionState {
         self.state
             .read()
@@ -837,15 +878,18 @@ impl Imu {
             .unwrap_or(MotionState::Initializing)
     }
 
+    /// Returns the active metrics describing the health of the hardware calibration.
     pub fn get_calibration_metrics(&self) -> Option<TransformMetrics> {
         self.alignment.read().unwrap().transform_metrics.clone()
     }
 
+    /// Returns `true` if a full 3D calibration has been established.
     pub fn is_calibrated(&self) -> bool {
         let align = self.alignment.read().unwrap();
         align.loaded_from_disk || align.calibration_axes.len() >= 3
     }
 
+    /// Retrieves the latest snapshot of the IMU's orientation and motion state.
     pub fn get_latest_state(&self) -> Option<ImuUpdate> {
         *self.state.read().unwrap()
     }

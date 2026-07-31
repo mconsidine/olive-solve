@@ -388,3 +388,76 @@ fn test_solver_mirrored_image() {
     assert!(result.target_ra.is_some());
     assert!(result.target_dec.is_some());
 }
+
+#[test]
+fn test_true_matches_consistency() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+
+    if !db_path.exists() || !zip_path.exists() {
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+    let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
+    let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
+
+    // Test first 10 samples
+    for x in 1..=10 {
+        let input_filename = format!("input_{}.json", x);
+        let mut input_buffer = Vec::new();
+        {
+            let mut req_file = archive.by_name(&input_filename).unwrap();
+            req_file.read_to_end(&mut input_buffer).unwrap();
+        }
+        let input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+        let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+        let mut array_of_arrays = Vec::with_capacity(input_dto.centroids.len());
+        for c in &input_dto.centroids {
+            flat_cents.push(c[0]);
+            flat_cents.push(c[1]);
+            array_of_arrays.push([c[0], c[1]]);
+        }
+        let centroids_array =
+            Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+        let options = SolveOptions {
+            fov_estimate: input_dto.options.fov_estimate,
+            fov_max_error: input_dto.options.fov_max_error,
+            match_radius: input_dto.options.match_radius,
+            match_threshold: input_dto.options.match_threshold,
+            solve_timeout_ms: input_dto.options.solve_timeout_ms,
+            distortion: input_dto.options.distortion,
+            match_max_error: input_dto.options.match_max_error,
+            return_matches: true,
+            return_catalog: false,
+            return_rotation_matrix: true,
+            target_pixel: None,
+            target_sky_coord: None,
+        };
+
+        let result = solver.solve(
+            &centroids_array,
+            (input_dto.image_height, input_dto.image_width),
+            options.clone(),
+        );
+
+        if result.status == SolveStatus::MatchFound {
+            let true_matches = solver
+                .get_matches_for_centroids(
+                    &result,
+                    &array_of_arrays,
+                    (input_dto.image_height, input_dto.image_width),
+                    &options,
+                )
+                .map(|v| v.len());
+            assert_eq!(
+                result.matches, true_matches,
+                "True match count differs from solver match count for sample {}",
+                x
+            );
+        }
+    }
+}
