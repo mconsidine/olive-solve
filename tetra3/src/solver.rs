@@ -1528,7 +1528,7 @@ impl Solver {
             }
         }
 
-        let mut image_centroids_undist = undistort_centroids(
+        let image_centroids_undist = undistort_centroids(
             image_centroids,
             height,
             width,
