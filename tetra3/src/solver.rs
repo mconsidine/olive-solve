@@ -878,11 +878,6 @@ fn verify_and_build_solution(
     Some(solution)
 }
 
-// --- Ported Utility Functions ---
-fn separation_for_density(fov: f64, stars_per_fov: f64) -> f64 {
-    0.6 * fov / stars_per_fov.sqrt()
-}
-
 // --- Scratchpad for Zero-Allocation Combinatorics ---
 #[derive(Default)]
 #[doc(hidden)]
@@ -1326,16 +1321,12 @@ impl Solver {
     }
 
     #[inline(always)]
-    fn compute_pattern_key_hash(pattern_key: &[usize; 5], bin_factor: usize) -> u64 {
-        let bf = bin_factor as u64;
-        let bf2 = bf * bf;
-        let bf3 = bf2 * bf;
-        let bf4 = bf3 * bf;
+    fn compute_pattern_key_hash(pattern_key: &[usize; 5], mults: &[u64; 4]) -> u64 {
         (pattern_key[0] as u64)
-            + (pattern_key[1] as u64) * bf
-            + (pattern_key[2] as u64) * bf2
-            + (pattern_key[3] as u64) * bf3
-            + (pattern_key[4] as u64) * bf4
+            + (pattern_key[1] as u64) * mults[0]
+            + (pattern_key[2] as u64) * mults[1]
+            + (pattern_key[3] as u64) * mults[2]
+            + (pattern_key[4] as u64) * mults[3]
     }
 
     #[inline(always)]
@@ -1649,6 +1640,9 @@ impl Solver {
         let p_size = 4;
 
         let p_bins = *self.db_props.get("pattern_bins").unwrap_or(&50.0) as usize;
+        let bf = p_bins as u64;
+        let hash_mults = [bf, bf * bf, bf * bf * bf, bf * bf * bf * bf];
+
         let verification_stars = *self
             .db_props
             .get("verification_stars_per_fov")
@@ -1669,42 +1663,31 @@ impl Solver {
         }
 
         // Thinning strategy
-        let pattern_stars_separation_pixels =
-            width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
-        // OPTIMIZATION: Squared Distance Pre-filtering (Removed .sqrt() calculations)
+        // Mathematically simplified: width * (0.6 * fov / sqrt(stars)) / fov
+        let pattern_stars_separation_pixels = width * 0.6 / (verification_stars as f64).sqrt();
         let sep_sq = pattern_stars_separation_pixels.powi(2);
 
         let scratch = &mut self.scratch;
-        scratch.sp_keep_for_patterns.clear();
-        scratch
-            .sp_keep_for_patterns
-            .resize(num_centroids_raw, false);
+        scratch.sp_pattern_centroids_inds.clear();
 
         for i in 0..num_centroids_raw {
             let mut occupied = false;
-            let c_i = star_centroids.row(i);
-            for j in 0..i {
-                if scratch.sp_keep_for_patterns[j] {
-                    let c_j = star_centroids.row(j);
-                    if (c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2) < sep_sq {
-                        occupied = true;
-                        break;
-                    }
+            let c_i_0 = star_centroids[[i, 0]];
+            let c_i_1 = star_centroids[[i, 1]];
+
+            for &j in &scratch.sp_pattern_centroids_inds {
+                if (c_i_0 - star_centroids[[j, 0]]).powi(2)
+                    + (c_i_1 - star_centroids[[j, 1]]).powi(2)
+                    < sep_sq
+                {
+                    occupied = true;
+                    break;
                 }
             }
             if !occupied {
-                scratch.sp_keep_for_patterns[i] = true;
+                scratch.sp_pattern_centroids_inds.push(i);
             }
         }
-
-        scratch.sp_pattern_centroids_inds.clear();
-        scratch.sp_pattern_centroids_inds.extend(
-            scratch
-                .sp_keep_for_patterns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &keep)| if keep { Some(i) } else { None }),
-        );
 
         let mut num_extracted_stars = num_centroids_raw;
         if num_centroids_raw > verification_stars {
@@ -1905,7 +1888,7 @@ impl Solver {
                             let pattern_key =
                                 Self::decode_pattern_key(scratch.sp_pattern_key_list[key_idx]);
                             let pattern_key_hash =
-                                Self::compute_pattern_key_hash(&pattern_key, p_bins);
+                                Self::compute_pattern_key_hash(&pattern_key, &hash_mults);
                             let hash_index = Self::pattern_key_hash_to_index(
                                 pattern_key_hash,
                                 (pattern_catalog_flat.len() / p_size) as u64,
