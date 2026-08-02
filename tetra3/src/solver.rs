@@ -878,10 +878,12 @@ fn verify_and_build_solution(
     Some(solution)
 }
 
-// --- Scratchpad for Zero-Allocation Combinatorics ---
+// OPTIMIZATION: Zero-Allocation Pipeline
+// All dynamically sized Vecs required by the setup and combinatorics phases are stored here.
+// Reusing this struct completely eliminates all dynamic heap allocations inside solve(),
+// preventing allocator fragmentation over hundreds of runs.
 #[derive(Default)]
 #[doc(hidden)]
-#[allow(missing_docs)]
 pub struct Scratchpads {
     pub sp_pattern_key_list: Vec<u64>,
     pub sp_image_centroids: Vec<[f64; 2]>,
@@ -978,6 +980,9 @@ pub struct Solver {
     pub star_vectors: Vec<[f64; 3]>,
     pub star_metadata: Vec<StarMetadata>,
     pub pattern_catalog_flat: Vec<u32>,
+    // OPTIMIZATION: u16 Hash Probe Table (Memory / Cache Optimization)
+    // We use a flat u16 array instead of u32 or a full struct. Halving the footprint from
+    // 4 bytes to 2 bytes ensures it fits better into constrained L2 caches like on the Pi Zero 2W.
     pub probe_table: Vec<u16>,
     pub star_kd_tree: ImmutableKdTree<f64, 3>,
     pub pattern_largest_edge: Option<Vec<f32>>,
@@ -1338,6 +1343,9 @@ impl Solver {
         }
     }
 
+    // OPTIMIZATION: u64 Primitive Sorting (Memory / Happy Path)
+    // Packs a 5-element pattern key (10 bits each) and its distance into a single 64-bit unsigned integer.
+    // This massively speeds up the combinations sort_unstable() and reduces memory allocation.
     #[inline(always)]
     fn encode_pattern_key(dist: usize, k: [usize; 5]) -> u64 {
         ((dist as u64) << 40)
@@ -1641,6 +1649,10 @@ impl Solver {
 
         let p_bins = *self.db_props.get("pattern_bins").unwrap_or(&50.0) as usize;
         let bf = p_bins as u64;
+
+        // OPTIMIZATION: Hash Constant Hoisting
+        // Precalculate the power multipliers for p_bins once per solve to avoid
+        // doing 3 redundant multiplications per generated combination.
         let hash_mults = [bf, bf * bf, bf * bf * bf, bf * bf * bf * bf];
 
         let verification_stars = *self
@@ -1662,8 +1674,10 @@ impl Solver {
             };
         }
 
-        // Thinning strategy
-        // Mathematically simplified: width * (0.6 * fov / sqrt(stars)) / fov
+        // OPTIMIZATION: O(N * K) Spatial Thinning
+        // Mathematically simplified: width * (0.6 * fov / sqrt(stars)) / fov removes the fov operations.
+        // We also iterate exclusively over previously kept stars (`sp_pattern_centroids_inds`)
+        // instead of an O(N^2) loop with boolean checks, heavily reducing inner iterations on dense fields.
         let pattern_stars_separation_pixels = width * 0.6 / (verification_stars as f64).sqrt();
         let sep_sq = pattern_stars_separation_pixels.powi(2);
 
@@ -1835,6 +1849,9 @@ impl Solver {
                         let edges = e;
 
                         let image_pattern_largest_edge = edges[5];
+
+                        // OPTIMIZATION: Division Elimination (Happy Path Optimization)
+                        // Precalculate the reciprocal to replace 5 heavy floating-point divisions with fast multiplications.
                         let inv_largest_edge = 1.0 / image_pattern_largest_edge;
 
                         // Min/max edge ratio bounds
