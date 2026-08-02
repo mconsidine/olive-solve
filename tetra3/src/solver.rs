@@ -1659,6 +1659,11 @@ impl Solver {
             .db_props
             .get("verification_stars_per_fov")
             .unwrap_or(&10.0) as usize;
+
+        // OPTIMIZATION: Loop-Invariant Code Motion
+        // Pre-convert to radians so we don't do floating-point math in the hot loop
+        let fov_est_rad = options.fov_estimate.map(|x| x.to_radians());
+        let fov_err_rad = options.fov_max_error.map(|x| x.to_radians());
         let p_max_err = options
             .match_max_error
             .max(*self.db_props.get("pattern_max_error").unwrap_or(&0.002));
@@ -1770,7 +1775,7 @@ impl Solver {
             for k in 2..l {
                 for j in 1..k {
                     solver_idx += 1;
-                    if solver_idx % 100 == 0 {
+                    if solver_idx & 127 == 0 {
                         if let Some(timeout_ms) = options.solve_timeout_ms {
                             if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout_ms {
                                 return Solution {
@@ -1916,8 +1921,8 @@ impl Solver {
                                 pattern_key_hash,
                                 hash_index,
                                 inv_largest_edge,
-                                options.fov_estimate.map(|x| x.to_radians()),
-                                options.fov_max_error.map(|x| x.to_radians()),
+                                fov_est_rad,
+                                fov_err_rad,
                                 pattern_catalog_flat,
                                 &self.probe_table,
                                 p_size,
