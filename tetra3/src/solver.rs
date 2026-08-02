@@ -67,7 +67,7 @@
 
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::{Matrix3, SVD};
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use npyz::NpyFile;
 use std::collections::HashMap;
 use std::fs::File;
@@ -496,8 +496,6 @@ fn verify_and_build_solution(
     height: f64,
     width: f64,
     options: &SolveOptions,
-    image_centroids: &[[f64; 2]],
-    image_centroids_undist: &mut Vec<[f64; 2]>,
     num_extracted_stars: usize,
     match_threshold: f64,
     t0_solve: Instant,
@@ -564,7 +562,7 @@ fn verify_and_build_solution(
     }
 
     find_centroid_matches_inplace(
-        image_centroids_undist,
+        &scratch.sp_image_centroids_undist,
         num_extracted_stars,
         &scratch.sp_valid_cat_centroids,
         crop_len,
@@ -593,7 +591,7 @@ fn verify_and_build_solution(
     for &(img_idx, cat_idx) in matched_stars {
         scratch
             .sp_matched_img_cents
-            .push(image_centroids_undist[img_idx]);
+            .push(scratch.sp_image_centroids_undist[img_idx]);
         scratch
             .sp_matched_cat_vecs
             .push(scratch.sp_valid_cat_vectors[cat_idx]);
@@ -633,7 +631,7 @@ fn verify_and_build_solution(
         let mut atb_1 = 0.0;
 
         for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-            let r_cent = image_centroids[img_idx];
+            let r_cent = scratch.sp_image_centroids[img_idx];
             let r_dist = ((r_cent[0] - height / 2.0).powi(2) + (r_cent[1] - width / 2.0).powi(2))
                 .sqrt()
                 / width
@@ -661,9 +659,11 @@ fn verify_and_build_solution(
             let f_val = sol_0 / (1.0 - sol_1);
             k_final = Some(sol_1);
             fov = 2.0 * (1.0 / f_val).atan();
-            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol_1);
+            let centroids = &scratch.sp_image_centroids;
+            let out = &mut scratch.sp_image_centroids_undist;
+            undistort_centroids_inplace(centroids, height, width, sol_1, out);
             for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                scratch.sp_matched_img_cents[m_idx] = image_centroids_undist[img_idx];
+                scratch.sp_matched_img_cents[m_idx] = scratch.sp_image_centroids_undist[img_idx];
             }
         }
     }
@@ -839,7 +839,7 @@ fn verify_and_build_solution(
         let mut m_stars = Vec::new();
         let mut m_ids = Vec::new();
         for &(img_idx, cat_idx) in matched_stars {
-            m_cents.push(image_centroids_undist[img_idx]);
+            m_cents.push(scratch.sp_image_centroids_undist[img_idx]);
             let star_idx = scratch.sp_valid_cat_inds[cat_idx];
             let meta = &star_metadata[star_idx];
             m_stars.push([meta.ra.to_degrees(), meta.dec.to_degrees(), meta.mag]);
@@ -889,6 +889,9 @@ fn separation_for_density(fov: f64, stars_per_fov: f64) -> f64 {
 #[allow(missing_docs)]
 pub struct Scratchpads {
     pub sp_pattern_key_list: Vec<u64>,
+    pub sp_image_centroids: Vec<[f64; 2]>,
+    pub sp_image_centroids_vectors: Vec<[f64; 3]>,
+    pub sp_pattern_centroids_inds: Vec<usize>,
 
     // Core matching scratchpads
     pub sp_image_centroids_undist: Vec<[f64; 2]>,
@@ -926,6 +929,9 @@ impl Scratchpads {
         let max_size = p_size.max(6);
         Self {
             sp_pattern_key_list: Vec::with_capacity(512),
+            sp_image_centroids: Vec::with_capacity(256),
+            sp_image_centroids_vectors: Vec::with_capacity(256),
+            sp_pattern_centroids_inds: Vec::with_capacity(256),
             sp_image_centroids_undist: Vec::with_capacity(256),
             sp_cat_edges_list: Vec::with_capacity(32),
             sp_cat_vectors_list: Vec::with_capacity(32),
@@ -1691,38 +1697,50 @@ impl Solver {
             }
         }
 
-        let mut pattern_centroids_inds: Vec<usize> = scratch
-            .sp_keep_for_patterns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
-            .collect();
+        scratch.sp_pattern_centroids_inds.clear();
+        scratch.sp_pattern_centroids_inds.extend(
+            scratch
+                .sp_keep_for_patterns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &keep)| if keep { Some(i) } else { None }),
+        );
 
         let mut num_extracted_stars = num_centroids_raw;
         if num_centroids_raw > verification_stars {
             num_extracted_stars = verification_stars;
-            pattern_centroids_inds.retain(|&i| i < num_extracted_stars);
+            scratch
+                .sp_pattern_centroids_inds
+                .retain(|&i| i < num_extracted_stars);
         }
 
         // Maintain the original full set of image_centroids for the final matrix building
-        let mut image_centroids = Vec::with_capacity(num_extracted_stars);
+        scratch.sp_image_centroids.clear();
         for i in 0..num_extracted_stars {
-            image_centroids.push([star_centroids[[i, 0]], star_centroids[[i, 1]]]);
+            scratch
+                .sp_image_centroids
+                .push([star_centroids[[i, 0]], star_centroids[[i, 1]]]);
         }
 
-        let mut image_centroids_undist = if let Some(k) = options.distortion {
-            undistort_centroids(&image_centroids, height, width, k)
+        if let Some(k) = options.distortion {
+            let cents = &scratch.sp_image_centroids;
+            let undist = &mut scratch.sp_image_centroids_undist;
+            undistort_centroids_inplace(cents, height, width, k, undist);
         } else {
-            image_centroids.clone()
-        };
+            scratch.sp_image_centroids_undist.clear();
+            scratch
+                .sp_image_centroids_undist
+                .extend_from_slice(&scratch.sp_image_centroids);
+        }
 
-        let image_centroids_vectors =
-            compute_vectors_flat(&image_centroids_undist, height, width, fov_initial);
+        let undist = &scratch.sp_image_centroids_undist;
+        let vecs = &mut scratch.sp_image_centroids_vectors;
+        compute_vectors_inplace(undist, height, width, fov_initial, vecs, undist.len());
 
         // OPTIMIZATION: Lazy Angle Precomputation (Happy Path Optimization)
         // We only compute distances on-demand and cache them. For successful solves
         // this skips thousands of unnecessary sqrt/asin operations.
-        let num_vecs = image_centroids_vectors.len();
+        let num_vecs = scratch.sp_image_centroids_vectors.len();
         scratch.sp_precomputed_angles.clear();
         scratch
             .sp_precomputed_angles
@@ -1735,7 +1753,7 @@ impl Solver {
         let pattern_catalog_flat = &self.pattern_catalog_flat;
         let linear_probe = self.linear_probe;
 
-        let n_inds = pattern_centroids_inds.len();
+        let n_inds = scratch.sp_pattern_centroids_inds.len();
 
         // Fail fast: if spatial thinning leaves us with too few stars to form a single pattern, abort.
         if n_inds < p_size {
@@ -1774,18 +1792,18 @@ impl Solver {
                         }
                     }
                     for i in 0..j {
-                        let p_i = pattern_centroids_inds[i];
-                        let p_j = pattern_centroids_inds[j];
-                        let p_k = pattern_centroids_inds[k];
-                        let p_l = pattern_centroids_inds[l];
+                        let p_i = scratch.sp_pattern_centroids_inds[i];
+                        let p_j = scratch.sp_pattern_centroids_inds[j];
+                        let p_k = scratch.sp_pattern_centroids_inds[k];
+                        let p_l = scratch.sp_pattern_centroids_inds[l];
 
                         macro_rules! get_angle {
                             ($p1:expr, $p2:expr) => {{
                                 let idx = $p1 * num_vecs + $p2;
                                 let mut ang = scratch.sp_precomputed_angles[idx];
                                 if ang < 0.0 {
-                                    let v_i = image_centroids_vectors[$p1];
-                                    let v_j = image_centroids_vectors[$p2];
+                                    let v_i = scratch.sp_image_centroids_vectors[$p1];
+                                    let v_j = scratch.sp_image_centroids_vectors[$p2];
                                     let dist = ((v_i[0] - v_j[0]).powi(2)
                                         + (v_i[1] - v_j[1]).powi(2)
                                         + (v_i[2] - v_j[2]).powi(2))
@@ -1968,10 +1986,10 @@ impl Solver {
                                 } else {
                                     if image_pattern_largest_distance.is_none() {
                                         let pts = [
-                                            image_centroids_undist[p_i],
-                                            image_centroids_undist[p_j],
-                                            image_centroids_undist[p_k],
-                                            image_centroids_undist[p_l],
+                                            scratch.sp_image_centroids_undist[p_i],
+                                            scratch.sp_image_centroids_undist[p_j],
+                                            scratch.sp_image_centroids_undist[p_k],
+                                            scratch.sp_image_centroids_undist[p_l],
                                         ];
                                         let mut max_dist = 0.0;
                                         for r in 0..4 {
@@ -1994,10 +2012,10 @@ impl Solver {
 
                                 // Re-calculate vectors uniquely sorted by radius to centroid
                                 let pts = [
-                                    image_centroids_undist[p_i],
-                                    image_centroids_undist[p_j],
-                                    image_centroids_undist[p_k],
-                                    image_centroids_undist[p_l],
+                                    scratch.sp_image_centroids_undist[p_i],
+                                    scratch.sp_image_centroids_undist[p_j],
+                                    scratch.sp_image_centroids_undist[p_k],
+                                    scratch.sp_image_centroids_undist[p_l],
                                 ];
                                 compute_vectors_inplace(
                                     &pts,
@@ -2087,8 +2105,6 @@ impl Solver {
                                     height,
                                     width,
                                     &options,
-                                    &image_centroids,
-                                    &mut image_centroids_undist,
                                     num_extracted_stars,
                                     match_threshold,
                                     t0_solve,
