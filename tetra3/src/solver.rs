@@ -164,13 +164,13 @@ pub struct Solution {
 #[derive(Clone, Copy)]
 #[allow(missing_docs)]
 /// Internal representation of a star loaded from the cedar-solve database.
-pub struct CatalogStar {
+pub struct StarMetadata {
     pub ra: f64,
     pub dec: f64,
-    pub vec: [f64; 3],
     pub mag: f64,
 }
 
+// Removed ProbeEntry
 // --- High-Performance Native Math Helpers ---
 
 #[inline(always)]
@@ -224,8 +224,8 @@ fn compute_vectors_flat(
         let v0 = 1.0;
         let v1 = (img_center_x - c[1]) * scale_factor;
         let v2 = (img_center_y - c[0]) * scale_factor;
-        let norm = (v0 * v0 + v1 * v1 + v2 * v2).sqrt();
-        out.push([v0 / norm, v1 / norm, v2 / norm]);
+        let inv_norm = 1.0 / (v0 * v0 + v1 * v1 + v2 * v2).sqrt();
+        out.push([v0 * inv_norm, v1 * inv_norm, v2 * inv_norm]);
     }
     out
 }
@@ -248,8 +248,8 @@ fn compute_vectors_inplace(
         let v0 = 1.0;
         let v1 = (img_center_x - centroids[i][1]) * scale_factor;
         let v2 = (img_center_y - centroids[i][0]) * scale_factor;
-        let norm = (v0 * v0 + v1 * v1 + v2 * v2).sqrt();
-        out.push([v0 / norm, v1 / norm, v2 / norm]);
+        let inv_norm = 1.0 / (v0 * v0 + v1 * v1 + v2 * v2).sqrt();
+        out.push([v0 * inv_norm, v1 * inv_norm, v2 * inv_norm]);
     }
 }
 
@@ -269,8 +269,9 @@ fn compute_centroids_inplace(
     let img_center_x = width / 2.0;
 
     for i in 0..len {
-        let cy = scale_factor * (vectors[i][2] / vectors[i][0]) + img_center_y;
-        let cx = scale_factor * (vectors[i][1] / vectors[i][0]) + img_center_x;
+        let inv_v0 = 1.0 / vectors[i][0];
+        let cy = scale_factor * (vectors[i][2] * inv_v0) + img_center_y;
+        let cx = scale_factor * (vectors[i][1] * inv_v0) + img_center_x;
         out_centroids[i][0] = cy;
         out_centroids[i][1] = cx;
 
@@ -281,18 +282,33 @@ fn compute_centroids_inplace(
 }
 
 fn undistort_centroids(centroids: &[[f64; 2]], height: f64, width: f64, k: f64) -> Vec<[f64; 2]> {
-    let kp = k * (2.0 / width).powi(2);
-    let mut undistorted = centroids.to_vec();
-
-    for row in undistorted.iter_mut() {
-        let dy = row[0] - height / 2.0;
-        let dx = row[1] - width / 2.0;
-        let r_dist = (dy * dy + dx * dx).sqrt();
-        let scale = (1.0 - kp * r_dist.powi(2)) / (1.0 - k);
-        row[0] = (dy * scale) + height / 2.0;
-        row[1] = (dx * scale) + width / 2.0;
-    }
+    let mut undistorted = Vec::with_capacity(centroids.len());
+    undistort_centroids_inplace(centroids, height, width, k, &mut undistorted);
     undistorted
+}
+
+fn undistort_centroids_inplace(
+    centroids: &[[f64; 2]],
+    height: f64,
+    width: f64,
+    k: f64,
+    out: &mut Vec<[f64; 2]>,
+) {
+    out.clear();
+    out.extend_from_slice(centroids);
+    let kp = k * (2.0 / width).powi(2);
+    let inv_1_k = 1.0 / (1.0 - k);
+    let h_2 = height / 2.0;
+    let w_2 = width / 2.0;
+
+    for row in out.iter_mut() {
+        let dy = row[0] - h_2;
+        let dx = row[1] - w_2;
+        let r_dist_sq = dy * dy + dx * dx;
+        let scale = (1.0 - kp * r_dist_sq) * inv_1_k;
+        row[0] = (dy * scale) + h_2;
+        row[1] = (dx * scale) + w_2;
+    }
 }
 
 fn distort_centroids(
@@ -305,10 +321,13 @@ fn distort_centroids(
 ) -> Vec<[f64; 2]> {
     let kp = k * (2.0 / width).powi(2);
     let mut distorted = centroids.to_vec();
+    let inv_1_k = 1.0 / (1.0 - k);
+    let h_2 = height / 2.0;
+    let w_2 = width / 2.0;
 
     for row in distorted.iter_mut() {
-        let dy = row[0] - height / 2.0;
-        let dx = row[1] - width / 2.0;
+        let dy = row[0] - h_2;
+        let dx = row[1] - w_2;
         let r_undist = (dy * dy + dx * dx).sqrt();
 
         if r_undist < 1e-8 {
@@ -317,8 +336,8 @@ fn distort_centroids(
 
         let mut r_dist = r_undist;
         for _ in 0..maxiter {
-            let r_undist_est = r_dist * (1.0 - kp * r_dist.powi(2)) / (1.0 - k);
-            let dru_drd = (1.0 - 2.0 * kp * r_dist) / (1.0 - k);
+            let r_undist_est = r_dist * (1.0 - kp * r_dist.powi(2)) * inv_1_k;
+            let dru_drd = (1.0 - 2.0 * kp * r_dist) * inv_1_k;
             let error = r_undist - r_undist_est;
             r_dist += error / dru_drd;
             if error.abs() < tol {
@@ -326,8 +345,8 @@ fn distort_centroids(
             }
         }
         let scale = r_dist / r_undist;
-        row[0] = (dy * scale) + height / 2.0;
-        row[1] = (dx * scale) + width / 2.0;
+        row[0] = (dy * scale) + h_2;
+        row[1] = (dx * scale) + w_2;
     }
     distorted
 }
@@ -354,7 +373,7 @@ fn sort_vectors_by_radius_inplace(
         let dx = vectors[i][0] - centroid[0];
         let dy = vectors[i][1] - centroid[1];
         let dz = vectors[i][2] - centroid[2];
-        radii_scratch.push(((dx * dx + dy * dy + dz * dz).sqrt(), i));
+        radii_scratch.push(((dx * dx + dy * dy + dz * dz), i));
     }
 
     radii_scratch.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -428,7 +447,13 @@ fn find_centroid_matches_inplace(
     for i in 0..img_len {
         for j in 0..cat_len {
             let dy = image_centroids[i][0] - catalog_centroids[j][0];
+            if dy.abs() >= r {
+                continue;
+            }
             let dx = image_centroids[i][1] - catalog_centroids[j][1];
+            if dx.abs() >= r {
+                continue;
+            }
             if (dy * dy + dx * dx) < r_sq {
                 matches.push((i, j));
             }
@@ -461,7 +486,8 @@ fn find_centroid_matches_inplace(
 fn verify_and_build_solution(
     scratch: &mut Scratchpads,
     star_kd_tree: &ImmutableKdTree<f64, 3>,
-    star_table_flat: &[CatalogStar],
+    star_vectors: &[[f64; 3]],
+    star_metadata: &[StarMetadata],
     star_catalog_ids: &Option<Array2<u32>>,
     db_props: &HashMap<String, f64>,
     num_patterns: usize,
@@ -516,14 +542,15 @@ fn verify_and_build_solution(
 
     for node in &nearby_nodes {
         let star_idx = node.item as usize;
-        let vec = star_table_flat[star_idx].vec;
+        let vec = star_vectors[star_idx];
 
         let v0 = r[(0, 0)] * vec[0] as f64 + r[(0, 1)] * vec[1] as f64 + r[(0, 2)] * vec[2] as f64;
         let v1 = r[(1, 0)] * vec[0] as f64 + r[(1, 1)] * vec[1] as f64 + r[(1, 2)] * vec[2] as f64;
         let v2 = r[(2, 0)] * vec[0] as f64 + r[(2, 1)] * vec[1] as f64 + r[(2, 2)] * vec[2] as f64;
 
-        let cy = scale_factor_cent * (v2 / v0) + img_center_y;
-        let cx = scale_factor_cent * (v1 / v0) + img_center_x;
+        let inv_v0 = 1.0 / v0;
+        let cy = scale_factor_cent * (v2 * inv_v0) + img_center_y;
+        let cx = scale_factor_cent * (v1 * inv_v0) + img_center_x;
 
         if cy > 0.0 && cx > 0.0 && cy < height && cx < width {
             scratch.sp_valid_cat_centroids[crop_len] = [cy, cx];
@@ -814,8 +841,8 @@ fn verify_and_build_solution(
         for &(img_idx, cat_idx) in matched_stars {
             m_cents.push(image_centroids_undist[img_idx]);
             let star_idx = scratch.sp_valid_cat_inds[cat_idx];
-            let star = &star_table_flat[star_idx];
-            m_stars.push([star.ra.to_degrees(), star.dec.to_degrees(), star.mag]);
+            let meta = &star_metadata[star_idx];
+            m_stars.push([meta.ra.to_degrees(), meta.dec.to_degrees(), meta.mag]);
 
             // Extract the catalog ID as a Vec (1 element for hip_main/bsc5, 3 elements for tyc_main)
             if let Some(ids) = star_catalog_ids {
@@ -836,11 +863,11 @@ fn verify_and_build_solution(
         let mut cat_stars = Vec::new();
         for c_idx in 0..crop_len {
             let star_idx = scratch.sp_valid_cat_inds[c_idx];
-            let star = &star_table_flat[star_idx];
+            let meta = &star_metadata[star_idx];
             cat_stars.push((
-                star.ra.to_degrees(),
-                star.dec.to_degrees(),
-                star.mag,
+                meta.ra.to_degrees(),
+                meta.dec.to_degrees(),
+                meta.mag,
                 scratch.sp_valid_cat_centroids[c_idx][0],
                 scratch.sp_valid_cat_centroids[c_idx][1],
             ));
@@ -864,6 +891,7 @@ pub struct Scratchpads {
     pub sp_pattern_key_list: Vec<(usize, [usize; 5])>,
 
     // Core matching scratchpads
+    pub sp_image_centroids_undist: Vec<[f64; 2]>,
     pub sp_cat_edges_list: Vec<[f64; 6]>,
     pub sp_cat_vectors_list: Vec<[[f64; 3]; 4]>,
     pub sp_p_cents: Vec<[f64; 2]>,
@@ -898,6 +926,7 @@ impl Scratchpads {
         let max_size = p_size.max(6);
         Self {
             sp_pattern_key_list: Vec::with_capacity(512),
+            sp_image_centroids_undist: Vec::with_capacity(256),
             sp_cat_edges_list: Vec::with_capacity(32),
             sp_cat_vectors_list: Vec::with_capacity(32),
 
@@ -945,13 +974,13 @@ impl Scratchpads {
 /// The main solver engine. Highly optimized for plate solving using cedar-solve databases.
 pub struct Solver {
     // OPTIMIZATION: Highly optimized cache-aligned struct lists
-    pub star_table_flat: Vec<CatalogStar>,
+    pub star_vectors: Vec<[f64; 3]>,
+    pub star_metadata: Vec<StarMetadata>,
     pub pattern_catalog_flat: Vec<u32>,
     pub probe_table: Vec<u32>,
     pub star_kd_tree: ImmutableKdTree<f64, 3>,
-
-    pub pattern_largest_edge: Option<Array1<f32>>,
-    pub pattern_key_hashes: Option<Array1<u16>>,
+    pub pattern_largest_edge: Option<Vec<f32>>,
+    pub pattern_key_hashes: Option<Vec<u16>>,
     pub star_catalog_ids: Option<Array2<u32>>,
     pub db_props: HashMap<String, f64>,
     pub num_patterns: usize,
@@ -970,7 +999,7 @@ impl Solver {
 
         let read_star_table = |arc: &mut ZipArchive<File>,
                                name: &str|
-         -> Result<Array2<f64>, Box<dyn std::error::Error>> {
+         -> Result<Vec<f64>, Box<dyn std::error::Error>> {
             let mut zf = arc.by_name(name)?;
             let mut buf = Vec::new();
             zf.read_to_end(&mut buf)?;
@@ -978,95 +1007,82 @@ impl Solver {
             let mut cursor = Cursor::new(&buf);
             let npy = NpyFile::new(&mut cursor)?;
             let shape = npy.shape().to_vec();
-            if shape.len() != 2 {
-                return Err("star_table must be 2D".into());
+            if shape.len() != 2 || shape[1] != 6 {
+                return Err("star_table must be 2D with 6 columns".into());
             }
 
             let mut cursor = Cursor::new(&buf);
             let npy2 = NpyFile::new(&mut cursor)?;
             if let Ok(data) = npy2.into_vec::<f64>() {
-                return Ok(Array2::from_shape_vec(
-                    (shape[0] as usize, shape[1] as usize),
-                    data,
-                )?);
+                return Ok(data);
             }
 
             let mut cursor = Cursor::new(&buf);
             let npy3 = NpyFile::new(&mut cursor)?;
             let data_f32: Vec<f32> = npy3.into_vec()?;
             let data: Vec<f64> = data_f32.into_iter().map(|v| v as f64).collect();
-            Ok(Array2::from_shape_vec(
-                (shape[0] as usize, shape[1] as usize),
-                data,
-            )?)
+            Ok(data)
         };
 
         // tetra3.py optimizes the data type of the pattern_catalog based on the number of patterns.
-        let read_pattern_catalog = |arc: &mut ZipArchive<File>,
-                                    name: &str|
-         -> Result<Array2<u32>, Box<dyn std::error::Error>> {
-            let mut zf = arc.by_name(name)?;
-            let mut buf = Vec::new();
-            zf.read_to_end(&mut buf)?;
+        let read_pattern_catalog =
+            |arc: &mut ZipArchive<File>,
+             name: &str|
+             -> Result<(Vec<u32>, usize), Box<dyn std::error::Error>> {
+                let mut zf = arc.by_name(name)?;
+                let mut buf = Vec::new();
+                zf.read_to_end(&mut buf)?;
 
-            let mut cursor = Cursor::new(&buf);
-            let npy = NpyFile::new(&mut cursor)?;
-            let shape = npy.shape().to_vec();
-            if shape.len() != 2 {
-                return Err("pattern_catalog must be 2D".into());
-            }
+                let mut cursor = Cursor::new(&buf);
+                let npy = NpyFile::new(&mut cursor)?;
+                let shape = npy.shape().to_vec();
+                if shape.len() != 2 {
+                    return Err("pattern_catalog must be 2D".into());
+                }
+                let nrows = shape[0] as usize;
 
-            // Fallback 1: Try u8 (tetra3 uses this for very small catalogs)
-            let mut cursor = Cursor::new(&buf);
-            if let Ok(npy) = NpyFile::new(&mut cursor)
-                && let Ok(data_u8) = npy.into_vec::<u8>()
-            {
-                let data: Vec<u32> = data_u8.into_iter().map(|v| v as u32).collect();
-                return Ok(Array2::from_shape_vec(
-                    (shape[0] as usize, shape[1] as usize),
-                    data,
-                )?);
-            }
+                // Fallback 1: Try u8 (tetra3 uses this for very small catalogs)
+                let mut cursor = Cursor::new(&buf);
+                if let Ok(npy) = NpyFile::new(&mut cursor) {
+                    if let Ok(data_u8) = npy.into_vec::<u8>() {
+                        let data: Vec<u32> = data_u8.into_iter().map(|v| v as u32).collect();
+                        return Ok((data, nrows));
+                    }
+                }
 
-            // Fallback 2: Try u16
-            let mut cursor = Cursor::new(&buf);
-            if let Ok(npy) = NpyFile::new(&mut cursor)
-                && let Ok(data_u16) = npy.into_vec::<u16>()
-            {
-                let data: Vec<u32> = data_u16.into_iter().map(|v| v as u32).collect();
-                return Ok(Array2::from_shape_vec(
-                    (shape[0] as usize, shape[1] as usize),
-                    data,
-                )?);
-            }
+                // Fallback 2: Try u16
+                let mut cursor = Cursor::new(&buf);
+                if let Ok(npy) = NpyFile::new(&mut cursor) {
+                    if let Ok(data_u16) = npy.into_vec::<u16>() {
+                        let data: Vec<u32> = data_u16.into_iter().map(|v| v as u32).collect();
+                        return Ok((data, nrows));
+                    }
+                }
 
-            // Fallback 3: Try u32
-            let mut cursor = Cursor::new(&buf);
-            let npy = NpyFile::new(&mut cursor)?;
-            let data_u32: Vec<u32> = npy.into_vec()?;
-            Ok(Array2::from_shape_vec(
-                (shape[0] as usize, shape[1] as usize),
-                data_u32,
-            )?)
-        };
+                // Fallback 3: Try u32
+                let mut cursor = Cursor::new(&buf);
+                let npy = NpyFile::new(&mut cursor)?;
+                let data_u32: Vec<u32> = npy.into_vec()?;
+                Ok((data_u32, nrows))
+            };
 
-        let read_1d_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<f32>> {
+        let read_1d_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Vec<f32>> {
             arc.by_name(name).ok().and_then(|mut zf| {
                 let mut buf = Vec::new();
                 zf.read_to_end(&mut buf).ok()?;
                 let mut cursor = Cursor::new(&buf);
                 let npy = NpyFile::new(&mut cursor).ok()?;
-                Some(Array1::from_vec(npy.into_vec().ok()?))
+                npy.into_vec().ok()
             })
         };
 
-        let read_1d_u16 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<u16>> {
+        let read_1d_u16 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Vec<u16>> {
             arc.by_name(name).ok().and_then(|mut zf| {
                 let mut buf = Vec::new();
                 zf.read_to_end(&mut buf).ok()?;
                 let mut cursor = Cursor::new(&buf);
                 let npy = NpyFile::new(&mut cursor).ok()?;
-                Some(Array1::from_vec(npy.into_vec().ok()?))
+                npy.into_vec().ok()
             })
         };
 
@@ -1120,36 +1136,30 @@ impl Solver {
                 })
             };
 
-        let pattern_catalog_arr = read_pattern_catalog(&mut archive, "pattern_catalog.npy")?;
-        let star_table_arr = read_star_table(&mut archive, "star_table.npy")?;
+        let (pattern_catalog_flat, num_patterns_from_arr) =
+            read_pattern_catalog(&mut archive, "pattern_catalog.npy")?;
+        let star_table_data = read_star_table(&mut archive, "star_table.npy")?;
         let pattern_largest_edge = read_1d_f32(&mut archive, "pattern_largest_edge.npy");
         let pattern_key_hashes = read_1d_u16(&mut archive, "pattern_key_hashes.npy");
         let star_catalog_ids = read_star_catalog_ids(&mut archive, "star_catalog_IDs.npy");
 
         // OPTIMIZATION: Convert massive Array2 allocations to deeply mapped fast internal native slices
-        let mut star_table_flat = Vec::with_capacity(star_table_arr.nrows());
-        for i in 0..star_table_arr.nrows() {
-            star_table_flat.push(CatalogStar {
-                ra: star_table_arr[[i, 0]],
-                dec: star_table_arr[[i, 1]],
-                vec: [
-                    star_table_arr[[i, 2]],
-                    star_table_arr[[i, 3]],
-                    star_table_arr[[i, 4]],
-                ],
-                mag: star_table_arr[[i, 5]],
+        let num_stars = star_table_data.len() / 6;
+        let mut star_vectors = Vec::with_capacity(num_stars);
+        let mut star_metadata = Vec::with_capacity(num_stars);
+        for chunk in star_table_data.chunks_exact(6) {
+            star_metadata.push(StarMetadata {
+                ra: chunk[0],
+                dec: chunk[1],
+                mag: chunk[5],
             });
-        }
-
-        let mut pattern_catalog_flat = Vec::with_capacity(pattern_catalog_arr.len());
-        for &val in pattern_catalog_arr.iter() {
-            pattern_catalog_flat.push(val);
+            star_vectors.push([chunk[2], chunk[3], chunk[4]]);
         }
 
         let num_patterns_allocated = pattern_catalog_flat.len() / 4;
         let mut probe_table = Vec::with_capacity(num_patterns_allocated);
         let has_pattern_key_hashes = pattern_key_hashes.is_some();
-        let hashes_ref = pattern_key_hashes.as_ref().map(|a| a.as_slice().unwrap());
+        let hashes_ref = pattern_key_hashes.as_ref().map(|a| a.as_slice());
 
         for i in 0..num_patterns_allocated {
             let row_start = i * 4;
@@ -1168,13 +1178,13 @@ impl Solver {
             }
         }
 
-        let mut points: Vec<[f64; 3]> = Vec::with_capacity(star_table_flat.len());
-        for star in star_table_flat.iter() {
-            points.push(star.vec);
+        let mut points: Vec<[f64; 3]> = Vec::with_capacity(star_vectors.len());
+        for vec in star_vectors.iter() {
+            points.push(*vec);
         }
         let star_kd_tree = ImmutableKdTree::new_from_slice(&points);
 
-        let mut num_patterns = pattern_catalog_arr.nrows() / 2;
+        let mut num_patterns = num_patterns_from_arr / 2;
         let mut db_props = HashMap::new();
         let mut linear_probe = false;
 
@@ -1284,7 +1294,8 @@ impl Solver {
         let is_cancelled = Arc::new(AtomicBool::new(false));
 
         Ok(Solver {
-            star_table_flat,
+            star_vectors,
+            star_metadata,
             pattern_catalog_flat,
             probe_table,
             star_kd_tree,
@@ -1335,20 +1346,38 @@ impl Solver {
         out_found: &mut Vec<usize>,
     ) {
         out_found.clear();
-        let max_ind = probe_table.len() as u64;
-        for c in 0.. {
-            let i = if linear_probe {
-                (hash_index + c) % max_ind
-            } else {
-                (hash_index + c * c) % max_ind
-            } as usize;
+        let max_ind = probe_table.len();
+        let mut i = (hash_index % (max_ind as u64)) as usize;
 
-            let probe_val = probe_table[i];
-            if probe_val == u32::MAX {
-                break;
+        if linear_probe {
+            loop {
+                let probe_val = probe_table[i];
+                if probe_val == u32::MAX {
+                    break;
+                }
+                if !has_hashes || probe_val == key_hash16 as u32 {
+                    out_found.push(i);
+                }
+                i += 1;
+                if i == max_ind {
+                    i = 0;
+                }
             }
-            if !has_hashes || probe_val == key_hash16 as u32 {
-                out_found.push(i);
+        } else {
+            let mut step = 1;
+            loop {
+                let probe_val = probe_table[i];
+                if probe_val == u32::MAX {
+                    break;
+                }
+                if !has_hashes || probe_val == key_hash16 as u32 {
+                    out_found.push(i);
+                }
+                i += step;
+                while i >= max_ind {
+                    i -= max_ind;
+                }
+                step += 2;
             }
         }
     }
@@ -1356,15 +1385,15 @@ impl Solver {
     fn get_all_patterns_for_index_inplace(
         pattern_key_hash: u64,
         hash_index: u64,
-        image_pattern_largest_edge: f64,
+        inv_largest_edge: f64,
         fov_estimate: Option<f64>,
         fov_max_error: Option<f64>,
         pattern_catalog_flat: &[u32],
         probe_table: &[u32],
         p_size: usize,
-        pattern_key_hashes: &Option<Array1<u16>>,
-        pattern_largest_edge: &Option<Array1<f32>>,
-        star_table_flat: &[CatalogStar],
+        pattern_key_hashes: &Option<Vec<u16>>,
+        pattern_largest_edge: &Option<Vec<f32>>,
+        star_vectors: &[[f64; 3]],
         linear_probe: bool,
         sp_hash_match_inds: &mut Vec<usize>,
         out_edges: &mut Vec<[f64; 6]>,
@@ -1390,9 +1419,10 @@ impl Solver {
         if let (Some(largest_edges), Some(f_est), Some(f_err)) =
             (pattern_largest_edge, fov_estimate, fov_max_error)
         {
+            let fov_factor = f_est * 0.001 * inv_largest_edge;
             sp_hash_match_inds.retain(|&idx| {
                 let cat_largest_edge = largest_edges[idx] as f64;
-                let fov2 = cat_largest_edge / image_pattern_largest_edge * f_est / 1000.0;
+                let fov2 = cat_largest_edge * fov_factor;
                 (fov2 - f_est).abs() < f_err
             });
         }
@@ -1412,8 +1442,8 @@ impl Solver {
             let vecs = &mut out_vectors[out_idx];
             for i in 0..p_size {
                 let star_id = pattern_catalog_flat[row_start + i] as usize;
-                let v = star_table_flat[star_id].vec;
-                vecs[i] = [v[0] as f64, v[1] as f64, v[2] as f64];
+                let v = star_vectors[star_id];
+                vecs[i] = v;
             }
 
             let edges_vec = &mut out_edges[out_idx];
@@ -1511,7 +1541,7 @@ impl Solver {
 
         for node in &nearby_nodes {
             let star_idx = node.item as usize;
-            let vec = self.star_table_flat[star_idx].vec;
+            let vec = self.star_vectors[star_idx];
 
             let v0 =
                 r[(0, 0)] * vec[0] as f64 + r[(0, 1)] * vec[1] as f64 + r[(0, 2)] * vec[2] as f64;
@@ -1528,19 +1558,22 @@ impl Solver {
             }
         }
 
-        let image_centroids_undist = undistort_centroids(
+        let mut scratch_sp_image_centroids_undist = Vec::new();
+        undistort_centroids_inplace(
             image_centroids,
             height,
             width,
             solution.distortion.unwrap_or(0.0),
+            &mut scratch_sp_image_centroids_undist,
         );
+        let image_centroids_undist = &scratch_sp_image_centroids_undist;
 
         let mut sp_matched_stars = Vec::new();
         let mut sp_matches_scratch = Vec::new();
         let mut sp_matches1_scratch = Vec::new();
 
         find_centroid_matches_inplace(
-            &image_centroids_undist,
+            image_centroids_undist,
             num_extracted_stars,
             &valid_cat_centroids,
             valid_cat_centroids.len(),
@@ -1686,10 +1719,10 @@ impl Solver {
 
         let scratch = &mut self.scratch;
         let star_kd_tree = &self.star_kd_tree;
-        let star_table_flat = &self.star_table_flat;
+        let star_vectors = &self.star_vectors;
+        let star_metadata = &self.star_metadata;
         let pattern_catalog_flat = &self.pattern_catalog_flat;
         let pattern_key_hashes = &self.pattern_key_hashes;
-        let pattern_largest_edge = &self.pattern_largest_edge;
         let linear_probe = self.linear_probe;
 
         let n_inds = pattern_centroids_inds.len();
@@ -1707,6 +1740,7 @@ impl Solver {
         // Allocation-free native iteration mirroring breadth-first order
         // -------------------------------------------------------------
         let mut solver_idx = 0;
+        let p_bins_f64 = p_bins as f64;
         for l in 3..n_inds {
             for k in 2..l {
                 for j in 1..k {
@@ -1771,6 +1805,7 @@ impl Solver {
                         let edges = e;
 
                         let image_pattern_largest_edge = edges[5];
+                        let inv_largest_edge = 1.0 / image_pattern_largest_edge;
 
                         // Min/max edge ratio bounds
                         let mut key_space_min = [0; 5];
@@ -1778,12 +1813,10 @@ impl Solver {
                         let mut target_keys = [0isize; 5];
 
                         for x in 0..5 {
-                            let ratio = edges[x] / image_pattern_largest_edge;
-                            key_space_min[x] =
-                                ((ratio - p_max_err).max(0.0) * p_bins as f64) as usize;
-                            key_space_max[x] =
-                                ((ratio + p_max_err).min(1.0) * p_bins as f64) as usize;
-                            target_keys[x] = (ratio * p_bins as f64) as isize;
+                            let ratio = edges[x] * inv_largest_edge;
+                            key_space_min[x] = ((ratio - p_max_err).max(0.0) * p_bins_f64) as usize;
+                            key_space_max[x] = ((ratio + p_max_err).min(1.0) * p_bins_f64) as usize;
+                            target_keys[x] = (ratio * p_bins_f64) as isize;
                         }
 
                         // Generate search space combinations via zero-allocation DFS (replaces Cartesian product)
@@ -1831,15 +1864,15 @@ impl Solver {
                             Self::get_all_patterns_for_index_inplace(
                                 pattern_key_hash,
                                 hash_index,
-                                image_pattern_largest_edge,
+                                inv_largest_edge,
                                 options.fov_estimate.map(|x| x.to_radians()),
                                 options.fov_max_error.map(|x| x.to_radians()),
                                 pattern_catalog_flat,
                                 &self.probe_table,
                                 p_size,
                                 pattern_key_hashes,
-                                pattern_largest_edge,
-                                star_table_flat,
+                                &self.pattern_largest_edge,
+                                &self.star_vectors,
                                 linear_probe,
                                 &mut scratch.sp_hash_match_inds,
                                 &mut scratch.sp_cat_edges_list,
@@ -2011,7 +2044,8 @@ impl Solver {
                                 if let Some(solution) = verify_and_build_solution(
                                     scratch,
                                     star_kd_tree,
-                                    star_table_flat,
+                                    star_vectors,
+                                    star_metadata,
                                     &self.star_catalog_ids,
                                     &self.db_props,
                                     self.num_patterns,
