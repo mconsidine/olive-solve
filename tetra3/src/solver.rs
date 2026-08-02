@@ -888,7 +888,7 @@ fn separation_for_density(fov: f64, stars_per_fov: f64) -> f64 {
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub struct Scratchpads {
-    pub sp_pattern_key_list: Vec<(usize, [usize; 5])>,
+    pub sp_pattern_key_list: Vec<u64>,
 
     // Core matching scratchpads
     pub sp_image_centroids_undist: Vec<[f64; 2]>,
@@ -977,10 +977,10 @@ pub struct Solver {
     pub star_vectors: Vec<[f64; 3]>,
     pub star_metadata: Vec<StarMetadata>,
     pub pattern_catalog_flat: Vec<u32>,
-    pub probe_table: Vec<u32>,
+    pub probe_table: Vec<u16>,
     pub star_kd_tree: ImmutableKdTree<f64, 3>,
     pub pattern_largest_edge: Option<Vec<f32>>,
-    pub pattern_key_hashes: Option<Vec<u16>>,
+    pub has_pattern_key_hashes: bool,
     pub star_catalog_ids: Option<Array2<u32>>,
     pub db_props: HashMap<String, f64>,
     pub num_patterns: usize,
@@ -1168,10 +1168,14 @@ impl Solver {
                 && pattern_catalog_flat[row_start + 2] == 0
                 && pattern_catalog_flat[row_start + 3] == 0
             {
-                probe_table.push(u32::MAX);
+                probe_table.push(u16::MAX);
             } else {
                 if has_pattern_key_hashes {
-                    probe_table.push(hashes_ref.unwrap()[i] as u32);
+                    let mut h = hashes_ref.unwrap()[i];
+                    if h == u16::MAX {
+                        h = u16::MAX - 1;
+                    }
+                    probe_table.push(h);
                 } else {
                     probe_table.push(0);
                 }
@@ -1300,7 +1304,7 @@ impl Solver {
             probe_table,
             star_kd_tree,
             pattern_largest_edge,
-            pattern_key_hashes,
+            has_pattern_key_hashes,
             star_catalog_ids,
             db_props,
             num_patterns,
@@ -1337,8 +1341,29 @@ impl Solver {
         }
     }
 
+    #[inline(always)]
+    fn encode_pattern_key(dist: usize, k: [usize; 5]) -> u64 {
+        ((dist as u64) << 40)
+            | ((k[4] as u64) << 32)
+            | ((k[3] as u64) << 24)
+            | ((k[2] as u64) << 16)
+            | ((k[1] as u64) << 8)
+            | (k[0] as u64)
+    }
+
+    #[inline(always)]
+    fn decode_pattern_key(val: u64) -> [usize; 5] {
+        [
+            (val & 0xff) as usize,
+            ((val >> 8) & 0xff) as usize,
+            ((val >> 16) & 0xff) as usize,
+            ((val >> 24) & 0xff) as usize,
+            ((val >> 32) & 0xff) as usize,
+        ]
+    }
+
     fn get_table_indices_from_hash_inplace(
-        probe_table: &[u32],
+        probe_table: &[u16],
         hash_index: u64,
         linear_probe: bool,
         has_hashes: bool,
@@ -1352,10 +1377,10 @@ impl Solver {
         if linear_probe {
             loop {
                 let probe_val = probe_table[i];
-                if probe_val == u32::MAX {
+                if probe_val == u16::MAX {
                     break;
                 }
-                if !has_hashes || probe_val == key_hash16 as u32 {
+                if !has_hashes || probe_val == key_hash16 {
                     out_found.push(i);
                 }
                 i += 1;
@@ -1367,10 +1392,10 @@ impl Solver {
             let mut step = 1;
             loop {
                 let probe_val = probe_table[i];
-                if probe_val == u32::MAX {
+                if probe_val == u16::MAX {
                     break;
                 }
-                if !has_hashes || probe_val == key_hash16 as u32 {
+                if !has_hashes || probe_val == key_hash16 {
                     out_found.push(i);
                 }
                 i += step;
@@ -1389,9 +1414,9 @@ impl Solver {
         fov_estimate: Option<f64>,
         fov_max_error: Option<f64>,
         pattern_catalog_flat: &[u32],
-        probe_table: &[u32],
+        probe_table: &[u16],
         p_size: usize,
-        pattern_key_hashes: &Option<Vec<u16>>,
+        has_pattern_key_hashes: bool,
         pattern_largest_edge: &Option<Vec<f32>>,
         star_vectors: &[[f64; 3]],
         linear_probe: bool,
@@ -1399,14 +1424,16 @@ impl Solver {
         out_edges: &mut Vec<[f64; 6]>,
         out_vectors: &mut Vec<[[f64; 3]; 4]>,
     ) {
-        let has_hashes = pattern_key_hashes.is_some();
-        let key_hash16 = (pattern_key_hash & 0xffff) as u16;
+        let mut key_hash16 = (pattern_key_hash & 0xffff) as u16;
+        if key_hash16 == u16::MAX {
+            key_hash16 = u16::MAX - 1;
+        }
 
         Self::get_table_indices_from_hash_inplace(
             probe_table,
             hash_index,
             linear_probe,
-            has_hashes,
+            has_pattern_key_hashes,
             key_hash16,
             sp_hash_match_inds,
         );
@@ -1692,37 +1719,20 @@ impl Solver {
         let image_centroids_vectors =
             compute_vectors_flat(&image_centroids_undist, height, width, fov_initial);
 
-        // OPTIMIZATION: Precompute pairwise distance angles exactly once.
-        // Drops 6 sqrt and 6 asin operations per iteration inside the hot combinatorics loop.
+        // OPTIMIZATION: Lazy Angle Precomputation (Happy Path Optimization)
+        // We only compute distances on-demand and cache them. For successful solves
+        // this skips thousands of unnecessary sqrt/asin operations.
         let num_vecs = image_centroids_vectors.len();
         scratch.sp_precomputed_angles.clear();
         scratch
             .sp_precomputed_angles
-            .resize(num_vecs * num_vecs, 0.0);
-
-        // ONLY precompute for pairs that are actually combinations evaluated!
-        for i_idx in 0..pattern_centroids_inds.len() {
-            for j_idx in (i_idx + 1)..pattern_centroids_inds.len() {
-                let i = pattern_centroids_inds[i_idx];
-                let j = pattern_centroids_inds[j_idx];
-                let v_i = image_centroids_vectors[i];
-                let v_j = image_centroids_vectors[j];
-                let dist = ((v_i[0] - v_j[0]).powi(2)
-                    + (v_i[1] - v_j[1]).powi(2)
-                    + (v_i[2] - v_j[2]).powi(2))
-                .sqrt();
-                let ang = angle_from_distance(dist);
-                scratch.sp_precomputed_angles[i * num_vecs + j] = ang;
-                scratch.sp_precomputed_angles[j * num_vecs + i] = ang;
-            }
-        }
+            .resize(num_vecs * num_vecs, -1.0);
 
         let scratch = &mut self.scratch;
         let star_kd_tree = &self.star_kd_tree;
         let star_vectors = &self.star_vectors;
         let star_metadata = &self.star_metadata;
         let pattern_catalog_flat = &self.pattern_catalog_flat;
-        let pattern_key_hashes = &self.pattern_key_hashes;
         let linear_probe = self.linear_probe;
 
         let n_inds = pattern_centroids_inds.len();
@@ -1769,14 +1779,33 @@ impl Solver {
                         let p_k = pattern_centroids_inds[k];
                         let p_l = pattern_centroids_inds[l];
 
-                        // Fast direct memory lookups for pairwise distance angle metrics
+                        macro_rules! get_angle {
+                            ($p1:expr, $p2:expr) => {{
+                                let idx = $p1 * num_vecs + $p2;
+                                let mut ang = scratch.sp_precomputed_angles[idx];
+                                if ang < 0.0 {
+                                    let v_i = image_centroids_vectors[$p1];
+                                    let v_j = image_centroids_vectors[$p2];
+                                    let dist = ((v_i[0] - v_j[0]).powi(2)
+                                        + (v_i[1] - v_j[1]).powi(2)
+                                        + (v_i[2] - v_j[2]).powi(2))
+                                    .sqrt();
+                                    ang = angle_from_distance(dist);
+                                    scratch.sp_precomputed_angles[$p1 * num_vecs + $p2] = ang;
+                                    scratch.sp_precomputed_angles[$p2 * num_vecs + $p1] = ang;
+                                }
+                                ang
+                            }};
+                        }
+
+                        // Lazy lookup/compute for pairwise distance angle metrics
                         let edges = [
-                            scratch.sp_precomputed_angles[p_i * num_vecs + p_j],
-                            scratch.sp_precomputed_angles[p_i * num_vecs + p_k],
-                            scratch.sp_precomputed_angles[p_i * num_vecs + p_l],
-                            scratch.sp_precomputed_angles[p_j * num_vecs + p_k],
-                            scratch.sp_precomputed_angles[p_j * num_vecs + p_l],
-                            scratch.sp_precomputed_angles[p_k * num_vecs + p_l],
+                            get_angle!(p_i, p_j),
+                            get_angle!(p_i, p_k),
+                            get_angle!(p_i, p_l),
+                            get_angle!(p_j, p_k),
+                            get_angle!(p_j, p_l),
+                            get_angle!(p_k, p_l),
                         ];
 
                         // Fast 6-element sorting network
@@ -1837,9 +1866,12 @@ impl Solver {
                                         for k4 in key_space_min[4].max(k3)..=key_space_max[4] {
                                             let diff4 = k4 as isize - target_keys[4];
                                             let dist4 = dist3 + diff4 * diff4;
-                                            scratch
-                                                .sp_pattern_key_list
-                                                .push((dist4 as usize, [k0, k1, k2, k3, k4]));
+                                            scratch.sp_pattern_key_list.push(
+                                                Self::encode_pattern_key(
+                                                    dist4 as usize,
+                                                    [k0, k1, k2, k3, k4],
+                                                ),
+                                            );
                                         }
                                     }
                                 }
@@ -1847,12 +1879,13 @@ impl Solver {
                         }
 
                         // OPTIMIZATION: Sort by distance to center to search the most likely patterns first.
-                        scratch.sp_pattern_key_list.sort_unstable_by_key(|k| k.0);
+                        scratch.sp_pattern_key_list.sort_unstable();
 
                         let mut image_pattern_largest_distance = None;
 
                         for key_idx in 0..scratch.sp_pattern_key_list.len() {
-                            let pattern_key = scratch.sp_pattern_key_list[key_idx].1;
+                            let pattern_key =
+                                Self::decode_pattern_key(scratch.sp_pattern_key_list[key_idx]);
                             let pattern_key_hash =
                                 Self::compute_pattern_key_hash(&pattern_key, p_bins);
                             let hash_index = Self::pattern_key_hash_to_index(
@@ -1870,7 +1903,7 @@ impl Solver {
                                 pattern_catalog_flat,
                                 &self.probe_table,
                                 p_size,
-                                pattern_key_hashes,
+                                self.has_pattern_key_hashes,
                                 &self.pattern_largest_edge,
                                 &self.star_vectors,
                                 linear_probe,
