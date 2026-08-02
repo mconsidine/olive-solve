@@ -100,6 +100,38 @@ pub enum Crop {
     },
 }
 
+impl Crop {
+    /// Returns the crop bounds `(y_min, y_max, x_min, x_max)` for a given original image size.
+    pub fn bounds(&self, orig_width: usize, orig_height: usize) -> (usize, usize, usize, usize) {
+        match self {
+            Crop::Fraction(f) => {
+                let h = orig_height / f;
+                let w = orig_width / f;
+                let oy = (orig_height.saturating_sub(h)) / 2;
+                let ox = (orig_width.saturating_sub(w)) / 2;
+                (oy, oy + h, ox, ox + w)
+            }
+            Crop::Center { height, width } => {
+                let oy = (orig_height.saturating_sub(*height)) / 2;
+                let ox = (orig_width.saturating_sub(*width)) / 2;
+                (oy, oy + *height, ox, ox + *width)
+            }
+            Crop::Region {
+                height,
+                width,
+                offset_y,
+                offset_x,
+            } => {
+                let cy = (orig_height / 2) as isize;
+                let cx = (orig_width / 2) as isize;
+                let oy = (cy + offset_y - (*height as isize) / 2).max(0) as usize;
+                let ox = (cx + offset_x - (*width as isize) / 2).max(0) as usize;
+                (oy, oy + *height, ox, ox + *width)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub sigma: f32,

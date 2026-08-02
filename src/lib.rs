@@ -280,15 +280,15 @@ impl FusedSolver {
         options: SolveOptions,
         timestamp: Option<SystemTime>,
     ) -> Result<Solution, String> {
-        self.solve_from_centroids_batch(&[centroids.clone()], size, options, timestamp)
+        self.solve_from_centroids_batch(&[(centroids.clone(), None)], size, options, timestamp)
     }
 
     /// Attempts to solve from multiple centroid sets in order, stopping when a solution is found.
     /// Updates internal solve state only when a solution is found or all given centroid sets fail.
     pub fn solve_from_centroids_batch(
         &self,
-        centroids_batch: &[Array2<f64>],
-        size: (f64, f64),
+        centroids_batch: &[(Array2<f64>, Option<tetra3::extractor::Crop>)],
+        main_size: (f64, f64),
         options: SolveOptions,
         timestamp: Option<SystemTime>,
     ) -> Result<Solution, String> {
@@ -301,9 +301,82 @@ impl FusedSolver {
             .as_mut()
             .ok_or_else(|| "Solver is not initialized.".to_string())?;
 
-        for centroids in centroids_batch {
-            let solution = solver.solve(centroids, size, options.clone());
+        for (centroids, crop_opt) in centroids_batch {
+            let mut item_options = options.clone();
+            let mut item_size = main_size;
+            let mut offset_x = 0.0;
+            let mut offset_y = 0.0;
+
+            if let Some(crop) = crop_opt {
+                let (y_min, y_max, x_min, x_max) =
+                    crop.bounds(main_size.1 as usize, main_size.0 as usize);
+                item_size = ((y_max - y_min) as f64, (x_max - x_min) as f64);
+                offset_y = y_min as f64;
+                offset_x = x_min as f64;
+                if let Some(fov) = item_options.fov_estimate {
+                    // Calculate mathematically exact FOV based on gnomonic projection
+                    let fov_rad = fov.to_radians();
+                    let f = main_size.1 / (2.0 * (fov_rad / 2.0).tan());
+                    let fov_crop_rad = 2.0 * ((item_size.1 / 2.0) / f).atan();
+                    item_options.fov_estimate = Some(fov_crop_rad.to_degrees());
+                }
+
+                // Always allow out of bounds targets for crops, as a target on the main
+                // image might naturally fall outside the crop's boundaries.
+                item_options.allow_out_of_bounds_target_pixel = Some(true);
+            }
+
+            // Adjust target_pixel for the crop offset
+            if let Some(tp) = &mut item_options.target_pixel {
+                for i in 0..tp.nrows() {
+                    tp[[i, 0]] -= offset_y;
+                    tp[[i, 1]] -= offset_x;
+                }
+            }
+
+            // Shift centroids to crop origin
+            let mut item_centroids = centroids.clone();
+            if offset_y != 0.0 || offset_x != 0.0 {
+                for i in 0..item_centroids.nrows() {
+                    item_centroids[[i, 0]] -= offset_y;
+                    item_centroids[[i, 1]] -= offset_x;
+                }
+            }
+
+            let mut solution = solver.solve(&item_centroids, item_size, item_options);
             let found = solution.status == SolveStatus::MatchFound;
+
+            if found {
+                // Project target pixel coordinates back to the main image
+                if let Some(ref mut target_y) = solution.target_y {
+                    for y in target_y.iter_mut().flatten() {
+                        *y += offset_y;
+                    }
+                }
+                if let Some(ref mut target_x) = solution.target_x {
+                    for x in target_x.iter_mut().flatten() {
+                        *x += offset_x;
+                    }
+                }
+
+                // If the client wants strict bounds checking against the main image size, enforce it
+                if crop_opt.is_some() && !options.allow_out_of_bounds_target_pixel.unwrap_or(false)
+                {
+                    if let (Some(ref mut target_y), Some(ref mut target_x)) =
+                        (&mut solution.target_y, &mut solution.target_x)
+                    {
+                        for (y, x) in target_y.iter_mut().zip(target_x.iter_mut()) {
+                            if let (Some(vy), Some(vx)) = (*y, *x) {
+                                if vy < 0.0 || vx < 0.0 || vy >= main_size.0 || vx >= main_size.1 {
+                                    *y = None;
+                                    *x = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             last_solution = Some(solution);
 
             if found {
@@ -404,18 +477,21 @@ impl FusedSolver {
         S: Data<Elem = T>,
         T: FastPixel,
     {
-        let extract_result = self.extract_fast(image, extract_options)?;
+        let extract_result = self.extract_fast(image, extract_options.clone())?;
 
         let mut centroid_arrays = Vec::new();
 
-        if let Some(crops) = extract_result.virtual_crop_centroids {
-            for crop in crops {
-                let mut crop_arr = Array2::zeros((crop.len(), 2));
-                for (i, c) in crop.iter().enumerate() {
+        if let (Some(vc), Some(crops)) = (
+            &extract_result.virtual_crop_centroids,
+            &extract_options.virtual_crops,
+        ) {
+            for (crop_cents, crop_def) in vc.iter().zip(crops.iter()) {
+                let mut crop_arr = Array2::zeros((crop_cents.len(), 2));
+                for (i, c) in crop_cents.iter().enumerate() {
                     crop_arr[[i, 0]] = c.y;
                     crop_arr[[i, 1]] = c.x;
                 }
-                centroid_arrays.push(crop_arr);
+                centroid_arrays.push((crop_arr, Some(crop_def.clone())));
             }
         }
 
@@ -424,7 +500,7 @@ impl FusedSolver {
             base_arr[[i, 0]] = c.y;
             base_arr[[i, 1]] = c.x;
         }
-        centroid_arrays.push(base_arr);
+        centroid_arrays.push((base_arr, None));
 
         let (height, width) = image.dim();
         self.solve_from_centroids_batch(
@@ -958,5 +1034,159 @@ mod tests {
 
         // Resetting calibration should also safely do nothing
         fs.reset_calibration();
+    }
+
+    #[test]
+    fn test_virtual_crops_batch_solve() {
+        use crate::FusedSolver;
+        use std::fs::File;
+        use std::path::Path;
+        use tetra3::{SolveStatus, Solver, extractor::Crop};
+        use zip::ZipArchive;
+
+        let db_path = Path::new("tetra3/tests/fixtures/default_database.npz");
+        let zip_path = Path::new("tetra3/tests/fixtures/solver_fixtures.zip");
+
+        if !db_path.exists() {
+            eprintln!("Skipping test: default_database.npz not found.");
+            return;
+        }
+        if !zip_path.exists() {
+            panic!(
+                "Fixture zip not found! Run `cargo test generate_test_fixtures --release -- --ignored` first."
+            );
+        }
+
+        let _solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+        // We wrap it in a FusedSolver
+        let fs = FusedSolver::new(db_path, None, None).unwrap();
+        // FusedSolver::new already loaded the DB, so we don't need to overwrite it, but we can if we want.
+        // *fs.solver.write().unwrap() = Some(solver);
+
+        let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
+        let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
+
+        // Read Input DTO
+        let input_filename = format!("input_1.json");
+        let mut input_buffer = Vec::new();
+        {
+            use std::io::Read;
+            let mut req_file = archive.by_name(&input_filename).unwrap();
+            req_file.read_to_end(&mut input_buffer).unwrap();
+        }
+
+        // Use a generic JSON value so we don't have to duplicate the DTO structs from validate_solver.rs
+        let input_dto: serde_json::Value = serde_json::from_slice(&input_buffer).unwrap();
+
+        let centroids = input_dto["centroids"].as_array().unwrap();
+        let image_height = input_dto["image_height"].as_f64().unwrap();
+        let image_width = input_dto["image_width"].as_f64().unwrap();
+
+        let mut flat_cents = Vec::with_capacity(centroids.len() * 2);
+        for c in centroids {
+            let arr = c.as_array().unwrap();
+            flat_cents.push(arr[0].as_f64().unwrap());
+            flat_cents.push(arr[1].as_f64().unwrap());
+        }
+        let centroids_array =
+            ndarray::Array2::from_shape_vec((centroids.len(), 2), flat_cents).unwrap();
+
+        // To make the comparison identical, let's treat the "full image" as being larger,
+        // and the "crop" as being the exact 512x512 region at offset (100, 100).
+        let offset_y = 100.0;
+        let offset_x = 100.0;
+        let main_h = image_height + 200.0;
+        let main_w = image_width + 200.0;
+        let main_size = (main_h, main_w);
+
+        let mut full_centroids = centroids_array.clone();
+        for i in 0..full_centroids.nrows() {
+            full_centroids[[i, 0]] += offset_y;
+            full_centroids[[i, 1]] += offset_x;
+        }
+
+        // 1. Solve on the original FULL image blindly so it deduces its own true FOV and center
+        let mut base_options = tetra3::solver::SolveOptions::default();
+        base_options.fov_estimate = None;
+
+        let result_init = fs
+            .solve_from_centroids(&full_centroids, main_size, base_options.clone(), None)
+            .unwrap();
+        assert_eq!(result_init.status, SolveStatus::MatchFound);
+
+        let ra = result_init.ra.unwrap();
+        let dec = result_init.dec.unwrap();
+
+        // Choose a target coordinate ~8 degrees away in Dec
+        let target_dec = dec + 8.0;
+        let target_ra = ra;
+
+        let mut target_sky_coord = ndarray::Array2::<f64>::zeros((1, 2));
+        target_sky_coord[[0, 0]] = target_ra;
+        target_sky_coord[[0, 1]] = target_dec;
+        base_options.target_sky_coord = Some(target_sky_coord);
+        base_options.allow_out_of_bounds_target_pixel = Some(true);
+
+        // Re-solve the full image with the target pixel so we have a baseline to compare against
+        let result = fs
+            .solve_from_centroids(&full_centroids, main_size, base_options.clone(), None)
+            .unwrap();
+
+        // 2. Pretend our centroids are actually from a virtual crop (e.g., offset by 100 pixels in X and Y)
+        // Crop bounds. Crop::Region uses absolute coordinates in the main image.
+        let crop_def = Crop::Region {
+            height: image_height as usize,
+            width: image_width as usize,
+            offset_y: offset_y as isize,
+            offset_x: offset_x as isize,
+        };
+
+        // Run the batch solver.
+        // We will pass the crop! For a virtual crop, the engine passes the points in FULL coordinates!
+        // Wait, does the batch solver expect full coordinates or cropped coordinates?
+        // Let's check `olive-engine/src/engine.rs`: engine extracts crops, and the points are in the FULL image coordinate system.
+        // And then in `solve_from_centroids_batch`, it shifts them: `item_centroids[[i, 0]] -= offset_y`.
+        // So we just pass `full_centroids` to the batch solver!
+        let batch = vec![(full_centroids, Some(crop_def))];
+
+        // We expect the solver to find a match, AND correctly calculate target_y and target_x
+        // because it overrides allow_out_of_bounds_target_pixel to true for crops!
+        let crop_result = fs
+            .solve_from_centroids_batch(&batch, main_size, base_options.clone(), None)
+            .unwrap();
+
+        assert_eq!(crop_result.status, SolveStatus::MatchFound);
+
+        let x = crop_result.target_x.as_ref().unwrap()[0];
+        let y = crop_result.target_y.as_ref().unwrap()[0];
+
+        assert!(x.is_some());
+        assert!(y.is_some());
+
+        let x_val = x.unwrap();
+        let y_val = y.unwrap();
+
+        let base_x = result.target_x.as_ref().unwrap()[0].unwrap();
+        let base_y = result.target_y.as_ref().unwrap()[0].unwrap();
+
+        // Assert the target pixel from the crop solve correctly projected to the exact same place
+        // on the main image coordinates as if it were solved natively on the main image.
+        // Due to scaling and polynomial distortion differences between solving a 712x712 image vs a 512x512 image,
+        // there is a tiny sub-pixel numerical difference over long projections (8 degrees away). We allow a 2.0px epsilon.
+        let epsilon = 2.0;
+
+        assert!(
+            (x_val - base_x).abs() < epsilon,
+            "Target X mismatched: crop={}, base={}",
+            x_val,
+            base_x
+        );
+        assert!(
+            (y_val - base_y).abs() < epsilon,
+            "Target Y mismatched: crop={}, base={}",
+            y_val,
+            base_y
+        );
     }
 }

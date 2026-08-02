@@ -405,32 +405,7 @@ impl FastExtractor {
         let virtual_crop_centroids = if let Some(crops) = &self.options.virtual_crops {
             let mut crop_results = Vec::with_capacity(crops.len());
             for crop in crops {
-                let (y_min, y_max, x_min, x_max) = match crop {
-                    crate::extractor::Crop::Fraction(f) => {
-                        let h = self.orig_height / f;
-                        let w = self.orig_width / f;
-                        let oy = (self.orig_height.saturating_sub(h)) / 2;
-                        let ox = (self.orig_width.saturating_sub(w)) / 2;
-                        (oy, oy + h, ox, ox + w)
-                    }
-                    crate::extractor::Crop::Center { height, width } => {
-                        let oy = (self.orig_height.saturating_sub(*height)) / 2;
-                        let ox = (self.orig_width.saturating_sub(*width)) / 2;
-                        (oy, oy + *height, ox, ox + *width)
-                    }
-                    crate::extractor::Crop::Region {
-                        height,
-                        width,
-                        offset_y,
-                        offset_x,
-                    } => {
-                        let cy = (self.orig_height / 2) as isize;
-                        let cx = (self.orig_width / 2) as isize;
-                        let oy = (cy + offset_y - (*height as isize) / 2).max(0) as usize;
-                        let ox = (cx + offset_x - (*width as isize) / 2).max(0) as usize;
-                        (oy, oy + *height, ox, ox + *width)
-                    }
-                };
+                let (y_min, y_max, x_min, x_max) = crop.bounds(self.orig_width, self.orig_height);
 
                 let filtered: Vec<_> = centroids
                     .iter()

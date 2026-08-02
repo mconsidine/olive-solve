@@ -110,6 +110,7 @@ pub struct SolveOptions {
     pub return_rotation_matrix: bool,
     pub target_pixel: Option<Array2<f64>>,     // N x 2 (y, x)
     pub target_sky_coord: Option<Array2<f64>>, // N x 2 (ra, dec)
+    pub allow_out_of_bounds_target_pixel: Option<bool>,
 }
 
 impl Default for SolveOptions {
@@ -127,6 +128,7 @@ impl Default for SolveOptions {
             return_rotation_matrix: false,
             target_pixel: None,
             target_sky_coord: None,
+            allow_out_of_bounds_target_pixel: None,
         }
     }
 }
@@ -262,6 +264,7 @@ fn compute_centroids_inplace(
     out_centroids: &mut [[f64; 2]],
     out_kept: &mut Vec<usize>,
     len: usize,
+    filter_bounds: bool,
 ) {
     out_kept.clear();
     let scale_factor = -width / 2.0 / (fov / 2.0).tan();
@@ -269,13 +272,18 @@ fn compute_centroids_inplace(
     let img_center_x = width / 2.0;
 
     for i in 0..len {
-        let inv_v0 = 1.0 / vectors[i][0];
+        let v0 = vectors[i][0];
+        if v0 <= 0.0 {
+            // Point is behind the focal plane
+            continue;
+        }
+        let inv_v0 = 1.0 / v0;
         let cy = scale_factor * (vectors[i][2] * inv_v0) + img_center_y;
         let cx = scale_factor * (vectors[i][1] * inv_v0) + img_center_x;
         out_centroids[i][0] = cy;
         out_centroids[i][1] = cx;
 
-        if cy > 0.0 && cx > 0.0 && cy < height && cx < width {
+        if !filter_bounds || (cy > 0.0 && cx > 0.0 && cy < height && cx < width) {
             out_kept.push(i);
         }
     }
@@ -817,6 +825,7 @@ fn verify_and_build_solution(
             &mut target_centroids,
             &mut kept_sky,
             target_sky_vecs.len(),
+            !options.allow_out_of_bounds_target_pixel.unwrap_or(false),
         );
         if let Some(k) = k_final {
             for &k_idx in &kept_sky {

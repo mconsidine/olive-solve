@@ -37,3 +37,7 @@ lto = "fat"            # Enables Link-Time Optimization across all dependency cr
 codegen-units = 1      # Compiles the whole program as a single unit for max optimization
 panic = "abort"        # Removes stack-unwinding overhead
 strip = true           # Strips debug symbols to reduce binary size and memory layout
+
+[dev-dependencies]
+serde_json = "1.0.151"
+zip = "8.6.0"

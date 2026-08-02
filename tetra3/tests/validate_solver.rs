@@ -153,6 +153,7 @@ fn test_solver_consistency_with_testdata() {
             return_rotation_matrix: input_dto.options.return_rotation_matrix,
             target_pixel,
             target_sky_coord,
+            allow_out_of_bounds_target_pixel: None,
         };
 
         // --- Capture the execution time ---
@@ -345,6 +346,7 @@ fn test_solver_mirrored_image() {
         return_rotation_matrix: input_dto.options.return_rotation_matrix,
         target_pixel,
         target_sky_coord: None,
+        allow_out_of_bounds_target_pixel: None,
     };
 
     let result = solver.solve(
@@ -436,6 +438,7 @@ fn test_true_matches_consistency() {
             return_rotation_matrix: true,
             target_pixel: None,
             target_sky_coord: None,
+            allow_out_of_bounds_target_pixel: None,
         };
 
         let result = solver.solve(
@@ -462,4 +465,126 @@ fn test_true_matches_consistency() {
             );
         }
     }
+}
+
+#[test]
+fn test_out_of_bounds_target_pixel() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+
+    if !db_path.exists() {
+        eprintln!("Skipping test: default_database.npz not found.");
+        return;
+    }
+    if !zip_path.exists() {
+        panic!(
+            "Fixture zip not found! Run `cargo test generate_test_fixtures --release -- --ignored` first."
+        );
+    }
+
+    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+    let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
+    let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
+
+    // Test first sample
+    let input_filename = format!("input_1.json");
+    let mut input_buffer = Vec::new();
+    {
+        let mut req_file = archive.by_name(&input_filename).unwrap();
+        req_file.read_to_end(&mut input_buffer).unwrap();
+    }
+    let input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+    let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+    for c in &input_dto.centroids {
+        flat_cents.push(c[0]);
+        flat_cents.push(c[1]);
+    }
+    let centroids_array =
+        Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+    // Create a target sky coordinate that maps to a point far outside the image bounds.
+    // Instead of computing it manually, we can just assign a target sky coordinate
+    // that is opposite to the center RA/Dec.
+    // Actually, to make it realistic, let's solve first without targets to get the RA/Dec.
+
+    let base_options = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        fov_max_error: input_dto.options.fov_max_error,
+        match_radius: input_dto.options.match_radius,
+        match_threshold: input_dto.options.match_threshold,
+        solve_timeout_ms: input_dto.options.solve_timeout_ms,
+        distortion: input_dto.options.distortion,
+        match_max_error: input_dto.options.match_max_error,
+        return_matches: false,
+        return_catalog: false,
+        return_rotation_matrix: true,
+        ..Default::default()
+    };
+
+    let result = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        base_options.clone(),
+    );
+    assert_eq!(result.status, SolveStatus::MatchFound);
+
+    let ra = result.ra.unwrap();
+    let dec = result.dec.unwrap();
+
+    // Choose a target coordinate ~8 degrees away in Dec (image FOV is typically ~12 degrees, so edge is ~6 deg away)
+    let target_dec = dec + 8.0;
+    let target_ra = ra;
+
+    let mut target_sky_coord = Array2::<f64>::zeros((1, 2));
+    target_sky_coord[[0, 0]] = target_ra;
+    target_sky_coord[[0, 1]] = target_dec;
+
+    // Test with allow_out_of_bounds_target_pixel = false (or None)
+    let mut options_strict = base_options.clone();
+    options_strict.target_sky_coord = Some(target_sky_coord.clone());
+    options_strict.allow_out_of_bounds_target_pixel = Some(false);
+
+    let result_strict = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options_strict,
+    );
+    assert_eq!(result_strict.status, SolveStatus::MatchFound);
+    assert_eq!(result_strict.target_x.unwrap()[0], None);
+    assert_eq!(result_strict.target_y.unwrap()[0], None);
+
+    // Test with allow_out_of_bounds_target_pixel = true
+    let mut options_allow = base_options.clone();
+    options_allow.target_sky_coord = Some(target_sky_coord.clone());
+    options_allow.allow_out_of_bounds_target_pixel = Some(true);
+
+    let result_allow = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options_allow,
+    );
+    assert_eq!(result_allow.status, SolveStatus::MatchFound);
+    let x = result_allow.target_x.unwrap()[0];
+    let y = result_allow.target_y.unwrap()[0];
+
+    assert!(x.is_some());
+    assert!(y.is_some());
+
+    let x_val = x.unwrap();
+    let y_val = y.unwrap();
+
+    // Ensure the returned pixel is indeed out of bounds
+    assert!(
+        x_val < 0.0
+            || x_val > input_dto.image_width
+            || y_val < 0.0
+            || y_val > input_dto.image_height,
+        "Target pixel was not actually out of bounds: x={}, y={}, w={}, h={}",
+        x_val,
+        y_val,
+        input_dto.image_width,
+        input_dto.image_height
+    );
 }

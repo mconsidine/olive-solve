@@ -4,9 +4,9 @@
 use crate::extractor::{BgSubMode, Crop, ExtractOptions, SigmaMode};
 use crate::fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastSigmaMode};
 use crate::solver::{Solution, SolveOptions};
+use numpy::PyArrayMethods;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use numpy::PyArrayMethods;
 
 /// Converts a slice of standard extractor `CentroidResult`s into an `N x 2` NumPy array `(y, x)`.
 pub fn centroids_to_numpy<'py>(
@@ -319,7 +319,11 @@ impl SolveOptions {
 impl Solution {
     /// Serializes the solver `Solution` into a standard Python dictionary.
     /// Includes coordinate properties, matches, and timing metrics.
-    pub fn to_dict<'py>(&self, py: Python<'py>, ext_time: Option<f64>) -> PyResult<Bound<'py, PyDict>> {
+    pub fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        ext_time: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let out_dict = PyDict::new(py);
 
         out_dict.set_item("RA", self.ra)?;
@@ -371,9 +375,9 @@ impl Solution {
         }
 
         if let Some(ref rm) = self.rotation_matrix {
-            let flat_slice = rm
-                .as_slice()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Matrix not contiguous"))?;
+            let flat_slice = rm.as_slice().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Matrix not contiguous")
+            })?;
             let py_matrix = numpy::PyArray1::from_slice(py, flat_slice)
                 .reshape([3, 3])
                 .unwrap();

@@ -210,12 +210,11 @@ impl PyFusedSolver {
 
         let cents_views: Vec<ndarray::ArrayView2<f64>> =
             centroids_list.iter().map(|c| c.as_array()).collect();
-        // FusedSolver solve_from_centroids_batch takes &[Array2<f64>], not &[ArrayView2<f64>]!
-        let cents_owned: Vec<ndarray::Array2<f64>> =
-            cents_views.iter().map(|v| v.to_owned()).collect();
+        let batch: Vec<(ndarray::Array2<f64>, Option<tetra3::extractor::Crop>)> =
+            cents_views.iter().map(|v| (v.to_owned(), None)).collect();
         let solution = self
             .inner
-            .solve_from_centroids_batch(&cents_owned, size, solve_options, None)
+            .solve_from_centroids_batch(&batch, size, solve_options, None)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         solution.to_dict(py, None)
     }
