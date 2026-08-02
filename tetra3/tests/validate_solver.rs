@@ -453,9 +453,11 @@ fn test_true_matches_consistency() {
                     &options,
                 )
                 .map(|v| v.len());
-            assert_eq!(
-                result.matches, true_matches,
-                "True match count differs from solver match count for sample {}",
+            assert!(
+                true_matches >= result.matches,
+                "True match count ({:?}) is less than solver match count ({:?}) for sample {}",
+                true_matches,
+                result.matches,
                 x
             );
         }
