@@ -69,27 +69,27 @@ mod hardware {
             let mut frames = Vec::new();
             let mut buf = [0_u8; FIFO_ACCEL_GYRO_FRAME_BYTES];
 
-            // Read all pending frames from the FIFO
-            while let Ok(diagnostics) = self.mpu.read_fifo_bytes_with_diagnostics(&mut buf) {
-                if diagnostics.fifo_count_before_bytes < FIFO_ACCEL_GYRO_FRAME_BYTES as u16 {
-                    break;
+            let fifo_count = self.mpu.fifo_count().unwrap_or(0);
+            let frames_to_read = fifo_count / (FIFO_ACCEL_GYRO_FRAME_BYTES as u16);
+
+            // Read only complete frames
+            for _ in 0..frames_to_read {
+                if self.mpu.read_fifo_bytes(&mut buf).is_ok() {
+                    // Decode raw gyro. Note: Buf structure for MPU6050 FIFO:
+                    // [Accel X, Accel Y, Accel Z, Gyro X, Gyro Y, Gyro Z]
+                    // Each is 2 bytes (Big Endian)
+                    let gx = i16::from_be_bytes([buf[6], buf[7]]) as f64;
+                    let gy = i16::from_be_bytes([buf[8], buf[9]]) as f64;
+                    let gz = i16::from_be_bytes([buf[10], buf[11]]) as f64;
+
+                    // Convert to rad/sec based on 2000 dps scale (Scale factor: 16.4 LSB/dps)
+                    let scale = 16.4;
+                    let deg2rad = std::f64::consts::PI / 180.0;
+                    let wx = (gx / scale) * deg2rad;
+                    let wy = (gy / scale) * deg2rad;
+                    let wz = (gz / scale) * deg2rad;
+                    frames.push(Vector3::new(wx, wy, wz));
                 }
-
-                // Decode raw gyro. Note: Buf structure for MPU6050 FIFO:
-                // [Accel X, Accel Y, Accel Z, Temp, Gyro X, Gyro Y, Gyro Z]
-                // Each is 2 bytes (Big Endian)
-                let gx = i16::from_be_bytes([buf[8], buf[9]]) as f64;
-                let gy = i16::from_be_bytes([buf[10], buf[11]]) as f64;
-                let gz = i16::from_be_bytes([buf[12], buf[13]]) as f64;
-
-                // Convert to rad/sec based on 2000 dps scale (Scale factor: 16.4 LSB/dps)
-                let scale = 16.4;
-                let deg2rad = std::f64::consts::PI / 180.0;
-                let wx = (gx / scale) * deg2rad;
-                let wy = (gy / scale) * deg2rad;
-                let wz = (gz / scale) * deg2rad;
-
-                frames.push(Vector3::new(wx, wy, wz));
             }
 
             let len = frames.len();
@@ -134,6 +134,10 @@ mod hardware {
                 .reset_fifo()
                 .map_err(|e| format!("Failed to reset FIFO: {:?}", e))?;
             Ok(())
+        }
+
+        fn needs_seeding(&self) -> bool {
+            true
         }
     }
 }

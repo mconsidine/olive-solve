@@ -133,11 +133,19 @@ pub trait ImuDevice: Send + 'static {
     fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String>;
     /// Attempts to soft-reset or revive an unresponsive device.
     fn revive(&mut self) -> Result<(), String>;
+    /// Reports if the IMU needs to seed the bias_offset value prior to calibration.
+    /// Some sensors have large stationary biases greater than our movement threshold. The
+    /// disadvantage of seeding is that if the sensor boots while moving the seeded value will
+    /// spoil the algorithm.
+    fn needs_seeding(&self) -> bool {
+        false
+    }
 }
 
 struct CalibrationState {
     pub total_samples: usize,
     pub bias_offset: Vector3<f64>,
+    pub is_seeded: bool,
 }
 
 impl Default for CalibrationState {
@@ -145,6 +153,7 @@ impl Default for CalibrationState {
         Self {
             total_samples: 0,
             bias_offset: Vector3::zeros(),
+            is_seeded: false,
         }
     }
 }
@@ -251,7 +260,17 @@ impl Imu {
                         for (raw_gyro, hw_dt) in readings {
                             // Calculate bias and magnitude
                             let bias = {
-                                let cal = calibration_clone.lock().unwrap();
+                                let mut cal = calibration_clone.lock().unwrap();
+
+                                // Ensure that a baseline reading is seeded if necessary
+                                if !cal.is_seeded {
+                                    if device.needs_seeding() {
+                                        cal.bias_offset = raw_gyro;
+                                        info!("Seeded initial IMU bias: {:?}", raw_gyro);
+                                    }
+                                    cal.is_seeded = true;
+                                }
+
                                 cal.bias_offset
                             };
 
@@ -376,6 +395,7 @@ impl Imu {
         let mut cal = self.calibration.lock().unwrap();
         cal.total_samples = 0;
         cal.bias_offset = Vector3::zeros();
+        cal.is_seeded = false;
         info!("Reset IMU bias calibration baseline.");
     }
 

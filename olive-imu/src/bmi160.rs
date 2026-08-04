@@ -21,8 +21,27 @@ mod hardware {
                 "Initializing BMI160 hardware over I2C at address 0x{:X}...",
                 address_u8
             );
-            let i2c =
+            let mut i2c =
                 I2cdev::new("/dev/i2c-1").map_err(|e| format!("I2cdev::new failed: {:?}", e))?;
+
+            // 1. Primary Check: BMI160 Chip ID
+            use embedded_hal::i2c::I2c;
+            let mut chip_id = [0u8; 1];
+            if i2c.write_read(address_u8, &[0x00], &mut chip_id).is_err() || chip_id[0] != 0xD1 {
+                return Err(format!("BMI160 chip ID mismatch at 0x{:X}", address_u8));
+            }
+
+            // 2. Secondary Check: MPU WHO_AM_I elimination
+            let mut mpu_id = [0u8; 1];
+            if i2c.write_read(address_u8, &[0x75], &mut mpu_id).is_ok() {
+                // Reject if it identifies as an MPU
+                if matches!(mpu_id[0], 0x68 | 0x70 | 0x71 | 0x73 | 0x75) {
+                    return Err(
+                        "Sensor matches an MPU series identity, rejecting BMI160 initialization"
+                            .into(),
+                    );
+                }
+            }
             let address = if address_u8 == 0x69 {
                 SlaveAddr::Alternative(true)
             } else {
