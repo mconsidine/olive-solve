@@ -301,8 +301,16 @@ impl FusedSolver {
             .as_mut()
             .ok_or_else(|| "Solver is not initialized.".to_string())?;
 
+        let mut actual_options = options.clone();
+        if actual_options.target_pixel.is_none() {
+            actual_options.target_pixel = Some(
+                ndarray::Array2::from_shape_vec((1, 2), vec![main_size.0 / 2.0, main_size.1 / 2.0])
+                    .unwrap(),
+            );
+        }
+
         for (centroids, crop_opt) in centroids_batch {
-            let mut item_options = options.clone();
+            let mut item_options = actual_options.clone();
             let mut item_size = main_size;
             let mut offset_x = 0.0;
             let mut offset_y = 0.0;
