@@ -14,17 +14,19 @@ This project is not just a straight port of the upstream Python logic. It introd
 * **Fast Extractor Implementation**: Leverages aggressive pre-allocation and `rayon`-based multi-threading for increased performance across a subset of supported extraction modes.
 * **Sequential Fast Extractor**: An alternative sequential path that trades a negligible amount of accuracy for much faster single-threaded performance.
 * **Hybrid Background Subtraction Modes**: Includes custom `Line Median` and `Block Median` background subtraction modes. These act as high-performance compromises between the fast (but less accurate) `Global Median` and the highly accurate (but computationally expensive) `Local Median` modes. *Note: `Line Median` is specifically designed to excel at handling cameras that exhibit horizontal banding noise.*
+* **Virtual Crops**: Calculates the centroids for sections of an image in addition to the full image.
 
 ### Solver
 
 * **Database Support**: Supports both `tetra3` and `cedar-solve` database formats.
-* **Performance**: Blazingly fast single-threaded performance - centroids generated from clean images typically solve in under 1ms on a Raspberry Pi Zero 2W.
+* **Performance**: Blazingly fast single-threaded performance - centroids generated from clean images typically solve in under 0.25ms on a Raspberry Pi Zero 2W.
+* **Centroid Matcher**: Given a plate solution and a list of centroids, determines the valid set of centroids that match stars in the database.
 
 ### Olive IMU
 
 A robust integration framework for inertial measurement units.
 
-* **Supported Sensors**: Integration with the Bosch BMI160 and Ceva BNO085 sensors is included. The ImuDevice trait can be implemented for other sensors.
+* **Supported Sensors**: Integration with the Bosch BMI160, Ceva BNO055 and BNO085, and TDK InvenSense MPU series sensors is included. The ImuDevice trait can be implemented for other sensors.
 * **Real-time SVD Alignment**: Implements continuous Singular Value Decomposition to mathematically derive the optimal transformation matrix,
   keeping the camera and IMU reference frames synchronized.
 * **Continuous Bias Compensation**: Uses rolling variance windows and an exponential moving average to actively calculate and eliminate zero-

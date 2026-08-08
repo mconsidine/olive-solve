@@ -47,6 +47,8 @@ pub enum ImuType {
     Bno055,
     /// The BMI160 IMU over I2C
     Bmi160,
+    /// MPU9250/MPU9150/MPU6500/MPU6050/MPU6000 IMU over I2C
+    MpuXxxx,
     /// A custom mock or external IMU device
     Custom(Box<dyn ImuDevice + Send + Sync>),
 }
@@ -157,6 +159,10 @@ impl FusedSolver {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x69) {
                     Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x68) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x69) {
+                    Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("Auto mode could not find any supported IMU hardware.".into());
                 }
@@ -186,6 +192,15 @@ impl FusedSolver {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("BMI160 hardware not found on I2C bus.".into());
+                }
+            }
+            ImuType::MpuXxxx => {
+                if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x68) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x69) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else {
+                    return Err("MPU sensor hardware not found on I2C bus.".into());
                 }
             }
             ImuType::Custom(_) => {

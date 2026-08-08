@@ -1898,6 +1898,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpu6050-driver"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d75fdcda7660cc3a6ae92801faad4ef0cb7d8f833635ca189112af894cf52ffe"
+dependencies = [
+ "embedded-hal",
+ "libm",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2198,9 +2208,11 @@ dependencies = [
  "bmi160",
  "bno055",
  "bno080",
+ "embedded-hal",
  "env_logger 0.11.11",
  "linux-embedded-hal",
  "log",
+ "mpu6050-driver",
  "nalgebra 0.32.6",
  "pico-args",
  "tokio",

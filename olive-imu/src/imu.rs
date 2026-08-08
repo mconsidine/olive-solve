@@ -133,11 +133,21 @@ pub trait ImuDevice: Send + 'static {
     fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String>;
     /// Attempts to soft-reset or revive an unresponsive device.
     fn revive(&mut self) -> Result<(), String>;
+    /// Reports if the IMU needs to seed the bias_offset value prior to calibration.
+    /// Some sensors have large stationary biases greater than our movement threshold. For these
+    /// sensors a stable set of 100 samples is collected to generate the initial bias offset.
+    fn needs_seeding(&self) -> bool {
+        false
+    }
 }
 
 struct CalibrationState {
     pub total_samples: usize,
     pub bias_offset: Vector3<f64>,
+    pub is_seeded: bool,
+    pub seed_samples: usize,
+    pub seed_sum: Vector3<f64>,
+    pub last_seed_reading: Vector3<f64>,
 }
 
 impl Default for CalibrationState {
@@ -145,6 +155,10 @@ impl Default for CalibrationState {
         Self {
             total_samples: 0,
             bias_offset: Vector3::zeros(),
+            is_seeded: false,
+            seed_samples: 0,
+            seed_sum: Vector3::zeros(),
+            last_seed_reading: Vector3::zeros(),
         }
     }
 }
@@ -250,9 +264,55 @@ impl Imu {
 
                         for (raw_gyro, hw_dt) in readings {
                             // Calculate bias and magnitude
+                            let mut is_seeding_active = false;
                             let bias = {
-                                let cal = calibration_clone.lock().unwrap();
-                                cal.bias_offset
+                                let mut cal = calibration_clone.lock().unwrap();
+
+                                // Ensure that a baseline reading is seeded if necessary
+                                if !cal.is_seeded {
+                                    if device.needs_seeding() {
+                                        let seeding_threshold = 0.005; // rad/s max deviation
+
+                                        if cal.seed_samples == 0 {
+                                            cal.last_seed_reading = raw_gyro;
+                                            cal.seed_sum = raw_gyro;
+                                            cal.seed_samples = 1;
+                                        } else {
+                                            let dev = (raw_gyro - cal.last_seed_reading).norm();
+                                            if dev > seeding_threshold {
+                                                // Reset if deviation is too large (sensor is moving)
+                                                cal.seed_samples = 1;
+                                                cal.seed_sum = raw_gyro;
+                                                cal.last_seed_reading = raw_gyro;
+                                            } else {
+                                                cal.seed_sum += raw_gyro;
+                                                cal.seed_samples += 1;
+                                                cal.last_seed_reading = raw_gyro;
+
+                                                if cal.seed_samples >= 100 {
+                                                    cal.bias_offset = cal.seed_sum / 100.0;
+                                                    cal.is_seeded = true;
+                                                    info!(
+                                                        "Seeded initial IMU bias: {:?}",
+                                                        cal.bias_offset
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        if !cal.is_seeded {
+                                            is_seeding_active = true;
+                                            raw_gyro // Output raw_gyro as temporary bias so gyro_vec_rad is 0
+                                        } else {
+                                            cal.bias_offset
+                                        }
+                                    } else {
+                                        cal.is_seeded = true;
+                                        cal.bias_offset
+                                    }
+                                } else {
+                                    cal.bias_offset
+                                }
                             };
 
                             let gyro_vec_rad = raw_gyro - bias;
@@ -269,8 +329,9 @@ impl Imu {
 
                             prev_quat *= delta_q;
 
-                            let is_warming_up =
-                                boot_time.elapsed().unwrap_or_default() < warm_up_duration;
+                            let is_warming_up = boot_time.elapsed().unwrap_or_default()
+                                < warm_up_duration
+                                || is_seeding_active;
 
                             if gyro_mag > 0.05 {
                                 last_motion_time = now;
@@ -376,6 +437,10 @@ impl Imu {
         let mut cal = self.calibration.lock().unwrap();
         cal.total_samples = 0;
         cal.bias_offset = Vector3::zeros();
+        cal.is_seeded = false;
+        cal.seed_samples = 0;
+        cal.seed_sum = Vector3::zeros();
+        cal.last_seed_reading = Vector3::zeros();
         info!("Reset IMU bias calibration baseline.");
     }
 
