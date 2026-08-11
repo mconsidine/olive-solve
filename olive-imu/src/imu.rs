@@ -271,7 +271,7 @@ impl Imu {
                                 // Ensure that a baseline reading is seeded if necessary
                                 if !cal.is_seeded {
                                     if device.needs_seeding() {
-                                        let seeding_threshold = 0.005; // rad/s max deviation
+                                        let seeding_threshold = 0.05; // rad/s max deviation
 
                                         if cal.seed_samples == 0 {
                                             cal.last_seed_reading = raw_gyro;

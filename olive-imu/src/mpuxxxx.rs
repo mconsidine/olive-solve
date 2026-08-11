@@ -6,7 +6,7 @@ mod hardware {
     use crate::imu::ImuDevice;
     use linux_embedded_hal::I2cdev;
     use log::{info, warn};
-    use mpu6050_driver::{Address, Dlpf, FIFO_ACCEL_GYRO_FRAME_BYTES, GyroRange, Mpu6050};
+    use mpu6050_driver::{Address, Dlpf, GyroRange, Mpu6050};
     use nalgebra::Vector3;
     use std::time::{Duration, SystemTime};
 
@@ -40,16 +40,11 @@ mod hardware {
 
             // Configure Gyro range and Digital Low Pass Filter
             mpu.set_gyro_range(GyroRange::Dps2000).ok();
-            mpu.set_dlpf(Dlpf::Cfg1).ok(); // ~188Hz bandwidth
+            mpu.set_dlpf(Dlpf::Cfg3).ok(); // ~41Hz bandwidth
 
             // Configure sample rate divider for ~100Hz.
             // Cfg1 base rate is 1kHz. 1000 / (1 + 9) = 100Hz.
             mpu.set_sample_rate_divider(9).ok();
-
-            // Reset and enable FIFO for Gyro only
-            mpu.reset_fifo().ok();
-            mpu.enable_motion_fifo().ok();
-            mpu.enable_fifo().ok();
 
             Ok(Self {
                 mpu,
@@ -66,73 +61,50 @@ mod hardware {
 
         fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
             let mut readings = Vec::new();
-            let mut frames = Vec::new();
-            let mut buf = [0_u8; FIFO_ACCEL_GYRO_FRAME_BYTES];
 
-            let fifo_count = self.mpu.fifo_count().unwrap_or(0);
-            let frames_to_read = fifo_count / (FIFO_ACCEL_GYRO_FRAME_BYTES as u16);
+            // Real-time register read
+            let raw = match self.mpu.read_raw_accel_gyro_temp() {
+                Ok(data) => data,
+                Err(_) => return Ok(readings),
+            };
 
-            // Read only complete frames
-            for _ in 0..frames_to_read {
-                if self.mpu.read_fifo_bytes(&mut buf).is_ok() {
-                    // Decode raw gyro. Note: Buf structure for MPU6050 FIFO:
-                    // [Accel X, Accel Y, Accel Z, Gyro X, Gyro Y, Gyro Z]
-                    // Each is 2 bytes (Big Endian)
-                    let gx = i16::from_be_bytes([buf[6], buf[7]]) as f64;
-                    let gy = i16::from_be_bytes([buf[8], buf[9]]) as f64;
-                    let gz = i16::from_be_bytes([buf[10], buf[11]]) as f64;
-
-                    // Convert to rad/sec based on 2000 dps scale (Scale factor: 16.4 LSB/dps)
-                    let scale = 16.4;
-                    let deg2rad = std::f64::consts::PI / 180.0;
-                    let wx = (gx / scale) * deg2rad;
-                    let wy = (gy / scale) * deg2rad;
-                    let wz = (gz / scale) * deg2rad;
-                    frames.push(Vector3::new(wx, wy, wz));
-                }
-            }
-
-            let len = frames.len();
-            if len == 0 {
-                return Ok(readings);
-            }
-
-            // Back-date time logic, mirroring `bno085.rs`
             let now = SystemTime::now();
             let fallback_dt = (self.report_interval_ms as f64) / 1000.0;
 
-            for i in 0..len {
-                let steps_backward = (len - 1 - i) as u32;
-                let sample_time = now
-                    .checked_sub(Duration::from_secs_f64(
-                        fallback_dt * (steps_backward as f64),
-                    ))
-                    .unwrap_or(now);
+            let dt = if let Some(last) = self.last_system_time {
+                now.duration_since(last)
+                    .unwrap_or(Duration::from_secs_f64(fallback_dt))
+                    .as_secs_f64()
+            } else {
+                fallback_dt
+            };
 
-                let dt = if let Some(last) = self.last_system_time {
-                    sample_time
-                        .duration_since(last)
-                        .unwrap_or(Duration::from_secs_f64(fallback_dt))
-                        .as_secs_f64()
-                } else {
-                    fallback_dt
-                };
+            let safe_dt = if dt <= 0.0 { fallback_dt } else { dt };
+            self.last_system_time = Some(now);
 
-                let safe_dt = if dt <= 0.0 { fallback_dt } else { dt };
+            // Convert to rad/sec based on 2000 dps scale (Scale factor: 16.4 LSB/dps)
+            let scale = 16.4;
+            let deg2rad = std::f64::consts::PI / 180.0;
+            let wx = (raw.gyro[0] as f64 / scale) * deg2rad;
+            let wy = (raw.gyro[1] as f64 / scale) * deg2rad;
+            let wz = (raw.gyro[2] as f64 / scale) * deg2rad;
 
-                self.last_system_time = Some(sample_time);
-
-                readings.push((frames[i], safe_dt));
-            }
+            readings.push((Vector3::new(wx, wy, wz), safe_dt));
 
             Ok(readings)
         }
 
         fn revive(&mut self) -> Result<(), String> {
-            warn!("Sensor unresponsive. Resetting hardware FIFO...");
+            warn!("Sensor unresponsive. Resetting hardware...");
             self.mpu
-                .reset_fifo()
-                .map_err(|e| format!("Failed to reset FIFO: {:?}", e))?;
+                .reset()
+                .map_err(|e| format!("Failed to reset: {:?}", e))?;
+            // Wait for reset to complete
+            std::thread::sleep(Duration::from_millis(100));
+            self.mpu.wake().ok();
+            self.mpu.set_gyro_range(GyroRange::Dps2000).ok();
+            self.mpu.set_dlpf(Dlpf::Cfg3).ok();
+            self.mpu.set_sample_rate_divider(9).ok();
             Ok(())
         }
 
