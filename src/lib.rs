@@ -27,8 +27,8 @@ impl ImuDevice for CustomImuWrapper {
     fn init(&mut self) -> Result<(), String> {
         self.0.init()
     }
-    fn poll_gyros(&mut self) -> Result<Vec<(nalgebra::Vector3<f64>, f64)>, String> {
-        self.0.poll_gyros()
+    fn poll(&mut self) -> Result<Vec<olive_imu::SensorEvent>, String> {
+        self.0.poll()
     }
     fn revive(&mut self) -> Result<(), String> {
         self.0.revive()
@@ -81,6 +81,23 @@ pub struct Position {
     pub timestamp: SystemTime,
 }
 
+/// A structure capturing the raw hardware telemetry and tracking state from the IMU.
+#[derive(Debug, Clone)]
+pub struct SensorData {
+    /// Time when the telemetry was recorded.
+    pub timestamp: SystemTime,
+    /// Raw gyroscope angular velocity [x, y, z] in rad/s.
+    pub gyro: [f64; 3],
+    /// Smoothed accelerometer gravity vector [x, y, z] in m/s^2.
+    pub gravity_vector: Option<[f64; 3]>,
+    /// The software-integrated relative tracking quaternion [i, j, k, w] purely from gyro integration.
+    pub relative_gyro_quaternion: [f64; 4],
+    /// Absolute hardware-fused orientation quaternion [i, j, k, w] (if supported).
+    pub hardware_quaternion: Option<[f64; 4]>,
+    /// The current classified state of motion (e.g. Stable, Moving).
+    pub motion_state: olive_imu::MotionState,
+}
+
 /// The unified solver coordinating tetra3 plate solving and olive-imu hardware tracking.
 /// Handles coordinate transformations between the equatorial and local horizontal frames.
 pub struct FusedSolver {
@@ -131,12 +148,8 @@ impl FusedSolver {
         *self.longitude.write().unwrap() = Some(lon);
     }
 
-    /// Starts the IMU. Requires location to be set first. Returns true if successful.
+    /// Starts the IMU. Returns true if successful.
     pub fn start_imu(&self) -> Result<bool, String> {
-        if self.latitude.read().unwrap().is_none() || self.longitude.read().unwrap().is_none() {
-            return Err("Observer location must be set before starting the IMU.".into());
-        }
-
         let mut imu_lock = self.imu.write().unwrap();
         if imu_lock.is_some() {
             return Err("IMU is already running.".into());
@@ -465,11 +478,13 @@ impl FusedSolver {
         extract_options: ExtractOptions,
         solve_options: SolveOptions,
         timestamp: Option<SystemTime>,
-    ) -> Result<Solution, String>
+    ) -> Result<(Solution, f64), String>
     where
         S: Data<Elem = f32>,
     {
+        let t0 = std::time::Instant::now();
         let centroids_result = self.extract(image, extract_options)?;
+        let extract_time_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let num_centroids = centroids_result.centroids.len();
         let mut centroids_arr = Array2::zeros((num_centroids, 2));
@@ -479,12 +494,13 @@ impl FusedSolver {
         }
 
         let (height, width) = image.dim();
-        self.solve_from_centroids(
+        let solution = self.solve_from_centroids(
             &centroids_arr,
             (height as f64, width as f64),
             solve_options,
             timestamp,
-        )
+        )?;
+        Ok((solution, extract_time_ms))
     }
 
     /// Extracts star centroids from the image using the fast pipeline and performs a plate solve.
@@ -495,12 +511,14 @@ impl FusedSolver {
         extract_options: FastExtractOptions,
         solve_options: SolveOptions,
         timestamp: Option<SystemTime>,
-    ) -> Result<Solution, String>
+    ) -> Result<(Solution, f64), String>
     where
         S: Data<Elem = T>,
         T: FastPixel,
     {
+        let t0 = std::time::Instant::now();
         let extract_result = self.extract_fast(image, extract_options.clone())?;
+        let extract_time_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let mut centroid_arrays = Vec::new();
 
@@ -526,12 +544,13 @@ impl FusedSolver {
         centroid_arrays.push((base_arr, None));
 
         let (height, width) = image.dim();
-        self.solve_from_centroids_batch(
+        let solution = self.solve_from_centroids_batch(
             &centroid_arrays,
             (height as f64, width as f64),
             solve_options,
             timestamp,
-        )
+        )?;
+        Ok((solution, extract_time_ms))
     }
 
     fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
@@ -592,6 +611,29 @@ impl FusedSolver {
         (*self.imu.read().unwrap())
             .as_ref()
             .map(|imu| imu.get_motion_state())
+    }
+
+    /// Fetches the current real-time hardware telemetry from the IMU.
+    /// Returns None if the IMU is not running.
+    pub fn get_sensor_data(&self) -> Option<SensorData> {
+        if let Some(ref imu) = *self.imu.read().unwrap() {
+            if let Some(state) = imu.get_latest_state() {
+                return Some(SensorData {
+                    timestamp: state.timestamp,
+                    gyro: [state.gyro.x, state.gyro.y, state.gyro.z],
+                    gravity_vector: state.gravity_vector.map(|a| [a.x, a.y, a.z]),
+                    relative_gyro_quaternion: [
+                        state.quaternion.i,
+                        state.quaternion.j,
+                        state.quaternion.k,
+                        state.quaternion.w,
+                    ],
+                    hardware_quaternion: state.hardware_quaternion.map(|q| [q.i, q.j, q.k, q.w]),
+                    motion_state: state.motion_state,
+                });
+            }
+        }
+        None
     }
 
     /// Fetches the latest known orientation of the device.
@@ -907,6 +949,7 @@ mod tests {
                 roll: 0.0,
                 source: PositionSource::Solver,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
+                gravity_vector: None,
             }))),
             last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),

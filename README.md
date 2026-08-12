@@ -7,6 +7,7 @@ A fast, robust, and async-friendly Rust implementation and optimization of the [
 This project is not just a straight port of the upstream Python logic. It introduces several performance optimizations and unique extraction features designed for constrained hardware and specific sensor characteristics.
 
 **NEW** Olive Solve now includes a complete IMU implementation for tracking movement between camera plate solves.
+**NEW** A complete FusedSolver implementation integrates between image plate-solves and IMU sensors.
 
 ### Extractor
 
@@ -33,15 +34,18 @@ A robust integration framework for inertial measurement units.
   rate gyroscope drift.
 * **Timing Synchronization**: Employs queue-draining and back-dating timestamp strategies to map sensor-relative measurements to host wall-clock time, absorbing I2C jitter and preventing timeline drift.
 * **Asynchronous Polling**: A dedicated OS thread handles blocking I2C transactions to maintain high polling rates (100 Hz+) without stalling the main `tokio` async runtime.
+* **Sensor Telemetry**: Exposes real-time hardware telemetry (gyro, gravity vectors, and integrated quaternions if available) via the `FusedSolver`.
 
 ## Repository Structure
 
-This workspace is divided into two primary crates:
+This workspace includes the following crates:
 
 * **`tetra3`**: The core algorithms. `solver.rs` is a Rust port of the [Tetra3](https://github.com/smroid/cedar-solve/blob/master/tetra3/tetra3.py) `solve_from_centroids` function. `extractor.rs` is a Rust port of the `get_centroids_from_image` function. `tetra3.rs` provides the standard interface corresponding to the Python project.
 * **`tetra3-py`**: Python bindings for the optimized tetra3 Rust implementation.
 * **`server`**: A gRPC server that exposes tetra3's algorithms as a service.
 * **`olive-imu`**: A specialized IMU driver library providing real-time kinematic integration for telescope orientation.
+
+The top-level crate exposes the FusedSolver integrated API, including Python bindings. The integrated API can be used with or without an IMU present.
 
 ## Getting Started
 

@@ -78,8 +78,12 @@ pub struct ImuUpdate {
     pub timestamp: SystemTime,
     /// Raw gyroscope readings
     pub gyro: RawSensorData,
+    /// Smoothed accelerometer readings
+    pub gravity_vector: Option<RawSensorData>,
     /// Current IMU orientation quaternion
     pub quaternion: UnitQuaternion<f64>,
+    /// Absolute hardware-fused quaternion (if supported)
+    pub hardware_quaternion: Option<UnitQuaternion<f64>>,
     /// Absolute angular velocity magnitude
     pub angular_velocity: f64,
     /// Classified state of motion
@@ -125,12 +129,28 @@ impl Default for AlignmentState {
     }
 }
 
+/// Represents a discrete reading from an IMU sensor.
+///
+/// Because sensors might emit data for different streams at different intervals (or over different I2C packets),
+/// any given event can contain a sparse assortment of gyro, accel, and hardware quaternion data.
+#[derive(Debug, Clone, Default)]
+pub struct SensorEvent {
+    /// Angular velocity from the gyroscope (in rad/s)
+    pub gyro: Option<Vector3<f64>>,
+    /// Linear acceleration from the accelerometer (in m/s^2)
+    pub accel: Option<Vector3<f64>>,
+    /// Absolute hardware-fused orientation (if supported)
+    pub hardware_quaternion: Option<UnitQuaternion<f64>>,
+    /// The integration time delta (in seconds). Only required if `gyro` or `accel` is present.
+    pub dt: Option<f64>,
+}
+
 /// Generic interface for communicating with physical IMU hardware.
 pub trait ImuDevice: Send + 'static {
     /// Initializes and configures the hardware device.
     fn init(&mut self) -> Result<(), String>;
-    /// Reads the latest gyroscope data from the device.
-    fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String>;
+    /// Reads the latest sensor events from the device.
+    fn poll(&mut self) -> Result<Vec<SensorEvent>, String>;
     /// Attempts to soft-reset or revive an unresponsive device.
     fn revive(&mut self) -> Result<(), String>;
     /// Reports if the IMU needs to seed the bias_offset value prior to calibration.
@@ -226,6 +246,7 @@ impl Imu {
         // blocking and we strictly do not want to stall the async Tokio runtime.
         std::thread::spawn(move || {
             let mut prev_quat = UnitQuaternion::identity();
+            let mut ema_accel: Option<Vector3<f64>> = None;
             let boot_time = SystemTime::now();
             let warm_up_duration = Duration::from_secs(3);
             let mut last_msg_time = SystemTime::now(); // Hardware watchdog tracker
@@ -235,9 +256,9 @@ impl Imu {
             loop {
                 std::thread::sleep(Duration::from_millis(10));
 
-                match device.poll_gyros() {
-                    Ok(readings) => {
-                        if readings.is_empty() {
+                match device.poll() {
+                    Ok(events) => {
+                        if events.is_empty() {
                             // Hardware watchdog: The BNO085 occasionally locks up over I2C.
                             // If we haven't seen a packet in 2 seconds, we re-send the enable command.
                             if last_msg_time.elapsed().unwrap_or_default() > Duration::from_secs(2)
@@ -253,7 +274,8 @@ impl Imu {
                         let now = SystemTime::now();
                         last_msg_time = now; // Kick the watchdog
 
-                        let total_batch_dt: f64 = readings.iter().map(|(_, dt)| dt).sum();
+                        let total_batch_dt: f64 = events.iter().filter_map(|e| e.dt).sum();
+
                         let mut current_event_time = now
                             .checked_sub(Duration::from_secs_f64(total_batch_dt))
                             .unwrap_or(now);
@@ -261,148 +283,181 @@ impl Imu {
                         let mut current_motion_state = MotionState::Stable;
                         let mut final_gyro_vec_rad = Vector3::zeros();
                         let mut final_gyro_mag = 0.0;
+                        let mut gyro_updated = false;
+                        let mut latest_hw_quat = None;
 
-                        for (raw_gyro, hw_dt) in readings {
-                            // Calculate bias and magnitude
-                            let mut is_seeding_active = false;
-                            let bias = {
-                                let mut cal = calibration_clone.lock().unwrap();
+                        for event in events {
+                            let opt_accel = event.accel;
+                            let opt_gyro = event.gyro;
 
-                                // Ensure that a baseline reading is seeded if necessary
-                                if !cal.is_seeded {
-                                    if device.needs_seeding() {
-                                        let seeding_threshold = 0.05; // rad/s max deviation
+                            if let Some(hwq) = event.hardware_quaternion {
+                                latest_hw_quat = Some(hwq);
+                            }
 
-                                        if cal.seed_samples == 0 {
-                                            cal.last_seed_reading = raw_gyro;
-                                            cal.seed_sum = raw_gyro;
-                                            cal.seed_samples = 1;
-                                        } else {
-                                            let dev = (raw_gyro - cal.last_seed_reading).norm();
-                                            if dev > seeding_threshold {
-                                                // Reset if deviation is too large (sensor is moving)
-                                                cal.seed_samples = 1;
+                            if let Some(accel) = opt_accel {
+                                if let Some(mut current) = ema_accel {
+                                    let alpha = 0.1;
+                                    current.x = (accel.x * alpha) + (current.x * (1.0 - alpha));
+                                    current.y = (accel.y * alpha) + (current.y * (1.0 - alpha));
+                                    current.z = (accel.z * alpha) + (current.z * (1.0 - alpha));
+                                    ema_accel = Some(current);
+                                } else {
+                                    ema_accel = Some(accel);
+                                }
+                            }
+
+                            if let Some(raw_gyro) = opt_gyro {
+                                gyro_updated = true;
+                                // Calculate bias and magnitude
+                                let mut is_seeding_active = false;
+                                let bias = {
+                                    let mut cal = calibration_clone.lock().unwrap();
+
+                                    // Ensure that a baseline reading is seeded if necessary
+                                    if !cal.is_seeded {
+                                        if device.needs_seeding() {
+                                            let seeding_threshold = 0.05; // rad/s max deviation
+
+                                            if cal.seed_samples == 0 {
+                                                cal.last_seed_reading = raw_gyro;
                                                 cal.seed_sum = raw_gyro;
-                                                cal.last_seed_reading = raw_gyro;
+                                                cal.seed_samples = 1;
                                             } else {
-                                                cal.seed_sum += raw_gyro;
-                                                cal.seed_samples += 1;
-                                                cal.last_seed_reading = raw_gyro;
+                                                let dev = (raw_gyro - cal.last_seed_reading).norm();
+                                                if dev > seeding_threshold {
+                                                    // Reset if deviation is too large (sensor is moving)
+                                                    cal.seed_samples = 1;
+                                                    cal.seed_sum = raw_gyro;
+                                                    cal.last_seed_reading = raw_gyro;
+                                                } else {
+                                                    cal.seed_sum += raw_gyro;
+                                                    cal.seed_samples += 1;
+                                                    cal.last_seed_reading = raw_gyro;
 
-                                                if cal.seed_samples >= 100 {
-                                                    cal.bias_offset = cal.seed_sum / 100.0;
-                                                    cal.is_seeded = true;
-                                                    info!(
-                                                        "Seeded initial IMU bias: {:?}",
-                                                        cal.bias_offset
-                                                    );
+                                                    if cal.seed_samples >= 100 {
+                                                        cal.bias_offset = cal.seed_sum / 100.0;
+                                                        cal.is_seeded = true;
+                                                        info!(
+                                                            "Seeded initial IMU bias: {:?}",
+                                                            cal.bias_offset
+                                                        );
+                                                    }
                                                 }
                                             }
-                                        }
 
-                                        if !cal.is_seeded {
-                                            is_seeding_active = true;
-                                            raw_gyro // Output raw_gyro as temporary bias so gyro_vec_rad is 0
+                                            if !cal.is_seeded {
+                                                is_seeding_active = true;
+                                                raw_gyro // Output raw_gyro as temporary bias so gyro_vec_rad is 0
+                                            } else {
+                                                cal.bias_offset
+                                            }
                                         } else {
+                                            cal.is_seeded = true;
                                             cal.bias_offset
                                         }
                                     } else {
-                                        cal.is_seeded = true;
                                         cal.bias_offset
                                     }
+                                };
+
+                                let gyro_vec_rad = raw_gyro - bias;
+                                let gyro_mag = gyro_vec_rad.norm();
+                                final_gyro_vec_rad = gyro_vec_rad;
+                                final_gyro_mag = gyro_mag;
+
+                                // 0.001 rad/s is approx 0.057 deg/s, a better deadband for stationary drift
+                                let hw_dt = event.dt.unwrap_or(0.0);
+                                let delta_q = if gyro_mag > 0.001 {
+                                    UnitQuaternion::new(gyro_vec_rad * hw_dt)
                                 } else {
-                                    cal.bias_offset
+                                    UnitQuaternion::identity()
+                                };
+
+                                prev_quat *= delta_q;
+
+                                let is_warming_up = boot_time.elapsed().unwrap_or_default()
+                                    < warm_up_duration
+                                    || is_seeding_active;
+
+                                if gyro_mag > 0.05 {
+                                    last_motion_time = now;
                                 }
-                            };
 
-                            let gyro_vec_rad = raw_gyro - bias;
-                            let gyro_mag = gyro_vec_rad.norm();
-                            final_gyro_vec_rad = gyro_vec_rad;
-                            final_gyro_mag = gyro_mag;
+                                // We enforce a time-based settling period after any motion ends. This
+                                // prevents heavy vibrations or structural settling in the telescope mount
+                                // from polluting our zero-bias baseline.
+                                current_motion_state = if is_warming_up {
+                                    MotionState::Initializing
+                                } else if now.duration_since(last_motion_time).unwrap_or_default()
+                                    < Duration::from_millis(SETTLE_TIME_MS)
+                                {
+                                    MotionState::Moving
+                                } else {
+                                    MotionState::Stable
+                                };
 
-                            // 0.001 rad/s is approx 0.057 deg/s, a better deadband for stationary drift
-                            let delta_q = if gyro_mag > 0.001 {
-                                UnitQuaternion::new(gyro_vec_rad * hw_dt)
-                            } else {
-                                UnitQuaternion::identity()
-                            };
+                                // Continuous zero-bias EMA tracking
+                                if current_motion_state == MotionState::Stable {
+                                    let mut cal = calibration_clone.lock().unwrap();
+                                    cal.total_samples += 1;
 
-                            prev_quat *= delta_q;
+                                    // Dynamic Alpha:
+                                    // Phase 1 (1.0 / samples): Acts as a mathematically pure cumulative average to
+                                    // rapidly lock in a highly accurate baseline over the first ~50 seconds (2500 samples).
+                                    // Phase 2 (max 0.0004): Permanently transforms into a rolling Exponential Moving Average
+                                    // that slowly tracks thermal drift without dragging the heavy anchor of historical data.
+                                    let alpha = (1.0 / (cal.total_samples as f64)).max(0.0004);
 
-                            let is_warming_up = boot_time.elapsed().unwrap_or_default()
-                                < warm_up_duration
-                                || is_seeding_active;
+                                    cal.bias_offset.x =
+                                        (raw_gyro.x * alpha) + (cal.bias_offset.x * (1.0 - alpha));
+                                    cal.bias_offset.y =
+                                        (raw_gyro.y * alpha) + (cal.bias_offset.y * (1.0 - alpha));
+                                    cal.bias_offset.z =
+                                        (raw_gyro.z * alpha) + (cal.bias_offset.z * (1.0 - alpha));
+                                }
 
-                            if gyro_mag > 0.05 {
-                                last_motion_time = now;
-                            }
+                                current_event_time = current_event_time
+                                    .checked_add(Duration::from_secs_f64(hw_dt))
+                                    .unwrap_or(now);
+                                let gyro_vec_deg = gyro_vec_rad * (180.0 / std::f64::consts::PI);
 
-                            // We enforce a time-based settling period after any motion ends. This
-                            // prevents heavy vibrations or structural settling in the telescope mount
-                            // from polluting our zero-bias baseline.
-                            current_motion_state = if is_warming_up {
-                                MotionState::Initializing
-                            } else if now.duration_since(last_motion_time).unwrap_or_default()
-                                < Duration::from_millis(SETTLE_TIME_MS)
-                            {
-                                MotionState::Moving
-                            } else {
-                                MotionState::Stable
-                            };
-
-                            // Continuous zero-bias EMA tracking
-                            if current_motion_state == MotionState::Stable {
-                                let mut cal = calibration_clone.lock().unwrap();
-                                cal.total_samples += 1;
-
-                                // Dynamic Alpha:
-                                // Phase 1 (1.0 / samples): Acts as a mathematically pure cumulative average to
-                                // rapidly lock in a highly accurate baseline over the first ~50 seconds (2500 samples).
-                                // Phase 2 (max 0.0004): Permanently transforms into a rolling Exponential Moving Average
-                                // that slowly tracks thermal drift without dragging the heavy anchor of historical data.
-                                let alpha = (1.0 / (cal.total_samples as f64)).max(0.0004);
-
-                                cal.bias_offset.x =
-                                    (raw_gyro.x * alpha) + (cal.bias_offset.x * (1.0 - alpha));
-                                cal.bias_offset.y =
-                                    (raw_gyro.y * alpha) + (cal.bias_offset.y * (1.0 - alpha));
-                                cal.bias_offset.z =
-                                    (raw_gyro.z * alpha) + (cal.bias_offset.z * (1.0 - alpha));
-                            }
-
-                            current_event_time = current_event_time
-                                .checked_add(Duration::from_secs_f64(hw_dt))
-                                .unwrap_or(now);
-                            let gyro_vec_deg = gyro_vec_rad * (180.0 / std::f64::consts::PI);
-
-                            {
-                                let mut hist = history_clone.lock().unwrap();
-                                hist.push_back((
-                                    current_event_time,
-                                    prev_quat,
-                                    current_motion_state,
-                                    gyro_vec_deg,
-                                ));
-                                if hist.len() > 500 {
-                                    hist.pop_front();
+                                {
+                                    let mut hist = history_clone.lock().unwrap();
+                                    hist.push_back((
+                                        current_event_time,
+                                        prev_quat,
+                                        current_motion_state,
+                                        gyro_vec_deg,
+                                    ));
+                                    if hist.len() > 500 {
+                                        hist.pop_front();
+                                    }
                                 }
                             }
                         }
 
-                        let update = ImuUpdate {
-                            timestamp: now,
-                            gyro: RawSensorData {
-                                x: final_gyro_vec_rad.x,
-                                y: final_gyro_vec_rad.y,
-                                z: final_gyro_vec_rad.z,
-                            },
-                            quaternion: prev_quat,
-                            angular_velocity: final_gyro_mag,
-                            motion_state: current_motion_state,
-                        };
+                        if gyro_updated {
+                            let update = ImuUpdate {
+                                timestamp: now,
+                                gyro: RawSensorData {
+                                    x: final_gyro_vec_rad.x,
+                                    y: final_gyro_vec_rad.y,
+                                    z: final_gyro_vec_rad.z,
+                                },
+                                gravity_vector: ema_accel.map(|a| RawSensorData {
+                                    x: a.x,
+                                    y: a.y,
+                                    z: a.z,
+                                }),
+                                quaternion: prev_quat,
+                                hardware_quaternion: latest_hw_quat,
+                                angular_velocity: final_gyro_mag,
+                                motion_state: current_motion_state,
+                            };
 
-                        // Drop any stale updates and push the newest one
-                        *state_clone.write().unwrap() = Some(update);
+                            // Drop any stale updates and push the newest one
+                            *state_clone.write().unwrap() = Some(update);
+                        }
                     }
                     Err(e) => {
                         error!("Device poll error: {}", e);

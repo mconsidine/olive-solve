@@ -6,11 +6,11 @@ mod hardware {
     use bno055::{BNO055OperationMode, Bno055};
     use linux_embedded_hal::{Delay, I2cdev};
     use log::{info, warn};
-    use nalgebra::Vector3;
+    use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 
     use std::time::{Duration, SystemTime};
 
-    use crate::imu::ImuDevice;
+    use crate::imu::{ImuDevice, SensorEvent};
 
     pub struct Bno055Device {
         imu: Bno055<I2cdev>,
@@ -43,12 +43,12 @@ mod hardware {
             imu.init(&mut delay)
                 .map_err(|e| format!("Failed to initialize BNO055 over I2C: {:?}", e))?;
 
-            // Set mode to GYRONLY
-            imu.set_mode(BNO055OperationMode::GYRO_ONLY, &mut delay)
-                .map_err(|e| format!("Failed to set BNO055 mode to GYRONLY: {:?}", e))?;
+            // Set mode to NDOF
+            imu.set_mode(BNO055OperationMode::NDOF, &mut delay)
+                .map_err(|e| format!("Failed to set BNO055 mode to NDOF: {:?}", e))?;
 
             info!(
-                "Hardware initialized at {}ms using GYRONLY mode.",
+                "Hardware initialized at {}ms using NDOF mode.",
                 report_interval_ms
             );
 
@@ -66,7 +66,7 @@ mod hardware {
             Ok(())
         }
 
-        fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
+        fn poll(&mut self) -> Result<Vec<SensorEvent>, String> {
             let mut readings = Vec::new();
 
             // The BNO055 does not support an internal hardware queue over I2C.
@@ -74,6 +74,11 @@ mod hardware {
             let gyro_data = match self.imu.gyro_data() {
                 Ok(data) => data,
                 Err(_) => return Ok(readings), // If read fails, return empty to let caller handle watchdog
+            };
+
+            let accel_data = match self.imu.accel_data() {
+                Ok(data) => data,
+                Err(_) => return Ok(readings),
             };
 
             let now = SystemTime::now();
@@ -96,8 +101,35 @@ mod hardware {
             let wx = gyro_data.x as f64 * to_rad;
             let wy = gyro_data.y as f64 * to_rad;
             let wz = gyro_data.z as f64 * to_rad;
+            let vec_g = Vector3::new(wx, wy, wz);
 
-            readings.push((Vector3::new(wx, wy, wz), safe_dt));
+            let ax = accel_data.x as f64;
+            let ay = accel_data.y as f64;
+            let az = accel_data.z as f64;
+            let vec_a = Vector3::new(ax, ay, az);
+
+            let hw_quat = if let Ok(q) = self.imu.quaternion() {
+                if q.s != 0.0 || q.v.x != 0.0 || q.v.y != 0.0 || q.v.z != 0.0 {
+                    Some(UnitQuaternion::new_normalize(Quaternion::new(
+                        q.s as f64,
+                        q.v.x as f64,
+                        q.v.y as f64,
+                        q.v.z as f64,
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            readings.push(SensorEvent {
+                gyro: Some(vec_g),
+                accel: Some(vec_a),
+                hardware_quaternion: hw_quat,
+                dt: Some(safe_dt),
+                ..Default::default()
+            });
 
             Ok(readings)
         }
@@ -105,7 +137,7 @@ mod hardware {
         fn revive(&mut self) -> Result<(), String> {
             warn!("Sensor unresponsive. Sending hardware revive command...");
             self.imu
-                .set_mode(BNO055OperationMode::GYRO_ONLY, &mut self.delay)
+                .set_mode(BNO055OperationMode::NDOF, &mut self.delay)
                 .map_err(|e| format!("Failed to revive: {:?}", e))?;
             Ok(())
         }
@@ -117,7 +149,7 @@ pub use hardware::*;
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod stub {
-    use crate::imu::ImuDevice;
+    use crate::imu::{ImuDevice, SensorEvent};
     use nalgebra::Vector3;
 
     /// Implementation of `ImuDevice` for the BNO055 IMU.
@@ -134,7 +166,7 @@ mod stub {
         fn init(&mut self) -> Result<(), String> {
             Err("Unsupported".into())
         }
-        fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
+        fn poll(&mut self) -> Result<Vec<SensorEvent>, String> {
             Err("Unsupported".into())
         }
         fn revive(&mut self) -> Result<(), String> {

@@ -38,7 +38,7 @@ impl PyFusedSolver {
     ///
     /// Returns:
     ///     numpy.ndarray: An array of shape (N, 2) containing (y, x) centroid coordinates.
-    pub fn extract<'py>(
+    pub fn get_centroids_from_image<'py>(
         &self,
         py: Python<'py>,
         image: PyReadonlyArray2<'py, f32>,
@@ -65,7 +65,7 @@ impl PyFusedSolver {
     /// Returns:
     ///     numpy.ndarray or tuple: Array of shape (N, 2) for centroids. If virtual crops
     ///     are used, returns a tuple containing (base_centroids, (crop_1_centroids, ...)).
-    pub fn extract_fast<'py>(
+    pub fn get_centroids_from_image_fast<'py>(
         &self,
         py: Python<'py>,
         image: Bound<'py, PyAny>,
@@ -119,12 +119,12 @@ impl PyFusedSolver {
         let solve_options = tetra3::solver::SolveOptions::from_kwargs(kwargs)?;
         let img_view = image.as_array();
 
-        let solution = self
+        let (solution, ext_time) = self
             .inner
             .solve_from_image(&img_view, extract_options, solve_options, None)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
-        solution.to_dict(py, None)
+        solution.to_dict(py, Some(ext_time))
     }
 
     #[pyo3(signature = (image, **kwargs))]
@@ -145,22 +145,23 @@ impl PyFusedSolver {
         let extract_options = tetra3::fast_extractor::FastExtractOptions::from_kwargs(kwargs)?;
         let solve_options = tetra3::solver::SolveOptions::from_kwargs(kwargs)?;
 
-        let solution = if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
-            let img_view = img_u8.as_array();
-            self.inner
-                .solve_from_image_fast(&img_view, extract_options, solve_options, None)
-        } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
-            let img_view = img_f32.as_array();
-            self.inner
-                .solve_from_image_fast(&img_view, extract_options, solve_options, None)
-        } else {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Image must be a 2D NumPy array of u8 or f32",
-            ));
-        }
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let (solution, ext_time) =
+            if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
+                let img_view = img_u8.as_array();
+                self.inner
+                    .solve_from_image_fast(&img_view, extract_options, solve_options, None)
+            } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
+                let img_view = img_f32.as_array();
+                self.inner
+                    .solve_from_image_fast(&img_view, extract_options, solve_options, None)
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "Image must be a 2D NumPy array of u8 or f32",
+                ));
+            }
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
-        solution.to_dict(py, None)
+        solution.to_dict(py, Some(ext_time))
     }
 
     #[pyo3(signature = (centroids, size, **kwargs))]
@@ -238,6 +239,110 @@ impl PyFusedSolver {
         self.inner
             .start_imu()
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    /// Stops the IMU and drops the background polling thread. Safe to call if not started.
+    pub fn stop_imu(&self) -> PyResult<()> {
+        self.inner
+            .stop_imu()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    /// Resets the internal IMU zero-bias and deletes the SVD calibration matrix from persistent storage.
+    pub fn reset_calibration(&self) {
+        self.inner.reset_calibration();
+    }
+
+    /// Fetches the latest known orientation of the device.
+    ///
+    /// Returns:
+    ///     dict: Dictionary containing ra, dec, roll, source, timestamp
+    pub fn get_latest_position<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        if let Some(pos) = self.inner.get_latest_position() {
+            let dict = PyDict::new(py);
+            dict.set_item("ra", pos.ra)?;
+            dict.set_item("dec", pos.dec)?;
+            dict.set_item("roll", pos.roll)?;
+            dict.set_item("source", format!("{:?}", pos.source))?;
+
+            let dt = pos
+                .timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            dict.set_item("timestamp", dt)?;
+
+            Ok(dict)
+        } else {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "No position estimate available",
+            ))
+        }
+    }
+
+    /// Fetches the latest real-time hardware telemetry from the IMU.
+    ///
+    /// Returns:
+    ///     dict: Dictionary containing timestamp, gyro, gravity_vector, relative_gyro_quaternion, hardware_quaternion, motion_state.
+    pub fn get_sensor_data<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if let Some(data) = self.inner.get_sensor_data() {
+            let dict = PyDict::new(py);
+            let dt = data
+                .timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            dict.set_item("timestamp", dt)?;
+
+            let py_gyro = pyo3::types::PyList::new(py, data.gyro)?;
+            dict.set_item("gyro", py_gyro)?;
+
+            let py_rel = pyo3::types::PyList::new(py, data.relative_gyro_quaternion)?;
+            dict.set_item("relative_gyro_quaternion", py_rel)?;
+
+            if let Some(gv) = data.gravity_vector {
+                let py_gv = pyo3::types::PyList::new(py, gv)?;
+                dict.set_item("gravity_vector", py_gv)?;
+            } else {
+                dict.set_item("gravity_vector", py.None())?;
+            }
+
+            if let Some(hq) = data.hardware_quaternion {
+                let py_hq = pyo3::types::PyList::new(py, hq)?;
+                dict.set_item("hardware_quaternion", py_hq)?;
+            } else {
+                dict.set_item("hardware_quaternion", py.None())?;
+            }
+
+            dict.set_item("motion_state", format!("{:?}", data.motion_state))?;
+
+            Ok(Some(dict))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Retrieves the real-time motion stability state from the IMU hardware, if running.
+    pub fn get_motion_state(&self) -> Option<String> {
+        self.inner.get_motion_state().map(|s| format!("{:?}", s))
+    }
+
+    /// Retrieves the real-time calibration metrics from the IMU hardware, if running.
+    pub fn get_calibration_status<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if let Some(status) = self.inner.get_calibration_status() {
+            let dict = PyDict::new(py);
+            dict.set_item("transform_error_fraction", status.transform_error_fraction)?;
+            dict.set_item("camera_view_gyro_axis", status.camera_view_gyro_axis)?;
+            dict.set_item("camera_view_misalignment", status.camera_view_misalignment)?;
+            dict.set_item("camera_up_gyro_axis", status.camera_up_gyro_axis)?;
+            dict.set_item("camera_up_misalignment", status.camera_up_misalignment)?;
+            Ok(Some(dict))
+        } else {
+            Ok(None)
+        }
     }
 }
 

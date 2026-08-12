@@ -203,11 +203,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Metric 3: EMA Baseline
                         // The dynamic alpha rolling window that perfectly balances short-term noise rejection with long-term drift tracking.
 
+                        let accel_str = if let Some(update) = engine.get_latest_state() {
+                            if let Some(accel) = update.gravity_vector {
+                                let mag = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
+                                format!("[{:.5}, {:.5}, {:.5}] ({:.2} m/s^2)", accel.x, accel.y, accel.z, mag)
+                            } else {
+                                "None".to_string()
+                            }
+                        } else {
+                            "None".to_string()
+                        };
+
+                        let quat_str = if let Some(update) = engine.get_latest_state() {
+                            if let Some(q) = update.hardware_quaternion {
+                                format!("[w:{:.3}, i:{:.3}, j:{:.3}, k:{:.3}]", q.w, q.i, q.j, q.k)
+                            } else {
+                                "None".to_string()
+                            }
+                        } else {
+                            "None".to_string()
+                        };
+
                         println!(
-                            "Current window: [{:.5}, {:.5}, {:.5}] | EMA baseline: [{:.5}, {:.5}, {:.5}] | Strict Cumulative: [{:.5}, {:.5}, {:.5}] ({} total samples)",
+                            "Gyro Window: [{:.5}, {:.5}, {:.5}] | Gyro EMA: [{:.5}, {:.5}, {:.5}] | Gyro Strict: [{:.5}, {:.5}, {:.5}] | Accel EMA: {} | HW Quat: {} ({} samples)",
                             current_bias.0, current_bias.1, current_bias.2,
                             ema_bias.0, ema_bias.1, ema_bias.2,
-                            strict_bias.0, strict_bias.1, strict_bias.2, total_samples
+                            strict_bias.0, strict_bias.1, strict_bias.2,
+                            accel_str,
+                            quat_str,
+                            total_samples
                         );
                     }
 
