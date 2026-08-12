@@ -3,7 +3,7 @@
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod hardware {
-    use crate::imu::ImuDevice;
+    use crate::imu::{ImuDevice, SensorEvent};
     use linux_embedded_hal::I2cdev;
     use log::{info, warn};
     use mpu6050_driver::{Address, Dlpf, GyroRange, Mpu6050};
@@ -59,7 +59,7 @@ mod hardware {
             Ok(())
         }
 
-        fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
+        fn poll(&mut self) -> Result<Vec<SensorEvent>, String> {
             let mut readings = Vec::new();
 
             // Real-time register read
@@ -88,8 +88,21 @@ mod hardware {
             let wx = (raw.gyro[0] as f64 / scale) * deg2rad;
             let wy = (raw.gyro[1] as f64 / scale) * deg2rad;
             let wz = (raw.gyro[2] as f64 / scale) * deg2rad;
+            let vec_g = Vector3::new(wx, wy, wz);
 
-            readings.push((Vector3::new(wx, wy, wz), safe_dt));
+            // Convert accel to m/s^2. MPU6050 default accel scale is +-2g (16384 LSB/g)
+            let accel_scale = 16384.0 / 9.81;
+            let ax = raw.accel[0] as f64;
+            let ay = raw.accel[1] as f64;
+            let az = raw.accel[2] as f64;
+            let vec_a = Vector3::new(ax / accel_scale, ay / accel_scale, az / accel_scale);
+
+            readings.push(SensorEvent {
+                gyro: Some(vec_g),
+                accel: Some(vec_a),
+                dt: Some(safe_dt),
+                ..Default::default()
+            });
 
             Ok(readings)
         }
@@ -119,7 +132,7 @@ pub use hardware::*;
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod stub {
-    use crate::imu::ImuDevice;
+    use crate::imu::{ImuDevice, SensorEvent};
     use nalgebra::Vector3;
 
     pub struct MpuXxxxDevice;
@@ -135,7 +148,7 @@ mod stub {
         fn init(&mut self) -> Result<(), String> {
             Err("Unsupported".into())
         }
-        fn poll_gyros(&mut self) -> Result<Vec<(Vector3<f64>, f64)>, String> {
+        fn poll(&mut self) -> Result<Vec<SensorEvent>, String> {
             Err("Unsupported".into())
         }
         fn revive(&mut self) -> Result<(), String> {

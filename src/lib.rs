@@ -27,8 +27,8 @@ impl ImuDevice for CustomImuWrapper {
     fn init(&mut self) -> Result<(), String> {
         self.0.init()
     }
-    fn poll_gyros(&mut self) -> Result<Vec<(nalgebra::Vector3<f64>, f64)>, String> {
-        self.0.poll_gyros()
+    fn poll(&mut self) -> Result<Vec<olive_imu::SensorEvent>, String> {
+        self.0.poll()
     }
     fn revive(&mut self) -> Result<(), String> {
         self.0.revive()
@@ -79,6 +79,10 @@ pub struct Position {
     pub source: PositionSource,
     /// The time at which this position was valid.
     pub timestamp: SystemTime,
+    /// Real-time smoothed gravity vector in the sensor frame.
+    pub gravity_vector: Option<[f64; 3]>,
+    /// Hardware-fused absolute rotation quaternion [i, j, k, w] (if supported by IMU)
+    pub hardware_quaternion: Option<[f64; 4]>,
 }
 
 /// The unified solver coordinating tetra3 plate solving and olive-imu hardware tracking.
@@ -571,6 +575,8 @@ impl FusedSolver {
             roll,
             source: PositionSource::Solver,
             timestamp: time,
+            gravity_vector: None,
+            hardware_quaternion: None,
         });
     }
 
@@ -602,6 +608,14 @@ impl FusedSolver {
         let last_failed = *self.last_solve_failed.read().unwrap();
 
         if let Some(ref imu) = *self.imu.read().unwrap() {
+            let latest = imu.get_latest_state();
+            let current_gravity = latest
+                .as_ref()
+                .and_then(|s| s.gravity_vector.map(|a| [a.x, a.y, a.z]));
+            let current_hw_quat = latest
+                .as_ref()
+                .and_then(|s| s.hardware_quaternion.map(|q| [q.i, q.j, q.k, q.w]));
+
             if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&SystemTime::now()) {
                 let lat_opt = *self.latitude.read().unwrap();
                 let lon_opt = *self.longitude.read().unwrap();
@@ -629,8 +643,15 @@ impl FusedSolver {
                         roll: current_roll,
                         source,
                         timestamp: SystemTime::now(),
+                        gravity_vector: current_gravity,
+                        hardware_quaternion: current_hw_quat,
                     });
                 }
+            }
+
+            if let Some(pos) = &mut last_solve {
+                pos.gravity_vector = current_gravity;
+                pos.hardware_quaternion = current_hw_quat;
             }
         }
 
@@ -907,6 +928,7 @@ mod tests {
                 roll: 0.0,
                 source: PositionSource::Solver,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
+                gravity_vector: None,
             }))),
             last_solve_failed: Arc::new(RwLock::new(false)),
             latitude: Arc::new(RwLock::new(None)),
