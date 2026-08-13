@@ -476,6 +476,8 @@ impl FusedSolver {
 
     /// Extracts star centroids from the image and performs a plate solve.
     /// If successful, the solver automatically updates the IMU anchor internally.
+    ///
+    /// Returns a tuple containing the `Solution` and the extraction time in milliseconds (`f64`).
     pub fn solve_from_image<S>(
         &self,
         image: &ArrayBase<S, Ix2>,
@@ -509,6 +511,8 @@ impl FusedSolver {
 
     /// Extracts star centroids from the image using the fast pipeline and performs a plate solve.
     /// If virtual crops are provided, they are attempted first, and the full image is appended at the end as a fallback.
+    ///
+    /// Returns a tuple containing the `Solution` and the extraction time in milliseconds (`f64`).
     pub fn solve_from_image_fast<S, T>(
         &self,
         image: &ArrayBase<S, Ix2>,

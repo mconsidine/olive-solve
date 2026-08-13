@@ -108,7 +108,7 @@ impl PyFusedSolver {
     ///     **kwargs: Options for both extraction and solving (fov_estimate, match_radius, etc).
     ///
     /// Returns:
-    ///     dict: A dictionary containing the solve results (RA, Dec, Roll, FOV, status, etc).
+    ///     dict: A dictionary containing the solve results (RA, Dec, Roll, FOV, status, T_extract, etc).
     pub fn solve_from_image<'py>(
         &self,
         py: Python<'py>,
@@ -135,7 +135,7 @@ impl PyFusedSolver {
     ///     **kwargs: Options for both fast extraction and solving.
     ///
     /// Returns:
-    ///     dict: A dictionary containing the solve results (RA, Dec, Roll, FOV, status, etc).
+    ///     dict: A dictionary containing the solve results (RA, Dec, Roll, FOV, status, T_extract, etc).
     pub fn solve_from_image_fast<'py>(
         &self,
         py: Python<'py>,
