@@ -79,6 +79,10 @@ pub struct Position {
     pub source: PositionSource,
     /// The time at which this position was valid.
     pub timestamp: SystemTime,
+    /// Real-time smoothed gravity vector in the sensor frame.
+    pub gravity_vector: Option<[f64; 3]>,
+    /// Hardware-fused absolute rotation quaternion [i, j, k, w] (if supported by IMU)
+    pub hardware_quaternion: Option<[f64; 4]>,
 }
 
 /// A structure capturing the raw hardware telemetry and tracking state from the IMU.
@@ -590,6 +594,8 @@ impl FusedSolver {
             roll,
             source: PositionSource::Solver,
             timestamp: time,
+            gravity_vector: None,
+            hardware_quaternion: None,
         });
     }
 
@@ -644,6 +650,14 @@ impl FusedSolver {
         let last_failed = *self.last_solve_failed.read().unwrap();
 
         if let Some(ref imu) = *self.imu.read().unwrap() {
+            let latest = imu.get_latest_state();
+            let current_gravity = latest
+                .as_ref()
+                .and_then(|s| s.gravity_vector.map(|a| [a.x, a.y, a.z]));
+            let current_hw_quat = latest
+                .as_ref()
+                .and_then(|s| s.hardware_quaternion.map(|q| [q.i, q.j, q.k, q.w]));
+
             if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&SystemTime::now()) {
                 let lat_opt = *self.latitude.read().unwrap();
                 let lon_opt = *self.longitude.read().unwrap();
@@ -671,8 +685,15 @@ impl FusedSolver {
                         roll: current_roll,
                         source,
                         timestamp: SystemTime::now(),
+                        gravity_vector: current_gravity,
+                        hardware_quaternion: current_hw_quat,
                     });
                 }
+            }
+
+            if let Some(pos) = &mut last_solve {
+                pos.gravity_vector = current_gravity;
+                pos.hardware_quaternion = current_hw_quat;
             }
         }
 
