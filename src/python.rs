@@ -16,12 +16,22 @@ pub struct PyFusedSolver {
 #[pymethods]
 impl PyFusedSolver {
     #[new]
+    #[pyo3(signature = (database_path, imu_type=None))]
     /// Initializes a new FusedSolver instance.
     ///
     /// Args:
     ///     database_path (str): The file path to the npz star database.
-    pub fn new(database_path: &str) -> PyResult<Self> {
-        let inner = FusedSolver::new(std::path::Path::new(database_path), None, None)
+    ///     imu_type (str, optional): The specific IMU to use (e.g. "bno085", "bmi160", "auto", "none"). Defaults to auto-detection.
+    pub fn new(database_path: &str, imu_type: Option<&str>) -> PyResult<Self> {
+        let rust_imu_type = match imu_type {
+            Some(s) => Some(
+                s.parse::<crate::ImuType>()
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?,
+            ),
+            None => None,
+        };
+
+        let inner = FusedSolver::new(std::path::Path::new(database_path), rust_imu_type, None)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Ok(Self { inner })
     }

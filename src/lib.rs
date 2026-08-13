@@ -53,6 +53,22 @@ pub enum ImuType {
     Custom(Box<dyn ImuDevice + Send + Sync>),
 }
 
+impl std::str::FromStr for ImuType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(ImuType::None),
+            "auto" => Ok(ImuType::Auto),
+            "bno085" => Ok(ImuType::Bno085),
+            "bno055" => Ok(ImuType::Bno055),
+            "bmi160" => Ok(ImuType::Bmi160),
+            "mpuxxxx" => Ok(ImuType::MpuXxxx),
+            _ => Err(format!("Unknown IMU type: {}", s)),
+        }
+    }
+}
+
 /// The source of the celestial position estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PositionSource {
