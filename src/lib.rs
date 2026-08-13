@@ -842,36 +842,12 @@ mod tests {
         fn init(&mut self) -> Result<(), String> {
             Ok(())
         }
-        fn poll_gyros(&mut self) -> Result<Vec<(nalgebra::Vector3<f64>, f64)>, String> {
+        fn poll(&mut self) -> Result<Vec<olive_imu::SensorEvent>, String> {
             Ok(vec![])
         }
         fn revive(&mut self) -> Result<(), String> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn test_start_imu_without_location_fails() {
-        // Dummy logic
-        let fs = FusedSolver {
-            solver: Arc::new(RwLock::new(None)),
-            extractor: Arc::new(RwLock::new(None)),
-            fast_extractor: Arc::new(RwLock::new(None)),
-            imu: Arc::new(RwLock::new(None)),
-            imu_type: Arc::new(RwLock::new(ImuType::None)),
-            storage: None,
-            latest_solve_position: Arc::new(RwLock::new(None)),
-            last_solve_failed: Arc::new(RwLock::new(false)),
-            latitude: Arc::new(RwLock::new(None)),
-            longitude: Arc::new(RwLock::new(None)),
-        };
-
-        let result = fs.start_imu();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Observer location must be set before starting the IMU."
-        );
     }
 
     #[test]
@@ -885,8 +861,8 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
-            latitude: Arc::new(RwLock::new(Some(0.0))),
-            longitude: Arc::new(RwLock::new(Some(0.0))),
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
         };
 
         let result = fs.start_imu();
@@ -908,8 +884,8 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
-            latitude: Arc::new(RwLock::new(Some(0.0))),
-            longitude: Arc::new(RwLock::new(Some(0.0))),
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
         };
 
         let first = fs.start_imu();
@@ -918,6 +894,25 @@ mod tests {
         let second = fs.start_imu();
         assert!(second.is_err());
         assert_eq!(second.unwrap_err(), "IMU is already running.");
+    }
+
+    #[test]
+    fn test_get_sensor_data_empty_when_not_started() {
+        let fs = FusedSolver {
+            solver: Arc::new(RwLock::new(None)),
+            extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
+            imu: Arc::new(RwLock::new(None)),
+            imu_type: Arc::new(RwLock::new(ImuType::None)),
+            storage: None,
+            latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
+        };
+
+        let data = fs.get_sensor_data();
+        assert!(data.is_none());
     }
 
     #[test]
