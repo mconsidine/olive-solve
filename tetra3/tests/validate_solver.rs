@@ -154,6 +154,9 @@ fn test_solver_consistency_with_testdata() {
             target_pixel,
             target_sky_coord,
             allow_out_of_bounds_target_pixel: None,
+            observer_latitude: None,
+            observer_lst: None,
+            min_boresight_altitude: None,
         };
 
         // --- Capture the execution time ---
@@ -347,6 +350,9 @@ fn test_solver_mirrored_image() {
         target_pixel,
         target_sky_coord: None,
         allow_out_of_bounds_target_pixel: None,
+        observer_latitude: None,
+        observer_lst: None,
+        min_boresight_altitude: None,
     };
 
     let result = solver.solve(
@@ -439,6 +445,9 @@ fn test_true_matches_consistency() {
             target_pixel: None,
             target_sky_coord: None,
             allow_out_of_bounds_target_pixel: None,
+            observer_latitude: None,
+            observer_lst: None,
+            min_boresight_altitude: None,
         };
 
         let result = solver.solve(
@@ -520,7 +529,12 @@ fn test_out_of_bounds_target_pixel() {
         return_matches: false,
         return_catalog: false,
         return_rotation_matrix: true,
-        ..Default::default()
+        target_pixel: None,
+        target_sky_coord: None,
+        allow_out_of_bounds_target_pixel: None,
+        observer_latitude: None,
+        observer_lst: None,
+        min_boresight_altitude: None,
     };
 
     let result = solver.solve(
@@ -587,4 +601,178 @@ fn test_out_of_bounds_target_pixel() {
         input_dto.image_width,
         input_dto.image_height
     );
+}
+
+#[test]
+fn test_horizon_filter() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+
+    if !db_path.exists() {
+        eprintln!("Skipping test: default_database.npz not found.");
+        return;
+    }
+    if !zip_path.exists() {
+        panic!(
+            "Fixture zip not found! Run `cargo test generate_test_fixtures --release -- --ignored` first."
+        );
+    }
+
+    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+    let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
+    let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
+
+    // Load one successful known good solve (input_1.json)
+    let mut input_buffer = Vec::new();
+    {
+        let mut req_file = archive.by_name("input_1.json").unwrap();
+        req_file.read_to_end(&mut input_buffer).unwrap();
+    }
+    let input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+    let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+    for c in &input_dto.centroids {
+        flat_cents.push(c[0]);
+        flat_cents.push(c[1]);
+    }
+    let centroids_array =
+        Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+    let mut options = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        fov_max_error: input_dto.options.fov_max_error,
+        match_radius: input_dto.options.match_radius,
+        match_threshold: input_dto.options.match_threshold,
+        solve_timeout_ms: input_dto.options.solve_timeout_ms,
+        distortion: input_dto.options.distortion,
+        match_max_error: input_dto.options.match_max_error,
+        return_matches: false,
+        return_catalog: false,
+        return_rotation_matrix: false,
+        target_pixel: None,
+        target_sky_coord: None,
+        allow_out_of_bounds_target_pixel: None,
+        observer_latitude: None,
+        observer_lst: None,
+        min_boresight_altitude: None,
+    };
+
+    // 1. Normal run (should succeed)
+    let sol = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options.clone(),
+    );
+    assert_eq!(sol.status, SolveStatus::MatchFound);
+
+    // Get the solved coordinates so we can place them under the horizon
+    let ra = sol.ra.unwrap();
+    let dec = sol.dec.unwrap();
+
+    // 2. Mathematically place the observer on the exact opposite side of the earth
+    // (Opposite latitude and LST exactly offset by 12 hours/180 degrees)
+    options.observer_latitude = Some(-dec);
+    options.observer_lst = Some((ra + 180.0) % 360.0);
+    options.min_boresight_altitude = Some(0.0);
+
+    let failed_sol = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options.clone(),
+    );
+    assert_eq!(
+        failed_sol.status,
+        SolveStatus::NoMatch,
+        "Solver should have rejected the pattern since it was placed below the horizon"
+    );
+
+    // 3. Place observer in the perfect spot so altitude is exactly +90 (Zenith),
+    // but ask for a minimum boresight altitude of +91 (impossible)
+    options.observer_latitude = Some(dec);
+    options.observer_lst = Some(ra);
+    options.min_boresight_altitude = Some(91.0);
+
+    let failed_sol_alt = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options,
+    );
+    assert_eq!(
+        failed_sol_alt.status,
+        SolveStatus::NoMatch,
+        "Solver should have rejected the solve due to strict boresight limits"
+    );
+}
+
+#[test]
+fn test_location_filtering_accuracy() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+    if !db_path.exists() || !zip_path.exists() {
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).unwrap();
+
+    let zip_file = File::open(zip_path).unwrap();
+    let mut archive = ZipArchive::new(zip_file).unwrap();
+
+    let samples = 738;
+    for x in 1..=samples {
+        let input_filename = format!("input_{}.json", x);
+        let mut input_buffer = Vec::new();
+        archive
+            .by_name(&input_filename)
+            .unwrap()
+            .read_to_end(&mut input_buffer)
+            .unwrap();
+        let input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+        let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+        for c in &input_dto.centroids {
+            flat_cents.push(c[0]);
+            flat_cents.push(c[1]);
+        }
+        let centroids_array =
+            Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+        let options_unfiltered = SolveOptions {
+            fov_estimate: input_dto.options.fov_estimate,
+            ..Default::default()
+        };
+
+        let result_unfiltered = solver.solve(
+            &centroids_array,
+            (input_dto.image_height, input_dto.image_width),
+            options_unfiltered.clone(),
+        );
+
+        let mut options_filtered = options_unfiltered.clone();
+        options_filtered.observer_latitude = Some(41.5);
+        options_filtered.observer_lst = Some(32.0);
+        options_filtered.min_boresight_altitude = Some(0.0);
+
+        let result_filtered = solver.solve(
+            &centroids_array,
+            (input_dto.image_height, input_dto.image_width),
+            options_filtered,
+        );
+
+        assert_eq!(
+            result_filtered.status,
+            SolveStatus::MatchFound,
+            "Sample {} failed to solve with location constraints!",
+            x
+        );
+
+        let diff_ra = (result_filtered.ra.unwrap() - result_unfiltered.ra.unwrap()).abs();
+        assert!(
+            diff_ra < 1e-5,
+            "Sample {} RA changed significantly: {} vs {}",
+            x,
+            result_unfiltered.ra.unwrap(),
+            result_filtered.ra.unwrap()
+        );
+    }
 }

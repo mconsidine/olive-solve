@@ -111,6 +111,20 @@ pub struct SolveOptions {
     pub target_pixel: Option<Array2<f64>>,     // N x 2 (y, x)
     pub target_sky_coord: Option<Array2<f64>>, // N x 2 (ra, dec)
     pub allow_out_of_bounds_target_pixel: Option<bool>,
+
+    /// Optional: The observer's latitude in degrees. If provided alongside `observer_lst`,
+    /// the solver will instantly reject patterns containing stars physically below the horizon.
+    pub observer_latitude: Option<f64>,
+
+    /// Optional: The observer's Local Sidereal Time in degrees. Required for horizon-based early rejection.
+    pub observer_lst: Option<f64>,
+
+    /// Optional: The minimum allowed altitude (in degrees) for the camera's center pixel (boresight).
+    /// 0.0° represents the physical horizon. This value can be negative to allow the camera's center
+    /// to point slightly downwards into the ground, which is necessary if the telescope (target pixel)
+    /// is mounted at an offset and is still pointing at the sky. Used to reject mathematically valid
+    /// false-positives that imply an impossibly low camera orientation.
+    pub min_boresight_altitude: Option<f64>,
 }
 
 impl Default for SolveOptions {
@@ -129,6 +143,9 @@ impl Default for SolveOptions {
             target_pixel: None,
             target_sky_coord: None,
             allow_out_of_bounds_target_pixel: None,
+            observer_latitude: None,
+            observer_lst: None,
+            min_boresight_altitude: None,
         }
     }
 }
@@ -731,6 +748,32 @@ fn verify_and_build_solution(
                 .sqrt(),
         )
         .to_degrees();
+
+    if let (Some(lat), Some(lst), Some(min_alt)) = (
+        options.observer_latitude,
+        options.observer_lst,
+        options.min_boresight_altitude,
+    ) {
+        let lat_rad = lat.to_radians();
+        let lst_rad = lst.to_radians();
+        let zenith = [
+            lat_rad.cos() * lst_rad.cos(),
+            lat_rad.cos() * lst_rad.sin(),
+            lat_rad.sin(),
+        ];
+
+        let boresight = [
+            precise_rotation_matrix[(0, 2)],
+            precise_rotation_matrix[(1, 2)],
+            precise_rotation_matrix[(2, 2)],
+        ];
+        let sin_alt =
+            boresight[0] * zenith[0] + boresight[1] * zenith[1] + boresight[2] * zenith[2];
+        if sin_alt < min_alt.to_radians().sin() {
+            return None; // Boresight is pointing below the allowed horizon limit
+        }
+    }
+
     let mut roll = precise_rotation_matrix[(1, 2)]
         .atan2(precise_rotation_matrix[(2, 2)])
         .to_degrees();
@@ -1679,6 +1722,21 @@ impl Solver {
         let match_threshold = options.match_threshold / (self.num_patterns as f64);
         let presorted = *self.db_props.get("presort_patterns").unwrap_or(&0.0) == 1.0;
 
+        // OPTIMIZATION: Early physical rejection
+        // Pre-compute zenith vector once per solve
+        let observer_zenith =
+            if let (Some(lat), Some(lst)) = (options.observer_latitude, options.observer_lst) {
+                let lat_rad = lat.to_radians();
+                let lst_rad = lst.to_radians();
+                Some([
+                    lat_rad.cos() * lst_rad.cos(),
+                    lat_rad.cos() * lst_rad.sin(),
+                    lat_rad.sin(),
+                ])
+            } else {
+                None
+            };
+
         let num_centroids_raw = star_centroids.nrows();
         if num_centroids_raw < p_size {
             return Solution {
@@ -2058,6 +2116,25 @@ impl Solver {
                                         4,
                                     );
                                 };
+
+                                // If any of the 4 matched catalog stars are physically below the horizon
+                                // right now, this pattern is mathematically impossible to see. Reject instantly.
+                                if let Some(zenith) = observer_zenith {
+                                    let mut invalid = false;
+                                    for i in 0..4 {
+                                        let star = scratch.sp_catalog_pattern_vectors_sorted[i];
+                                        let sin_alt = star[0] * zenith[0]
+                                            + star[1] * zenith[1]
+                                            + star[2] * zenith[2];
+                                        if sin_alt < 0.0 {
+                                            invalid = true;
+                                            break;
+                                        }
+                                    }
+                                    if invalid {
+                                        continue;
+                                    }
+                                }
 
                                 let (rotation_matrix, _det) =
                                     match find_rotation_matrix_and_det_inplace(

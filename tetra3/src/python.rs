@@ -311,6 +311,21 @@ impl SolveOptions {
                     options.target_sky_coord = Some(py_arr.as_array().to_owned());
                 }
             }
+            if let Some(val) = dict.get_item("observer_latitude")? {
+                if !val.is_none() {
+                    options.observer_latitude = Some(val.extract()?);
+                }
+            }
+            if let Some(val) = dict.get_item("observer_lst")? {
+                if !val.is_none() {
+                    options.observer_lst = Some(val.extract()?);
+                }
+            }
+            if let Some(val) = dict.get_item("min_boresight_altitude")? {
+                if !val.is_none() {
+                    options.min_boresight_altitude = Some(val.extract()?);
+                }
+            }
         }
         Ok(options)
     }
