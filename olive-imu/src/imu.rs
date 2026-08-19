@@ -254,6 +254,13 @@ impl Imu {
 
             // Main hardware polling loop. Extracts messages from the I2C bus.
             loop {
+                // If the primary Imu struct was dropped, our state_clone is the only remaining reference.
+                // This gracefully kills the ghost thread and releases the I2C device.
+                if Arc::strong_count(&state_clone) <= 1 {
+                    log::info!("Imu struct dropped. Terminating hardware polling thread.");
+                    break;
+                }
+
                 std::thread::sleep(Duration::from_millis(10));
 
                 match device.poll() {
