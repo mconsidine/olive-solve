@@ -776,3 +776,101 @@ fn test_location_filtering_accuracy() {
         );
     }
 }
+
+#[test]
+fn test_location_filtering_performance() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+    if !db_path.exists() || !zip_path.exists() {
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).unwrap();
+
+    let zip_file = File::open(zip_path).unwrap();
+    let mut archive = ZipArchive::new(zip_file).unwrap();
+
+    let samples = 738;
+    let sets = 50;
+
+    // Load all samples into memory
+    let mut all_centroids = Vec::with_capacity(samples);
+    let mut all_image_sizes = Vec::with_capacity(samples);
+    let mut all_options_unfiltered = Vec::with_capacity(samples);
+    let mut all_options_filtered = Vec::with_capacity(samples);
+
+    for x in 1..=samples {
+        let input_filename = format!("input_{}.json", x);
+        let mut input_buffer = Vec::new();
+        archive
+            .by_name(&input_filename)
+            .unwrap()
+            .read_to_end(&mut input_buffer)
+            .unwrap();
+        let input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+        let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+        for c in &input_dto.centroids {
+            flat_cents.push(c[0]);
+            flat_cents.push(c[1]);
+        }
+        let centroids_array =
+            Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+        all_centroids.push(centroids_array);
+        all_image_sizes.push((input_dto.image_height, input_dto.image_width));
+
+        let options_unfiltered = SolveOptions {
+            fov_estimate: input_dto.options.fov_estimate,
+            ..Default::default()
+        };
+        all_options_unfiltered.push(options_unfiltered.clone());
+
+        let mut options_filtered = options_unfiltered.clone();
+        options_filtered.observer_latitude = Some(41.5);
+        options_filtered.observer_lst = Some(32.0);
+        options_filtered.min_boresight_altitude = Some(0.0);
+        all_options_filtered.push(options_filtered);
+    }
+
+    let total_solves = samples * sets;
+
+    // Benchmark without filters
+    let start_unfiltered = Instant::now();
+    for _ in 0..sets {
+        for i in 0..samples {
+            let _ = solver.solve(
+                &all_centroids[i],
+                all_image_sizes[i],
+                all_options_unfiltered[i].clone(),
+            );
+        }
+    }
+    let duration_unfiltered = start_unfiltered.elapsed();
+    let avg_unfiltered = duration_unfiltered.as_secs_f64() * 1000.0 / total_solves as f64;
+
+    // Benchmark with filters
+    let start_filtered = Instant::now();
+    for _ in 0..sets {
+        for i in 0..samples {
+            let _ = solver.solve(
+                &all_centroids[i],
+                all_image_sizes[i],
+                all_options_filtered[i].clone(),
+            );
+        }
+    }
+    let duration_filtered = start_filtered.elapsed();
+    let avg_filtered = duration_filtered.as_secs_f64() * 1000.0 / total_solves as f64;
+
+    println!(
+        "Performance comparison ({} samples, {} sets, total {} solves):",
+        samples, sets, total_solves
+    );
+    println!("  Without filters:");
+    println!("    Total time: {:.2?}", duration_unfiltered);
+    println!("    Average time per solve: {:.3} ms", avg_unfiltered);
+    println!("  With location filters:");
+    println!("    Total time: {:.2?}", duration_filtered);
+    println!("    Average time per solve: {:.3} ms", avg_filtered);
+}
