@@ -248,6 +248,14 @@ impl PyTetra3 {
     /// Runs plate solving from pre-extracted centroids.
     /// Returns a dictionary containing the solution and execution times.
     ///
+    /// Optional horizon-based early rejection (opt-in): pass
+    /// `observer_latitude` and `observer_lst` (both degrees) to skip candidate
+    /// patterns whose stars are below the observer's horizon, and
+    /// `min_boresight_altitude` (degrees) to also reject a solution pointing
+    /// below that altitude. Requires a trusted clock/position — a wrong UTC or
+    /// latitude can reject valid solves. Omit them (the default) for the
+    /// original behavior.
+    ///
     /// Returns:
     ///     dict: A dictionary with the following keys is returned:
     ///         - 'RA': Right ascension of centre of image in degrees.
@@ -673,6 +681,25 @@ fn parse_solve_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<SolveOpti
         }
         if let Some(val) = dict.get_item("strict_hint")? {
             options.strict_hint = val.extract()?;
+        }
+        // Horizon-based early rejection (opt-in). Supply observer_latitude +
+        // observer_lst (both degrees) to prune patterns with below-horizon
+        // stars; add min_boresight_altitude (degrees) to also reject a final
+        // solution pointing below that altitude.
+        if let Some(val) = dict.get_item("observer_latitude")? {
+            if !val.is_none() {
+                options.observer_latitude = Some(val.extract()?);
+            }
+        }
+        if let Some(val) = dict.get_item("observer_lst")? {
+            if !val.is_none() {
+                options.observer_lst = Some(val.extract()?);
+            }
+        }
+        if let Some(val) = dict.get_item("min_boresight_altitude")? {
+            if !val.is_none() {
+                options.min_boresight_altitude = Some(val.extract()?);
+            }
         }
         if let Some(val) = dict.get_item("parallel")? {
             options.parallel = val.extract()?;
