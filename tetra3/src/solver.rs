@@ -125,6 +125,27 @@ pub struct SolveOptions {
     /// cone — to enforce a strict re-acquisition window. No effect when
     /// `attitude_hint` is `None`.
     pub strict_hint: bool,
+    /// Observer's geographic latitude [degrees]. Together with `observer_lst`
+    /// this enables horizon-based early rejection: every detected image star is
+    /// by definition above the observer's horizon, so a candidate catalog
+    /// pattern that contains a star well below the horizon is physically
+    /// impossible and is dropped before the expensive KD-tree verification.
+    /// Opt-in and **requires a trusted clock/position** — a wrong UTC (hence
+    /// LST) or latitude rotates the horizon and can reject valid solves.
+    /// `None` disables (default). No effect unless `observer_lst` is also set.
+    pub observer_latitude: Option<f64>,
+    /// Observer's Local Sidereal Time [degrees, 0–360] at capture time. Equals
+    /// the right ascension on the local meridian — i.e. the zenith's RA.
+    /// Required together with `observer_latitude` for horizon rejection.
+    /// `None` disables (default).
+    pub observer_lst: Option<f64>,
+    /// Minimum allowed altitude of the boresight (image-center pixel) [degrees];
+    /// 0 = geometric horizon, negative allows slightly below. A final solution
+    /// whose center points below this altitude is rejected as spurious.
+    /// Requires `observer_latitude` + `observer_lst`. `None` (default) disables
+    /// only this boresight gate; the per-star pattern prune still runs whenever
+    /// latitude + LST are supplied.
+    pub min_boresight_altitude: Option<f64>,
     /// Distribute the pattern-candidate search across the rayon thread pool.
     /// The result is identical to the serial search: the first verified match
     /// in enumeration order wins, and workers poll the same timeout/cancel
@@ -151,6 +172,9 @@ impl Default for SolveOptions {
             attitude_hint: None,
             hint_uncertainty_deg: 15.0,
             strict_hint: false,
+            observer_latitude: None,
+            observer_lst: None,
+            min_boresight_altitude: None,
             parallel: true,
         }
     }
@@ -565,6 +589,38 @@ fn rotation_matrix_to_quat(r: &Matrix3<f64>) -> [f64; 4] {
 
 // Helper to build the solution
 #[allow(clippy::too_many_arguments)]
+/// Altitude floor for the per-star horizon prune, expressed as sin(altitude).
+/// A candidate pattern star is dropped only when it sits clearly below the
+/// horizon (−5°), leaving margin for atmospheric refraction (~0.5° near the
+/// horizon) and small clock/position error so a genuine near-horizon pattern
+/// star is never rejected. Still removes the ~45% of the sky that is well below
+/// the horizon.
+const HORIZON_STAR_SIN_FLOOR: f64 = -0.0871557; // sin(-5°)
+
+/// Unit vector toward the observer's zenith in the catalog's equatorial (ICRS)
+/// frame, from latitude and Local Sidereal Time (both degrees). The zenith's
+/// right ascension is the LST and its declination is the latitude, so this is
+/// just the standard RA/Dec → unit-vector conversion. Dotting a catalog star's
+/// unit vector with this gives sin(altitude) of that star for the observer.
+#[inline]
+fn zenith_vector(lat_deg: f64, lst_deg: f64) -> [f64; 3] {
+    let lat = lat_deg.to_radians();
+    let lst = lst_deg.to_radians();
+    [lat.cos() * lst.cos(), lat.cos() * lst.sin(), lat.sin()]
+}
+
+/// sin(altitude) of an equatorial direction (RA, Dec in degrees) for an observer
+/// at `lat_deg` and local sidereal time `lst_deg`. Standard relation
+/// sin(alt) = sin(dec)·sin(lat) + cos(dec)·cos(lat)·cos(LST − RA); independent of
+/// any rotation-matrix convention.
+#[inline]
+fn equatorial_sin_altitude(ra_deg: f64, dec_deg: f64, lat_deg: f64, lst_deg: f64) -> f64 {
+    let dec = dec_deg.to_radians();
+    let lat = lat_deg.to_radians();
+    let lha = (lst_deg - ra_deg).to_radians();
+    dec.sin() * lat.sin() + dec.cos() * lat.cos() * lha.cos()
+}
+
 fn verify_and_build_solution(
     scratch: &mut Scratchpads,
     star_kd_tree: &ImmutableKdTree<f32, 3>,
@@ -805,6 +861,20 @@ fn verify_and_build_solution(
                 .sqrt(),
         )
         .to_degrees();
+
+    // Horizon boresight gate (opt-in): reject a final solution whose center
+    // pixel points below the observer's altitude limit. Derived from the solved
+    // RA/Dec, so it is independent of the rotation-matrix convention.
+    if let (Some(lat), Some(lst), Some(min_alt)) = (
+        options.observer_latitude,
+        options.observer_lst,
+        options.min_boresight_altitude,
+    ) {
+        if equatorial_sin_altitude(ra, dec, lat, lst) < min_alt.to_radians().sin() {
+            return None;
+        }
+    }
+
     let mut roll = precise_rotation_matrix[(1, 2)]
         .atan2(precise_rotation_matrix[(2, 2)])
         .to_degrees();
@@ -993,6 +1063,10 @@ struct ComboContext<'a> {
     db_props: &'a HashMap<String, f64>,
     num_patterns: usize,
     linear_probe: bool,
+    /// Precomputed observer zenith unit vector (equatorial frame) for
+    /// horizon-based early rejection, or `None` when the observer's
+    /// latitude/LST were not supplied.
+    zenith: Option<[f64; 3]>,
 }
 
 fn aborted_solution(is_cancelled: &AtomicBool, t0_solve: Instant) -> Solution {
@@ -1184,6 +1258,30 @@ fn try_pattern_combo(
                 );
             };
 
+            // Horizon-based early rejection (opt-in via observer lat + LST).
+            // Every detected image star is above the observer's horizon right
+            // now, so any candidate catalog pattern containing a star below the
+            // horizon is physically impossible — drop it before the SVD. The
+            // four pattern entries are catalog unit vectors in the equatorial
+            // frame; dotting with the zenith gives sin(altitude). A small
+            // below-horizon margin (HORIZON_STAR_SIN_FLOOR) absorbs refraction
+            // and minor clock/position error so a true near-horizon star is
+            // never cut.
+            if let Some(zenith) = ctx.zenith {
+                let mut below_horizon = false;
+                for i in 0..4 {
+                    let s = scratch.sp_catalog_pattern_vectors_sorted[i];
+                    let sin_alt = s[0] * zenith[0] + s[1] * zenith[1] + s[2] * zenith[2];
+                    if sin_alt < HORIZON_STAR_SIN_FLOOR {
+                        below_horizon = true;
+                        break;
+                    }
+                }
+                if below_horizon {
+                    continue;
+                }
+            }
+
             let (rotation_matrix, _det) = match find_rotation_matrix_and_det_inplace(
                 &scratch.sp_image_pattern_vectors_sorted,
                 &scratch.sp_catalog_pattern_vectors_sorted,
@@ -1222,8 +1320,9 @@ fn try_pattern_combo(
                 let v1 = r[(1, 0)] * vec[0] + r[(1, 1)] * vec[1] + r[(1, 2)] * vec[2];
                 let v2 = r[(2, 0)] * vec[0] + r[(2, 1)] * vec[1] + r[(2, 2)] * vec[2];
 
-                let dist_sq =
-                    (v0 - img_vec[0]).powi(2) + (v1 - img_vec[1]).powi(2) + (v2 - img_vec[2]).powi(2);
+                let dist_sq = (v0 - img_vec[0]).powi(2)
+                    + (v1 - img_vec[1]).powi(2)
+                    + (v2 - img_vec[2]).powi(2);
                 if dist_sq > max_dist_sq {
                     valid_shape = false;
                     break;
@@ -2018,6 +2117,13 @@ impl Solver {
                 pass_options.attitude_hint = None;
             }
 
+            // Precompute the observer zenith once per pass for horizon rejection
+            // (None unless both latitude and LST were supplied).
+            let zenith = match (pass_options.observer_latitude, pass_options.observer_lst) {
+                (Some(lat), Some(lst)) => Some(zenith_vector(lat, lst)),
+                _ => None,
+            };
+
             let ctx = ComboContext {
                 precomputed_angles: &precomputed_angles,
                 num_vecs,
@@ -2041,6 +2147,7 @@ impl Solver {
                 db_props: &self.db_props,
                 num_patterns: self.num_patterns,
                 linear_probe: self.linear_probe,
+                zenith,
             };
 
             if use_parallel {
@@ -2240,5 +2347,70 @@ impl Drop for Solver {
         if let Some(handle) = self.watchdog_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod horizon_tests {
+    use super::{equatorial_sin_altitude, zenith_vector};
+
+    // Unit vector for an equatorial direction (RA, Dec in degrees), matching the
+    // convention of the catalog star vectors dotted in the per-star horizon gate.
+    fn radec_unit(ra_deg: f64, dec_deg: f64) -> [f64; 3] {
+        let ra = ra_deg.to_radians();
+        let dec = dec_deg.to_radians();
+        [dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    #[test]
+    fn star_at_zenith_has_altitude_90() {
+        // A star whose RA == LST and Dec == latitude sits at the zenith: sin(alt)=1.
+        let (lat, lst) = (40.0, 123.0);
+        let s = radec_unit(lst, lat);
+        let z = zenith_vector(lat, lst);
+        assert!((dot(s, z) - 1.0).abs() < 1e-9);
+        assert!((equatorial_sin_altitude(lst, lat, lat, lst) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn star_opposite_zenith_is_below_horizon() {
+        // The anti-zenith point (nadir) has sin(alt) = -1, well below any floor.
+        let (lat, lst): (f64, f64) = (40.0, 123.0);
+        let nadir = radec_unit((lst + 180.0).rem_euclid(360.0), -lat);
+        let z = zenith_vector(lat, lst);
+        assert!(dot(nadir, z) < -0.999);
+    }
+
+    #[test]
+    fn dot_with_zenith_equals_sin_altitude() {
+        // The two code paths (per-star dot product and the boresight formula)
+        // must agree for arbitrary directions and observers.
+        let cases = [
+            (10.0, 45.0, 200.0, 30.0),
+            (-33.0, 350.0, 12.0, -75.0),
+            (51.5, 90.0, 250.0, 60.0),
+            (0.0, 0.0, 0.0, 0.0),
+        ];
+        for (lat, lst, ra, dec) in cases {
+            let via_dot = dot(radec_unit(ra, dec), zenith_vector(lat, lst));
+            let via_formula = equatorial_sin_altitude(ra, dec, lat, lst);
+            assert!(
+                (via_dot - via_formula).abs() < 1e-12,
+                "mismatch at lat={lat} lst={lst} ra={ra} dec={dec}: {via_dot} vs {via_formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn horizon_sign_matches_geometry() {
+        // At lat=0, lst=0 the zenith is (RA=0, Dec=0). A star at RA=0,Dec=0 is up;
+        // one at RA=180 (or |Dec| near 90) is down.
+        assert!(equatorial_sin_altitude(0.0, 0.0, 0.0, 0.0) > 0.0);
+        assert!(equatorial_sin_altitude(180.0, 0.0, 0.0, 0.0) < 0.0);
+        assert!(equatorial_sin_altitude(0.0, 89.0, 0.0, 0.0) > 0.0); // near NCP, low but up-ish? check sign
     }
 }
