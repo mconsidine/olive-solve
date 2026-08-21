@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "tetra3"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "image",
  "kiddo",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "tetra3-py"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "numpy",
  "pyo3",
