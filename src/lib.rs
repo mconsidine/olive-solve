@@ -176,9 +176,15 @@ impl FusedSolver {
             ImuType::None => return Err("Cannot start IMU because ImuType is None.".into()),
             ImuType::Auto => {
                 // Try Bno085 primary/alt
-                if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true) {
+                if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, Some(3)) {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, Some(3))
+                {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, None) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true, None) {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x28) {
                     Some(Imu::start(dev, self.storage.clone())?)
@@ -197,9 +203,15 @@ impl FusedSolver {
                 }
             }
             ImuType::Bno085 => {
-                if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true) {
+                if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, Some(3)) {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, Some(3))
+                {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, None) {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true, None) {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("BNO085 hardware not found on I2C bus.".into());

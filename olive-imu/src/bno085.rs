@@ -27,13 +27,15 @@ mod hardware {
             report_interval_ms: u16,
             address: u8,
             use_calibrated: bool,
+            i2c_bus: Option<u8>,
         ) -> Result<Self, String> {
+            let bus = i2c_bus.unwrap_or(1);
+            let bus_path = format!("/dev/i2c-{}", bus);
             info!(
-                "Initializing BNO085 hardware over I2C at address 0x{:X}...",
-                address
+                "Initializing BNO085 hardware over I2C ({}) at address 0x{:X}...",
+                bus_path, address
             );
-            let i2c =
-                I2cdev::new("/dev/i2c-1").map_err(|e| format!("I2cdev::new failed: {:?}", e))?;
+            let i2c = I2cdev::new(&bus_path).map_err(|e| format!("I2cdev::new failed: {:?}", e))?;
             let interface = I2cInterface::new(i2c, address);
             let mut imu = BNO080::new_with_interface(interface);
             let mut delay = Delay {};
