@@ -763,9 +763,9 @@ fn verify_and_build_solution(
         ];
 
         let boresight = [
+            precise_rotation_matrix[(0, 0)],
+            precise_rotation_matrix[(0, 1)],
             precise_rotation_matrix[(0, 2)],
-            precise_rotation_matrix[(1, 2)],
-            precise_rotation_matrix[(2, 2)],
         ];
         let sin_alt =
             boresight[0] * zenith[0] + boresight[1] * zenith[1] + boresight[2] * zenith[2];

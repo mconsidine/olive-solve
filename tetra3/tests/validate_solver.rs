@@ -687,21 +687,36 @@ fn test_horizon_filter() {
         "Solver should have rejected the pattern since it was placed below the horizon"
     );
 
-    // 3. Place observer in the perfect spot so altitude is exactly +90 (Zenith),
-    // but ask for a minimum boresight altitude of +91 (impossible)
-    options.observer_latitude = Some(dec);
+    // 3. Place observer so altitude is exactly +80 degrees.
+    // To do this, we can set latitude = dec - 10.0 and lst = ra
+    options.observer_latitude = Some(dec - 10.0);
     options.observer_lst = Some(ra);
-    options.min_boresight_altitude = Some(91.0);
+
+    // First, ask for a minimum boresight altitude of +85 (impossible, since alt is 80)
+    options.min_boresight_altitude = Some(85.0);
 
     let failed_sol_alt = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options.clone(),
+    );
+    assert_eq!(
+        failed_sol_alt.status,
+        SolveStatus::NoMatch,
+        "Solver should have rejected the solve since alt (80) is less than min_alt (85)"
+    );
+
+    // 4. Ask for a minimum boresight altitude of +75 (should pass since alt is 80)
+    options.min_boresight_altitude = Some(75.0);
+    let success_sol_alt = solver.solve(
         &centroids_array,
         (input_dto.image_height, input_dto.image_width),
         options,
     );
     assert_eq!(
-        failed_sol_alt.status,
-        SolveStatus::NoMatch,
-        "Solver should have rejected the solve due to strict boresight limits"
+        success_sol_alt.status,
+        SolveStatus::MatchFound,
+        "Solver should have accepted the solve since alt (80) is greater than min_alt (75)"
     );
 }
 
