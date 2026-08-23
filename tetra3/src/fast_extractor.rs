@@ -73,6 +73,7 @@ pub struct FastExtractOptionsUpdate {
     pub noise_filter: Option<bool>,
     pub min_area: Option<usize>,
     pub max_area: Option<usize>,
+    pub virtual_crops: Option<Option<Vec<crate::extractor::Crop>>>,
 }
 
 impl Default for FastExtractOptions {
@@ -199,6 +200,9 @@ impl FastExtractor {
         }
         if let Some(mxa) = update.max_area {
             self.options.max_area = Some(mxa);
+        }
+        if let Some(vc) = update.virtual_crops {
+            self.options.virtual_crops = vc;
         }
     }
 

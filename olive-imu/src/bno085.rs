@@ -236,7 +236,12 @@ mod stub {
 
     impl Bno085Device {
         /// Creates a new `Bno085Device`.
-        pub fn new(_interval: u16, _address: u8, _calib: bool) -> Result<Self, String> {
+        pub fn new(
+            _interval: u16,
+            _address: u8,
+            _calib: bool,
+            _i2c_bus: Option<u8>,
+        ) -> Result<Self, String> {
             Err("Hardware I2C is only supported on Linux/Android".into())
         }
     }
