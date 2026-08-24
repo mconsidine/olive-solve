@@ -906,6 +906,38 @@ impl Imu {
         }
     }
 
+    /// Updates the positional IMU anchor from a true camera position without adding
+    /// the movement vector to the SVD calibration pool. This safely cures gyro drift
+    /// using low-confidence plate solves without risking permanent geometric corruption.
+    pub fn update_pointing_anchor_only(
+        &self,
+        camera_pointing: &MountCoordinates,
+        timestamp: &SystemTime,
+    ) {
+        let imu_state = *self.state.read().unwrap();
+
+        if imu_state.is_some() {
+            let historical_imu_q = self.get_historical_quat(timestamp);
+
+            if let Some((hist_q, motion_state)) = historical_imu_q {
+                if motion_state != MotionState::Stable {
+                    debug!(
+                        "Image was captured during movement. Rejecting pointing anchor update to prevent timestamp and rolling shutter artifacts."
+                    );
+                    return;
+                }
+
+                let mut align = self.alignment.write().unwrap();
+                align.last_camera_position = Some(*camera_pointing);
+                align.imu_anchor_state = Some(hist_q);
+
+                debug!(
+                    "IMU pointing anchor successfully updated from low-confidence solve. SVD calibration bypassed."
+                );
+            }
+        }
+    }
+
     // Clears the active session anchors and telemetry, but strictly preserves
     // the SVD calibration pool, mount_q, and disk file to support file-less recalibration and
     // uninterrupted EQ tracking.

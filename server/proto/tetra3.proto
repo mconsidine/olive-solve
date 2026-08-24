@@ -10,6 +10,7 @@ enum SolveStatus {
     TIMEOUT = 2;
     CANCELLED = 3;
     TOO_FEW = 4;
+    LOW_CONFIDENCE_MATCH = 5;
 }
 
 enum BgSubMode {
@@ -110,6 +111,11 @@ message SolveOptions {
     optional bool return_rotation_matrix = 10;
     repeated Pixel target_pixel = 11;
     repeated SkyCoord target_sky_coord = 12;
+    optional bool allow_out_of_bounds_target_pixel = 13;
+    optional double observer_latitude = 14;
+    optional double observer_lst = 15;
+    optional double min_boresight_altitude = 16;
+    optional bool return_best_failed_match = 17;
 }
 
 // --- Responses ---

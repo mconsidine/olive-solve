@@ -28,7 +28,3 @@ serde_json = "1.0"
 [features]
 python = ["pyo3", "numpy"]
 
-[[bin]]
-name = "test_db"
-path = "src/bin_db.rs"
-

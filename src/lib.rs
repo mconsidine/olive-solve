@@ -382,6 +382,12 @@ impl FusedSolver {
             );
         }
 
+        // Track the highest-confidence fallback match across all centroid crop attempts,
+        // so we can attempt to rescue it using IMU verification if no perfect match is found.
+        let mut best_low_conf_solution: Option<Solution> = None;
+        let mut best_low_conf_prob = f64::INFINITY;
+        let mut best_low_conf_index = 0;
+
         for (i, (centroids, crop_opt)) in centroids_batch.iter().enumerate() {
             let mut item_options = actual_options.clone();
             let mut item_size = main_size;
@@ -425,9 +431,10 @@ impl FusedSolver {
             }
 
             let mut solution = solver.solve(&item_centroids, item_size, item_options);
-            let found = solution.status == SolveStatus::MatchFound;
 
-            if found {
+            if solution.status == SolveStatus::MatchFound
+                || solution.status == SolveStatus::LowConfidenceMatch
+            {
                 // Project target pixel coordinates back to the main image
                 if let Some(ref mut target_y) = solution.target_y {
                     for y in target_y.iter_mut().flatten() {
@@ -458,26 +465,75 @@ impl FusedSolver {
                 }
             }
 
+            if solution.status == SolveStatus::MatchFound {
+                last_solution = Some(solution);
+                last_index = i;
+                break;
+            } else if solution.status == SolveStatus::LowConfidenceMatch {
+                // Keep track of the lowest-probability LowConfidenceMatch so we can
+                // fall back to it if no perfect MatchFound is discovered in this batch.
+                let prob = solution.prob.unwrap_or(f64::INFINITY);
+                if prob < best_low_conf_prob {
+                    best_low_conf_prob = prob;
+                    best_low_conf_solution = Some(solution.clone());
+                    best_low_conf_index = i;
+                }
+            }
+
             last_solution = Some(solution);
             last_index = i;
-
-            if found {
-                break;
-            }
         }
 
-        let solution = last_solution.ok_or_else(|| "No centroid sets provided.".to_string())?;
+        let (mut solution, solve_crop_index) = if let Some(last) = last_solution {
+            if last.status == SolveStatus::MatchFound {
+                (last, last_index)
+            } else if let Some(best_low_conf) = best_low_conf_solution {
+                (best_low_conf, best_low_conf_index)
+            } else {
+                (last, last_index)
+            }
+        } else {
+            return Err("No centroid sets provided.".to_string());
+        };
 
         if solution.status == SolveStatus::MatchFound {
             *self.last_solve_failed.write().unwrap() = false;
             self.update_anchor_from_solution(&solution, time);
+        } else if solution.status == SolveStatus::LowConfidenceMatch {
+            // Only accept a low confidence fallback if the IMU can physically verify it
+            // is within a tight 5-degree geometric cone of our expected orientation.
+            let imu_verified = self.verify_solution_with_imu(&solution, time, 5.0);
+
+            match imu_verified {
+                Some(true) => {
+                    solution.status = SolveStatus::MatchFound;
+                    *self.last_solve_failed.write().unwrap() = false;
+
+                    *self.latest_solve_position.write().unwrap() = Some(Position {
+                        ra: solution.ra.unwrap_or(0.0),
+                        dec: solution.dec.unwrap_or(0.0),
+                        roll: solution.roll.unwrap_or(0.0),
+                        source: PositionSource::Solver,
+                        timestamp: time,
+                    });
+
+                    self.update_pointing_anchor_only_from_solution(&solution, time);
+                }
+                Some(false) => {
+                    solution.status = SolveStatus::NoMatch;
+                    *self.last_solve_failed.write().unwrap() = true;
+                }
+                None => {
+                    *self.last_solve_failed.write().unwrap() = true;
+                }
+            }
         } else {
             *self.last_solve_failed.write().unwrap() = true;
         }
 
         Ok(BatchSolution {
             solution,
-            crop_index: last_index,
+            crop_index: solve_crop_index,
             solve_time: batch_start.elapsed(),
         })
     }
@@ -647,6 +703,73 @@ impl FusedSolver {
             source: PositionSource::Solver,
             timestamp: time,
         });
+    }
+
+    fn update_pointing_anchor_only_from_solution(&self, solution: &Solution, time: SystemTime) {
+        let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
+            t_ra[0]
+        } else {
+            solution.ra.unwrap_or(0.0)
+        };
+        let dec = if let (Some(_t_ra), Some(t_dec)) = (&solution.target_ra, &solution.target_dec) {
+            t_dec[0]
+        } else {
+            solution.dec.unwrap_or(0.0)
+        };
+        let roll = solution.roll.unwrap_or(0.0);
+
+        if let Some(ref imu) = *self.imu.read().unwrap() {
+            let lat_opt = *self.latitude.read().unwrap();
+            let lon_opt = *self.longitude.read().unwrap();
+
+            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                let dt: chrono::DateTime<chrono::Utc> = time.into();
+                let (alt, az, alt_az_roll) = ra_dec_to_alt_az(ra, dec, roll, lat, lon, dt);
+
+                let mount_coords = MountCoordinates {
+                    pitch: alt,
+                    yaw: az,
+                    roll: alt_az_roll,
+                };
+                imu.update_pointing_anchor_only(&mount_coords, &time);
+            }
+        }
+    }
+
+    fn verify_solution_with_imu(
+        &self,
+        solution: &Solution,
+        time: SystemTime,
+        max_dist_deg: f64,
+    ) -> Option<bool> {
+        let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
+            t_ra[0]
+        } else {
+            solution.ra.unwrap_or(0.0)
+        };
+        let dec = if let (Some(_t_ra), Some(t_dec)) = (&solution.target_ra, &solution.target_dec) {
+            t_dec[0]
+        } else {
+            solution.dec.unwrap_or(0.0)
+        };
+
+        let imu_guard = self.imu.read().unwrap();
+        if let Some(ref imu) = *imu_guard {
+            let lat_opt = *self.latitude.read().unwrap();
+            let lon_opt = *self.longitude.read().unwrap();
+
+            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                if let Ok((est, _)) = imu.get_estimated_pointing(&time) {
+                    let dt: chrono::DateTime<chrono::Utc> = time.into();
+                    let (imu_ra, imu_dec, _) =
+                        alt_az_to_ra_dec(est.pitch, est.yaw, est.roll, lat, lon, dt);
+
+                    let dist = angular_separation_deg(ra, dec, imu_ra, imu_dec);
+                    return Some(dist <= max_dist_deg);
+                }
+            }
+        }
+        None
     }
 
     // ==========================================
@@ -1304,6 +1427,115 @@ mod tests {
             "Target Y mismatched: crop={}, base={}",
             y_val,
             base_y
+        );
+    }
+}
+
+/// Computes the great-circle angular distance between two sky coordinates in degrees.
+pub fn angular_separation_deg(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
+    let ra1_rad = ra1_deg.to_radians();
+    let dec1_rad = dec1_deg.to_radians();
+    let ra2_rad = ra2_deg.to_radians();
+    let dec2_rad = dec2_deg.to_radians();
+
+    let cos_theta = dec1_rad.sin() * dec2_rad.sin()
+        + dec1_rad.cos() * dec2_rad.cos() * (ra1_rad - ra2_rad).cos();
+    cos_theta.clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+#[cfg(test)]
+mod new_tests {
+    use super::*;
+
+    struct MockImuWithData;
+    impl ImuDevice for MockImuWithData {
+        fn init(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Vec<olive_imu::SensorEvent>, String> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Return identity quaternion constantly, meaning IMU reports no physical movement.
+            Ok(vec![olive_imu::SensorEvent {
+                gyro: Some(nalgebra::Vector3::new(0.0, 0.0, 0.0)),
+                dt: Some(0.01),
+                hardware_quaternion: Some(nalgebra::UnitQuaternion::from_quaternion(
+                    nalgebra::Quaternion::new(1.0, 0.0, 0.0, 0.0),
+                )),
+                ..Default::default()
+            }])
+        }
+        fn revive(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_imu_verification_low_confidence_match() {
+        let fs = FusedSolver {
+            solver: Arc::new(RwLock::new(None)),
+            extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
+            imu: Arc::new(RwLock::new(None)),
+            imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImuWithData)))),
+            storage: None,
+            latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
+        };
+
+        fs.set_observer_location(34.0, -118.0);
+        fs.start_imu().unwrap();
+
+        // Let the IMU thread accumulate some history
+        std::thread::sleep(std::time::Duration::from_millis(3100)); // Must wait for IMU 3-second warm-up to finish!
+
+        let t0 = std::time::SystemTime::now();
+
+        // Anchor the IMU exactly at RA=100.0, Dec=50.0
+        let anchor_sol = tetra3::solver::Solution {
+            ra: Some(100.0),
+            dec: Some(50.0),
+            roll: Some(0.0),
+            status: tetra3::solver::SolveStatus::MatchFound,
+            ..Default::default()
+        };
+        fs.update_anchor_from_solution(&anchor_sol, t0);
+
+        // Wait a tiny bit
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let t1 = std::time::SystemTime::now();
+
+        // The IMU hasn't moved (always returning identity quaternion), so its estimate is still basically 100.0, 50.0.
+        // Let's create a LowConfidenceMatch that is ~2 degrees away (within 5 degree cone).
+        let candidate_verified = tetra3::solver::Solution {
+            ra: Some(101.5), // ~1.5 degrees away in RA
+            dec: Some(51.0), // ~1.0 degrees away in Dec
+            roll: Some(0.0),
+            status: tetra3::solver::SolveStatus::LowConfidenceMatch,
+            ..Default::default()
+        };
+
+        let verified = fs.verify_solution_with_imu(&candidate_verified, t1, 5.0);
+        assert_eq!(
+            verified,
+            Some(true),
+            "Candidate should be verified as it is within 5 degrees"
+        );
+
+        // Let's test a candidate that is 10 degrees away
+        let candidate_rejected = tetra3::solver::Solution {
+            ra: Some(110.0),
+            dec: Some(50.0),
+            roll: Some(0.0),
+            status: tetra3::solver::SolveStatus::LowConfidenceMatch,
+            ..Default::default()
+        };
+        let rejected = fs.verify_solution_with_imu(&candidate_rejected, t1, 5.0);
+        assert_eq!(
+            rejected,
+            Some(false),
+            "Candidate should be rejected as it is >5 degrees away"
         );
     }
 }

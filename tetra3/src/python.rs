@@ -326,6 +326,11 @@ impl SolveOptions {
                     options.min_boresight_altitude = Some(val.extract()?);
                 }
             }
+            if let Some(val) = dict.get_item("return_best_failed_match")? {
+                if !val.is_none() {
+                    options.return_best_failed_match = val.extract()?;
+                }
+            }
         }
         Ok(options)
     }

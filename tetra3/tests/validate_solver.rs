@@ -157,6 +157,7 @@ fn test_solver_consistency_with_testdata() {
             observer_latitude: None,
             observer_lst: None,
             min_boresight_altitude: None,
+            return_best_failed_match: false,
         };
 
         // --- Capture the execution time ---
@@ -178,6 +179,7 @@ fn test_solver_consistency_with_testdata() {
             SolveStatus::Timeout => "Timeout",
             SolveStatus::Cancelled => "Cancelled",
             SolveStatus::TooFew => "TooFew",
+            SolveStatus::LowConfidenceMatch => "LowConfidenceMatch",
         };
 
         if expected_dto.status == "MatchFound" {
@@ -353,6 +355,7 @@ fn test_solver_mirrored_image() {
         observer_latitude: None,
         observer_lst: None,
         min_boresight_altitude: None,
+        return_best_failed_match: false,
     };
 
     let result = solver.solve(
@@ -448,6 +451,7 @@ fn test_true_matches_consistency() {
             observer_latitude: None,
             observer_lst: None,
             min_boresight_altitude: None,
+            return_best_failed_match: false,
         };
 
         let result = solver.solve(
@@ -535,6 +539,7 @@ fn test_out_of_bounds_target_pixel() {
         observer_latitude: None,
         observer_lst: None,
         min_boresight_altitude: None,
+        return_best_failed_match: false,
     };
 
     let result = solver.solve(
@@ -656,6 +661,7 @@ fn test_horizon_filter() {
         observer_latitude: None,
         observer_lst: None,
         min_boresight_altitude: None,
+        return_best_failed_match: false,
     };
 
     // 1. Normal run (should succeed)
@@ -888,4 +894,101 @@ fn test_location_filtering_performance() {
     println!("  With location filters:");
     println!("    Total time: {:.2?}", duration_filtered);
     println!("    Average time per solve: {:.3} ms", avg_filtered);
+}
+
+#[test]
+fn test_return_best_failed_match_low_confidence() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+    if !db_path.exists() || !zip_path.exists() {
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).unwrap();
+    let zip_file = File::open(zip_path).unwrap();
+    let mut archive = ZipArchive::new(zip_file).unwrap();
+
+    // Read input_1.json
+    let mut input_buffer = Vec::new();
+    archive
+        .by_name("input_1.json")
+        .unwrap()
+        .read_to_end(&mut input_buffer)
+        .unwrap();
+    let input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+    let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+    for c in &input_dto.centroids {
+        flat_cents.push(c[0]);
+        flat_cents.push(c[1]);
+    }
+    let centroids_array =
+        Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+    // 1. Standard solve (with normal threshold) succeeds with MatchFound
+    let options_normal = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        match_threshold: 1e-5,
+        return_best_failed_match: false,
+        ..Default::default()
+    };
+    let result_normal = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options_normal,
+    );
+    assert_eq!(result_normal.status, SolveStatus::MatchFound);
+    assert!(result_normal.prob.is_some());
+    let normal_prob = result_normal.prob.unwrap();
+    assert!(normal_prob < 1e-5);
+
+    // Strict threshold chosen to be strictly smaller than the calculated normal_prob (or 0.0 if normal_prob == 0.0)
+    // If normal_prob is 0.0, we set strict_threshold = -1.0 so prob >= threshold always holds.
+    let strict_threshold = if normal_prob > 0.0 {
+        normal_prob / 10.0
+    } else {
+        -1.0
+    };
+
+    // 2. Setting a threshold strictly smaller than normal_prob without return_best_failed_match returns NoMatch
+    let options_strict_no_track = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        match_threshold: strict_threshold,
+        return_best_failed_match: false,
+        ..Default::default()
+    };
+    let result_strict_no_track = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options_strict_no_track,
+    );
+    assert_eq!(result_strict_no_track.status, SolveStatus::NoMatch);
+    assert!(result_strict_no_track.prob.is_none());
+
+    // 3. Setting the same strict threshold WITH return_best_failed_match = true
+    // returns LowConfidenceMatch with the calculated prob and valid RA/Dec coordinates
+    let options_strict_with_track = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        match_threshold: strict_threshold,
+        return_best_failed_match: true,
+        ..Default::default()
+    };
+    let result_strict_with_track = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options_strict_with_track,
+    );
+    assert_eq!(
+        result_strict_with_track.status,
+        SolveStatus::LowConfidenceMatch
+    );
+    assert!(result_strict_with_track.prob.is_some());
+    let best_prob = result_strict_with_track.prob.unwrap();
+    assert!(best_prob >= strict_threshold);
+    assert!((best_prob - normal_prob).abs() < 1e-12);
+    assert!(result_strict_with_track.ra.is_some());
+    assert!(result_strict_with_track.dec.is_some());
+    assert!(result_strict_with_track.roll.is_some());
+    assert!((result_strict_with_track.ra.unwrap() - result_normal.ra.unwrap()).abs() < 1e-5);
+    assert!((result_strict_with_track.dec.unwrap() - result_normal.dec.unwrap()).abs() < 1e-5);
 }

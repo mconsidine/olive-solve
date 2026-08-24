@@ -86,12 +86,20 @@ const MAGIC_RAND: u64 = 2654435761;
 #[allow(missing_docs)]
 /// Indicates the status of a plate solve attempt.
 pub enum SolveStatus {
+    /// A high-confidence match was found that satisfies `options.match_threshold`.
     MatchFound,
     #[default]
+    /// No match was found across the catalog search space.
     NoMatch,
+    /// The solve attempt timed out before evaluating all candidate patterns.
     Timeout,
+    /// The solve attempt was cancelled via an external signal.
     Cancelled,
+    /// Too few stars were provided to form a pattern (< 4 centroids).
     TooFew,
+    /// A candidate match was identified, but its false-positive probability (`prob`)
+    /// exceeded `options.match_threshold`. Returned only when `return_best_failed_match` is true.
+    LowConfidenceMatch,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +133,13 @@ pub struct SolveOptions {
     /// is mounted at an offset and is still pointing at the sky. Used to reject mathematically valid
     /// false-positives that imply an impossibly low camera orientation.
     pub min_boresight_altitude: Option<f64>,
+
+    /// Optional: If true, when no candidate pattern meets the strict `match_threshold`,
+    /// the solver will return the globally best candidate evaluated during the search
+    /// with status `SolveStatus::LowConfidenceMatch` and its calculated `prob`.
+    /// This prevents premature termination on weak candidates (which occurs with relaxed thresholds)
+    /// while still recovering a solution in obstructed/cluttered star fields.
+    pub return_best_failed_match: bool,
 }
 
 impl Default for SolveOptions {
@@ -146,11 +161,12 @@ impl Default for SolveOptions {
             observer_latitude: None,
             observer_lst: None,
             min_boresight_altitude: None,
+            return_best_failed_match: false,
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[allow(missing_docs)]
 /// Contains the result of a plate solve attempt.
 pub struct Solution {
@@ -163,6 +179,9 @@ pub struct Solution {
     pub p90e: Option<f64>,
     pub maxe: Option<f64>,
     pub matches: Option<usize>,
+    /// Estimated false-positive probability across the entire catalog database (`prob_mismatch * num_patterns`).
+    /// Lower is better. A value `< match_threshold` indicates a high-confidence match (`MatchFound`),
+    /// while a value `>= match_threshold` is returned on `LowConfidenceMatch`.
     pub prob: Option<f64>,
     pub epoch_equinox: Option<f64>,
     pub epoch_proper_motion: Option<f64>,
@@ -506,6 +525,12 @@ fn find_centroid_matches_inplace(
     }
 }
 
+enum VerificationResult {
+    Success(Solution),
+    NewBestFailed(f64, Solution),
+    None,
+}
+
 // Helper to build the solution
 #[allow(clippy::too_many_arguments)]
 fn verify_and_build_solution(
@@ -523,8 +548,9 @@ fn verify_and_build_solution(
     options: &SolveOptions,
     num_extracted_stars: usize,
     match_threshold: f64,
+    best_prob_mismatch: f64,
     t0_solve: Instant,
-) -> Option<Solution> {
+) -> VerificationResult {
     // Find all catalog stars inside the FOV diagonal
     let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
     let image_center_vector = [
@@ -544,7 +570,7 @@ fn verify_and_build_solution(
 
     let num_nearby = nearby_nodes.len();
     if num_nearby == 0 {
-        return None;
+        return VerificationResult::None;
     }
 
     let target_crop_len = 2 * num_extracted_stars;
@@ -606,11 +632,16 @@ fn verify_and_build_solution(
 
     // Safe bounds bypass replicating scipy.stats.binom.cdf behavior
     let prob_mismatch = fast_binomial_cdf(k_raw, num_extracted_stars as u64, p_raw);
-    if prob_mismatch >= match_threshold {
-        return None;
+    let is_match = prob_mismatch < match_threshold;
+
+    // Early exit if this candidate fails the match_threshold AND we either:
+    // 1) are not tracking the best failed match, or
+    // 2) this candidate is not strictly better than our current best candidate.
+    if !is_match && (!options.return_best_failed_match || prob_mismatch >= best_prob_mismatch) {
+        return VerificationResult::None;
     }
 
-    // We passed all checks. Complete the final exact solution details
+    // We passed verification (or found a new best fallback candidate). Complete exact solution details.
     scratch.sp_matched_img_cents.clear();
     scratch.sp_matched_cat_vecs.clear();
     for &(img_idx, cat_idx) in matched_stars {
@@ -630,11 +661,14 @@ fn verify_and_build_solution(
         &mut scratch.sp_matched_img_vecs,
         num_star_matches,
     );
-    let (precise_rotation_matrix, precise_det) = find_rotation_matrix_and_det_inplace(
+    let (precise_rotation_matrix, precise_det) = match find_rotation_matrix_and_det_inplace(
         &scratch.sp_matched_img_vecs,
         &scratch.sp_matched_cat_vecs,
         num_star_matches,
-    )?;
+    ) {
+        Some(res) => res,
+        None => return VerificationResult::None,
+    };
 
     let mut k_final = options.distortion;
     if options.distortion.is_some() {
@@ -770,7 +804,7 @@ fn verify_and_build_solution(
         let sin_alt =
             boresight[0] * zenith[0] + boresight[1] * zenith[1] + boresight[2] * zenith[2];
         if sin_alt < min_alt.to_radians().sin() {
-            return None; // Boresight is pointing below the allowed horizon limit
+            return VerificationResult::None; // Boresight is pointing below the allowed horizon limit
         }
     }
 
@@ -791,6 +825,12 @@ fn verify_and_build_solution(
         }
     }
 
+    let status = if is_match {
+        SolveStatus::MatchFound
+    } else {
+        SolveStatus::LowConfidenceMatch
+    };
+
     let mut solution = Solution {
         ra: Some(ra),
         dec: Some(dec),
@@ -804,7 +844,7 @@ fn verify_and_build_solution(
         prob: Some(prob_mismatch * (num_patterns as f64)),
         epoch_equinox: db_props.get("epoch_equinox").cloned(),
         epoch_proper_motion: db_props.get("epoch_proper_motion").cloned(),
-        status: SolveStatus::MatchFound,
+        status,
         t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
         is_mirrored: precise_det < 0.0,
         ..Default::default()
@@ -927,7 +967,11 @@ fn verify_and_build_solution(
         solution.catalog_stars = Some(cat_stars);
     }
 
-    Some(solution)
+    if is_match {
+        VerificationResult::Success(solution)
+    } else {
+        VerificationResult::NewBestFailed(prob_mismatch, solution)
+    }
 }
 
 // OPTIMIZATION: Zero-Allocation Pipeline
@@ -1833,6 +1877,14 @@ impl Solver {
             };
         }
 
+        // Tracking state for recovering the best match that failed the threshold.
+        // When `options.return_best_failed_match` is enabled, we track the candidate pattern
+        // with the globally lowest false-positive probability (`prob_mismatch`).
+        // If no pattern reaches the strict `match_threshold`, this best candidate is returned
+        // at the end with `SolveStatus::LowConfidenceMatch`.
+        let mut best_prob_mismatch = f64::INFINITY;
+        let mut best_candidate_solution: Option<Solution> = None;
+
         // -------------------------------------------------------------
         // Allocation-free native iteration mirroring breadth-first order
         // -------------------------------------------------------------
@@ -2183,7 +2235,7 @@ impl Solver {
                                     continue;
                                 }
 
-                                if let Some(solution) = verify_and_build_solution(
+                                match verify_and_build_solution(
                                     scratch,
                                     star_kd_tree,
                                     star_vectors,
@@ -2198,14 +2250,30 @@ impl Solver {
                                     &options,
                                     num_extracted_stars,
                                     match_threshold,
+                                    best_prob_mismatch,
                                     t0_solve,
                                 ) {
-                                    return solution;
+                                    VerificationResult::Success(solution) => return solution,
+                                    VerificationResult::NewBestFailed(prob, candidate) => {
+                                        // Candidate verified geometrically and produced a new globally
+                                        // lowest false-positive probability among threshold-failing patterns.
+                                        best_prob_mismatch = prob;
+                                        best_candidate_solution = Some(candidate);
+                                    }
+                                    VerificationResult::None => {}
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // If no candidate met the strict match_threshold, check if the client requested
+        // the best fallback candidate that failed the threshold.
+        if options.return_best_failed_match {
+            if let Some(candidate) = best_candidate_solution {
+                return candidate;
             }
         }
 
