@@ -206,7 +206,9 @@ impl PyFusedSolver {
     ///     **kwargs: Solve options.
     ///
     /// Returns:
-    ///     dict: A dictionary containing the solve results from the successful set.
+    ///     dict: A dictionary containing the solve results from the successful set,
+    ///           including the `crop_index` representing which set succeeded,
+    ///           and `solve_time_ms` for the batch execution duration.
     pub fn solve_from_centroids_batch<'py>(
         &self,
         py: Python<'py>,
@@ -220,11 +222,17 @@ impl PyFusedSolver {
             centroids_list.iter().map(|c| c.as_array()).collect();
         let batch: Vec<(ndarray::Array2<f64>, Option<tetra3::extractor::Crop>)> =
             cents_views.iter().map(|v| (v.to_owned(), None)).collect();
-        let solution = self
+        let batch_solution = self
             .inner
             .solve_from_centroids_batch(&batch, size, solve_options, None)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-        solution.to_dict(py, None)
+        let dict = batch_solution.solution.to_dict(py, None)?;
+        dict.set_item("crop_index", batch_solution.crop_index)?;
+        dict.set_item(
+            "solve_time_ms",
+            batch_solution.solve_time.as_millis() as u64,
+        )?;
+        Ok(dict)
     }
 
     /// Sets the observer's location, allowing the solver to compute azimuth/elevation

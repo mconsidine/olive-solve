@@ -131,6 +131,16 @@ pub struct FusedSolver {
     longitude: Arc<RwLock<Option<f64>>>,
 }
 
+/// The result of a batch solve operation, containing the solution and metadata about the successful batch item.
+pub struct BatchSolution {
+    /// The actual solution produced by the solver.
+    pub solution: Solution,
+    /// The index of the centroid set in the batch that successfully produced the solution (or the index of the last set if all failed).
+    pub crop_index: usize,
+    /// The total elapsed time spent iterating through the batch and solving.
+    pub solve_time: std::time::Duration,
+}
+
 impl FusedSolver {
     /// Initialize the unified solver.
     /// Takes in the database location, an optional IMU type (defaults to Auto),
@@ -337,20 +347,27 @@ impl FusedSolver {
         timestamp: Option<SystemTime>,
     ) -> Result<Solution, String> {
         self.solve_from_centroids_batch(&[(centroids.clone(), None)], size, options, timestamp)
+            .map(|batch_solution| batch_solution.solution)
     }
 
     /// Attempts to solve from multiple centroid sets in order, stopping when a solution is found.
     /// Updates internal solve state only when a solution is found or all given centroid sets fail.
+    ///
+    /// Returns a `BatchSolution` containing the successful `Solution`, the index of the
+    /// centroid set in the batch that successfully produced it (or the index of the last set if all failed),
+    /// and the total time taken to execute the batch.
     pub fn solve_from_centroids_batch(
         &self,
         centroids_batch: &[(Array2<f64>, Option<tetra3::extractor::Crop>)],
         main_size: (f64, f64),
         options: SolveOptions,
         timestamp: Option<SystemTime>,
-    ) -> Result<Solution, String> {
+    ) -> Result<BatchSolution, String> {
+        let batch_start = std::time::Instant::now();
         let time = timestamp.unwrap_or_else(SystemTime::now);
 
         let mut last_solution = None;
+        let mut last_index = 0;
 
         let mut solver_guard = self.solver.write().unwrap();
         let solver = solver_guard
@@ -365,7 +382,7 @@ impl FusedSolver {
             );
         }
 
-        for (centroids, crop_opt) in centroids_batch {
+        for (i, (centroids, crop_opt)) in centroids_batch.iter().enumerate() {
             let mut item_options = actual_options.clone();
             let mut item_size = main_size;
             let mut offset_x = 0.0;
@@ -442,6 +459,7 @@ impl FusedSolver {
             }
 
             last_solution = Some(solution);
+            last_index = i;
 
             if found {
                 break;
@@ -457,7 +475,11 @@ impl FusedSolver {
             *self.last_solve_failed.write().unwrap() = true;
         }
 
-        Ok(solution)
+        Ok(BatchSolution {
+            solution,
+            crop_index: last_index,
+            solve_time: batch_start.elapsed(),
+        })
     }
 
     /// Evaluates a pre-computed `Solution` against an arbitrary list of centroids to
@@ -576,12 +598,14 @@ impl FusedSolver {
         centroid_arrays.push((base_arr, None));
 
         let (height, width) = image.dim();
-        let solution = self.solve_from_centroids_batch(
-            &centroid_arrays,
-            (height as f64, width as f64),
-            solve_options,
-            timestamp,
-        )?;
+        let solution = self
+            .solve_from_centroids_batch(
+                &centroid_arrays,
+                (height as f64, width as f64),
+                solve_options,
+                timestamp,
+            )?
+            .solution;
         Ok((solution, extract_time_ms))
     }
 
@@ -1246,7 +1270,8 @@ mod tests {
         // because it overrides allow_out_of_bounds_target_pixel to true for crops!
         let crop_result = fs
             .solve_from_centroids_batch(&batch, main_size, base_options.clone(), None)
-            .unwrap();
+            .unwrap()
+            .solution;
 
         assert_eq!(crop_result.status, SolveStatus::MatchFound);
 
