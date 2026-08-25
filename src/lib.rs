@@ -8,7 +8,10 @@
 use chrono::{Datelike, Timelike};
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use olive_imu::storage::PersistentStorage;
-use olive_imu::{Imu, ImuDevice, MountCoordinates};
+use olive_imu::{
+    Imu, ImuDevice, MOVING_CAMERA_DEVIATION_TOLERANCE_DEG, MountCoordinates,
+    STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG, STATIONARY_MOTION_THRESHOLD_DEG,
+};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -497,8 +500,31 @@ impl FusedSolver {
         };
 
         if solution.status == SolveStatus::MatchFound {
-            *self.last_solve_failed.write().unwrap() = false;
-            self.update_anchor_from_solution(&solution, time);
+            let angle_moved = self.get_rotation_since_last_anchor(&time).unwrap_or(0.0);
+            let max_allowed_error_deg = if angle_moved < STATIONARY_MOTION_THRESHOLD_DEG {
+                STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG // Stationary since last anchor: reject false solves jumping too far
+            } else {
+                MOVING_CAMERA_DEVIATION_TOLERANCE_DEG // Physical slew occurred: tolerate gyro integration drift
+            };
+
+            let is_valid =
+                match self.verify_solution_with_imu(&solution, time, max_allowed_error_deg) {
+                    Some(valid) => valid,
+                    None => true, // Initial bootstrap solve or no IMU: accept
+                };
+
+            if is_valid {
+                *self.last_solve_failed.write().unwrap() = false;
+                self.update_anchor_from_solution(&solution, time);
+            } else {
+                log::warn!(
+                    "Rejected anomalous MatchFound: solve position deviated > {:.1}° from IMU (angle moved since last anchor: {:.2}°).",
+                    max_allowed_error_deg,
+                    angle_moved
+                );
+                *self.last_solve_failed.write().unwrap() = true;
+                solution.status = SolveStatus::NoMatch;
+            }
         } else if solution.status == SolveStatus::LowConfidenceMatch {
             // Only accept a low confidence fallback if the IMU can physically verify it
             // is within a tight 5-degree geometric cone of our expected orientation.
@@ -790,6 +816,13 @@ impl FusedSolver {
         (*self.imu.read().unwrap())
             .as_ref()
             .map(|imu| imu.get_motion_state())
+    }
+
+    /// Returns the angular movement (in degrees) measured by the IMU since the last plate-solve anchor was established.
+    pub fn get_rotation_since_last_anchor(&self, timestamp: &SystemTime) -> Option<f64> {
+        (*self.imu.read().unwrap())
+            .as_ref()
+            .and_then(|imu| imu.get_rotation_since_last_anchor(timestamp))
     }
 
     /// Fetches the current real-time hardware telemetry from the IMU.
@@ -1536,6 +1569,88 @@ mod new_tests {
             rejected,
             Some(false),
             "Candidate should be rejected as it is >5 degrees away"
+        );
+    }
+
+    #[test]
+    fn test_imu_stationary_match_found_rejection() {
+        let fs = FusedSolver {
+            solver: Arc::new(RwLock::new(None)),
+            extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
+            imu: Arc::new(RwLock::new(None)),
+            imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImuWithData)))),
+            storage: None,
+            latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
+        };
+
+        fs.set_observer_location(34.0, -118.0);
+        fs.start_imu().unwrap();
+
+        // Let IMU initialize
+        std::thread::sleep(std::time::Duration::from_millis(3100));
+
+        let t0 = std::time::SystemTime::now();
+
+        // Establish initial anchor at RA=100.0, Dec=50.0
+        let anchor_sol = tetra3::solver::Solution {
+            ra: Some(100.0),
+            dec: Some(50.0),
+            roll: Some(0.0),
+            status: tetra3::solver::SolveStatus::MatchFound,
+            ..Default::default()
+        };
+        fs.update_anchor_from_solution(&anchor_sol, t0);
+
+        // IMU reports no motion since last anchor (angle_moved ≈ 0.0)
+        let t1 = std::time::SystemTime::now();
+        let angle_moved = fs.get_rotation_since_last_anchor(&t1).unwrap_or(0.0);
+        assert!(
+            angle_moved < STATIONARY_MOTION_THRESHOLD_DEG,
+            "IMU should report < {}° motion since last anchor",
+            STATIONARY_MOTION_THRESHOLD_DEG
+        );
+
+        // A false MatchFound solve (e.g. from tree leaves) jumping to RA=250.0, Dec=10.0 (155° away)
+        let false_tree_solve = tetra3::solver::Solution {
+            ra: Some(250.0),
+            dec: Some(10.0),
+            roll: Some(0.0),
+            status: tetra3::solver::SolveStatus::MatchFound,
+            ..Default::default()
+        };
+
+        // When stationary, verify should reject this 155° false solve.
+        let max_allowed = if angle_moved < STATIONARY_MOTION_THRESHOLD_DEG {
+            STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG
+        } else {
+            MOVING_CAMERA_DEVIATION_TOLERANCE_DEG
+        };
+        let is_valid = fs
+            .verify_solution_with_imu(&false_tree_solve, t1, max_allowed)
+            .unwrap_or(true);
+        assert!(
+            !is_valid,
+            "False solve 155° away while stationary must be rejected"
+        );
+
+        // Valid solve 1.0° away while stationary should be accepted
+        let valid_solve = tetra3::solver::Solution {
+            ra: Some(100.5),
+            dec: Some(50.5),
+            roll: Some(0.0),
+            status: tetra3::solver::SolveStatus::MatchFound,
+            ..Default::default()
+        };
+        let is_valid_close = fs
+            .verify_solution_with_imu(&valid_solve, t1, max_allowed)
+            .unwrap_or(false);
+        assert!(
+            is_valid_close,
+            "Valid solve 1° away while stationary must be accepted"
         );
     }
 }

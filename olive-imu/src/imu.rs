@@ -23,6 +23,16 @@ const HARDWARE_ALTERATION_THRESHOLD_DEG: f64 = 10.0;
 // Time to allow sensor to settle before considering it to be motionless.
 const SETTLE_TIME_MS: u64 = 100;
 
+// --- ANCHOR VERIFICATION CONSTANTS ---
+/// The maximum angular movement (in degrees) for the telescope to be considered stationary.
+pub const STATIONARY_MOTION_THRESHOLD_DEG: f64 = 1.0;
+
+/// The maximum allowed plate-solve deviation (in degrees) when the telescope is stationary.
+pub const STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG: f64 = 5.0;
+
+/// The maximum allowed discrepancy (in degrees) between the plate-solve motion and the IMU motion when slewing.
+pub const MOVING_CAMERA_DEVIATION_TOLERANCE_DEG: f64 = 20.0;
+
 /// Represents the current physical motion state of the IMU.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MotionState {
@@ -105,6 +115,8 @@ pub struct AlignmentState {
     pub calibration_axes: Vec<(Vector3<f64>, Vector3<f64>)>,
     /// Flag to track if the current mount_q was loaded from disk or previously locked
     pub loaded_from_disk: bool,
+    /// Flag to allow one-time hardware alteration check at session startup
+    pub startup_hardware_check_pending: bool,
     /// The highest confidence score achieved by the currently locked mount_q
     pub best_calibration_confidence: f64,
     /// Counter to throttle SD card writes
@@ -122,6 +134,7 @@ impl Default for AlignmentState {
             transform_metrics: None,
             calibration_axes: Vec::new(),
             loaded_from_disk: false,
+            startup_hardware_check_pending: false,
             best_calibration_confidence: 0.0,
             calibration_updates_since_save: 0,
             error_history: Vec::new(),
@@ -217,6 +230,7 @@ impl Imu {
                     initial_alignment.mount_q =
                         UnitQuaternion::new_normalize(nalgebra::Quaternion::new(w, x, y, z));
                     initial_alignment.loaded_from_disk = true; // Protect this saved matrix
+                    initial_alignment.startup_hardware_check_pending = true;
                     initial_alignment.best_calibration_confidence = confidence;
                     info!(
                         "Successfully loaded saved calibration (Confidence: {:.1}%): {:.3}, {:.3}, {:.3}, {:.3}",
@@ -506,6 +520,17 @@ impl Imu {
         info!("Reset IMU bias calibration baseline.");
     }
 
+    /// Returns the angular movement (in degrees) measured by the IMU since the last plate-solve anchor was established.
+    pub fn get_rotation_since_last_anchor(&self, timestamp: &SystemTime) -> Option<f64> {
+        let align = self.alignment.read().unwrap();
+        if let Some(old_quat) = align.imu_anchor_state {
+            if let Some((hist_q, _)) = self.get_historical_quat(timestamp) {
+                return Some((old_quat.conjugate() * hist_q).angle().to_degrees());
+            }
+        }
+        None
+    }
+
     // Helper to identify the closest primary IMU axis to a given camera vector
     fn get_closest_imu_axis(v: &Vector3<f64>) -> (String, f64) {
         let mut max_val = 0.0;
@@ -645,11 +670,16 @@ impl Imu {
                     let q_true_delta = old_true_q.conjugate() * new_true_q;
                     let q_imu_delta = old_quat.conjugate() * hist_q;
 
-                    let angle_moved = q_true_delta.angle().to_degrees();
+                    let angle_cam = q_true_delta.angle().to_degrees();
+                    let angle_imu = q_imu_delta.angle().to_degrees();
 
-                    // All distinct movements are now ingested organically to ensure bad matrices
-                    // can heal themselves from true physical slews.
-                    if angle_moved > 0.5 {
+                    // SVD Calibration Eligibility:
+                    // Both sensors must detect significant physical motion and agree on the slew magnitude.
+                    let svd_eligible = angle_cam >= STATIONARY_MOTION_THRESHOLD_DEG
+                        && angle_imu >= STATIONARY_MOTION_THRESHOLD_DEG
+                        && (angle_cam - angle_imu).abs() <= MOVING_CAMERA_DEVIATION_TOLERANCE_DEG;
+
+                    if svd_eligible {
                         if let (Some(axis_true), Some(axis_imu)) =
                             (q_true_delta.axis(), q_imu_delta.axis())
                         {
@@ -736,15 +766,6 @@ impl Imu {
                                             .angle()
                                             .to_degrees();
 
-                                        // Condition A: Hardware was physically altered (unscrewed and reattached)
-                                        let hardware_altered = is_mature
-                                            && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
-                                            && hardware_shift_deg
-                                                > HARDWARE_ALTERATION_THRESHOLD_DEG;
-
-                                        // We only overwrite the active mount_q if the new matrix proves it has
-                                        // high 3D confidence (user rolled the tube) OR we started completely fresh
-                                        // and need a temporary best-guess to power the UI.
                                         if !align.loaded_from_disk {
                                             // Bootstrapping phase. Update fluidly to get the UI tracking immediately.
                                             align.mount_q = calculated_q;
@@ -764,26 +785,38 @@ impl Imu {
                                                     align.best_calibration_confidence * 100.0
                                                 );
                                             }
-                                        } else if hardware_altered {
-                                            // Overwrite the locked matrix because the physical structure changed
-                                            warn!(
-                                                "Hardware alteration detected! New matrix differs by {:.2}°. Resetting calibration constraints.",
-                                                hardware_shift_deg
-                                            );
-                                            align.mount_q = calculated_q;
-                                            align.best_calibration_confidence = new_pool_confidence;
-                                            self.save_calibration_to_disk(
-                                                align.mount_q,
-                                                align.best_calibration_confidence,
-                                            );
+                                        } else if align.startup_hardware_check_pending {
+                                            // Startup verification: detect if hardware was physically remounted between sessions
+                                            if is_mature
+                                                && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
+                                                && hardware_shift_deg
+                                                    > HARDWARE_ALTERATION_THRESHOLD_DEG
+                                            {
+                                                warn!(
+                                                    "Hardware alteration detected at startup! New matrix differs by {:.2}°. Updating calibration.",
+                                                    hardware_shift_deg
+                                                );
+                                                align.mount_q = calculated_q;
+                                                align.best_calibration_confidence =
+                                                    new_pool_confidence;
+                                                self.save_calibration_to_disk(
+                                                    align.mount_q,
+                                                    align.best_calibration_confidence,
+                                                );
+                                            }
+                                            if is_mature {
+                                                align.startup_hardware_check_pending = false;
+                                            }
                                         } else if new_pool_confidence
                                             > align.best_calibration_confidence
+                                            && hardware_shift_deg <= 10.0
                                         {
-                                            // Upgrade the locked matrix because EQ tracking naturally built a superior 3D volume
+                                            // Incremental upgrade during runtime tracking
                                             info!(
-                                                "Upgrading calibration matrix! Confidence increased from {:.1}% to {:.1}%",
+                                                "Upgrading calibration matrix! Confidence increased from {:.1}% to {:.1}% (Shift: {:.2}°)",
                                                 align.best_calibration_confidence * 100.0,
-                                                new_pool_confidence * 100.0
+                                                new_pool_confidence * 100.0,
+                                                hardware_shift_deg
                                             );
                                             align.mount_q = calculated_q;
                                             align.best_calibration_confidence = new_pool_confidence;
@@ -811,8 +844,8 @@ impl Imu {
                         }
                     } else {
                         debug!(
-                            "Movement ({:.2}°) too small to add to calibration pool.",
-                            angle_moved
+                            "Movement (cam: {:.2}°, imu: {:.2}°) not eligible for SVD calibration.",
+                            angle_cam, angle_imu
                         );
                     }
 
@@ -825,7 +858,7 @@ impl Imu {
                     let final_error_quat = final_expected.inverse() * new_true_q;
                     let final_error_angle = final_error_quat.angle().to_degrees();
 
-                    if angle_moved > 5.0 {
+                    if angle_cam > 5.0 {
                         align.error_history.push(final_error_angle);
                         if align.error_history.len() > 20 {
                             align.error_history.remove(0);
@@ -875,12 +908,29 @@ impl Imu {
                     let (up_axis, up_misalign) = Self::get_closest_imu_axis(&cam_up_in_imu);
 
                     align.transform_metrics = Some(TransformMetrics {
-                        transform_error_fraction: final_error_angle / angle_moved.max(0.001),
+                        transform_error_fraction: final_error_angle / angle_cam.max(0.001),
                         camera_view_gyro_axis: view_axis,
                         camera_view_misalignment: view_misalign,
                         camera_up_gyro_axis: up_axis,
                         camera_up_misalignment: up_misalign,
                     });
+
+                    // Pointing Anchor Update
+                    let is_valid_anchor_update = if angle_imu < STATIONARY_MOTION_THRESHOLD_DEG {
+                        angle_cam <= STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG
+                    } else {
+                        (angle_cam - angle_imu).abs() <= MOVING_CAMERA_DEVIATION_TOLERANCE_DEG
+                    };
+
+                    if is_valid_anchor_update {
+                        align.last_camera_position = Some(*camera_pointing);
+                        align.imu_anchor_state = Some(hist_q);
+                    } else {
+                        debug!(
+                            "Rejecting anchor update: discrepancy too large (cam: {:.2}°, imu: {:.2}°)",
+                            angle_cam, angle_imu
+                        );
+                    }
                 } else {
                     info!("Initial plate-solve anchor locked in.");
 
@@ -897,11 +947,10 @@ impl Imu {
                         camera_up_gyro_axis: up_axis,
                         camera_up_misalignment: up_misalign,
                     });
-                }
 
-                // Always strictly lock in the most recent plate solve and corresponding historical IMU state as our new anchor.
-                align.last_camera_position = Some(*camera_pointing);
-                align.imu_anchor_state = Some(hist_q);
+                    align.last_camera_position = Some(*camera_pointing);
+                    align.imu_anchor_state = Some(hist_q);
+                }
             }
         }
     }
