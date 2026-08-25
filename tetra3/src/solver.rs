@@ -626,6 +626,16 @@ fn verify_and_build_solution(
 
     // Probability calculation
     let num_star_matches = matched_stars.len();
+    // A minimum of 3 non-collinear star matches is mathematically required to determine a
+    // unique 3D celestial attitude (rotation matrix R) and overdetermine the 2-parameter distortion fit.
+    // While standard Tetra3 solves match 4+ stars, 3 matches can occur when one pattern star
+    // is lost due to sensor edge optical distortion, partial obstruction, or catalog brightness cutoff.
+    // These 3-match candidates will produce a LowConfidenceMatch (prob >= match_threshold) that downstream
+    // systems (e.g. olive-solve IMU fusion) can safely cross-verify against hardware sensors.
+    // Any candidate with < 3 matches (0, 1, or 2) is mathematically indeterminate or degenerate and is rejected.
+    if num_star_matches < 3 {
+        return VerificationResult::None;
+    }
     let prob_single_star_mismatch = (crop_len as f64) * options.match_radius.powi(2);
     let p_raw = 1.0 - prob_single_star_mismatch;
     let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
@@ -716,13 +726,16 @@ fn verify_and_build_solution(
             let sol_1 = (ata_00 * atb_1 - ata_01 * atb_0) / det;
 
             let f_val = sol_0 / (1.0 - sol_1);
-            k_final = Some(sol_1);
-            fov = 2.0 * (1.0 / f_val).atan();
-            let centroids = &scratch.sp_image_centroids;
-            let out = &mut scratch.sp_image_centroids_undist;
-            undistort_centroids_inplace(centroids, height, width, sol_1, out);
-            for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                scratch.sp_matched_img_cents[m_idx] = scratch.sp_image_centroids_undist[img_idx];
+            if f_val > 0.0 && f_val.is_finite() {
+                k_final = Some(sol_1);
+                fov = 2.0 * (1.0 / f_val).atan();
+                let centroids = &scratch.sp_image_centroids;
+                let out = &mut scratch.sp_image_centroids_undist;
+                undistort_centroids_inplace(centroids, height, width, sol_1, out);
+                for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
+                    scratch.sp_matched_img_cents[m_idx] =
+                        scratch.sp_image_centroids_undist[img_idx];
+                }
             }
         }
     }
@@ -751,16 +764,23 @@ fn verify_and_build_solution(
             + (row_f[1] - row_c[1]).powi(2)
             + (row_f[2] - row_c[2]).powi(2))
         .sqrt();
-        scratch.sp_distances.push(dist);
+        if dist.is_finite() {
+            scratch.sp_distances.push(dist);
+        }
     }
     scratch
         .sp_distances
-        .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let p90_idx = (0.9 * (scratch.sp_distances.len() - 1) as f64) as usize;
+    if scratch.sp_distances.is_empty() {
+        return VerificationResult::None;
+    }
+
+    let p90_idx = ((0.9 * (scratch.sp_distances.len() - 1) as f64) as usize)
+        .min(scratch.sp_distances.len() - 1);
     let p90_err_angle = angle_from_distance(scratch.sp_distances[p90_idx]).to_degrees() * 3600.0;
     let max_err_angle =
-        angle_from_distance(*scratch.sp_distances.last().unwrap()).to_degrees() * 3600.0;
+        angle_from_distance(*scratch.sp_distances.last().unwrap_or(&0.0)).to_degrees() * 3600.0;
 
     let mut rms_sum = 0.0;
     for &d in &scratch.sp_distances {

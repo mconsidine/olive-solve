@@ -992,3 +992,36 @@ fn test_return_best_failed_match_low_confidence() {
     assert!((result_strict_with_track.ra.unwrap() - result_normal.ra.unwrap()).abs() < 1e-5);
     assert!((result_strict_with_track.dec.unwrap() - result_normal.dec.unwrap()).abs() < 1e-5);
 }
+
+#[test]
+fn test_return_best_failed_match_with_random_noise_no_panic() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    if !db_path.exists() {
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).unwrap();
+
+    // Create random / noise centroids that do not form valid constellations
+    let noise_centroids = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            100.0, 100.0, 120.0, 105.0, 150.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0,
+            900.0, 1000.0, 1100.0, 1200.0,
+        ],
+    )
+    .unwrap();
+
+    let options = SolveOptions {
+        fov_estimate: Some(15.0),
+        match_threshold: 1e-4,
+        return_best_failed_match: true,
+        ..Default::default()
+    };
+
+    let result = solver.solve(&noise_centroids, (1080.0, 1920.0), options);
+    // Should cleanly return NoMatch (or LowConfidenceMatch if by coincidence 3+ stars align with IMU verify), never panic
+    assert!(
+        result.status == SolveStatus::NoMatch || result.status == SolveStatus::LowConfidenceMatch
+    );
+}
