@@ -15,7 +15,6 @@ use walkdir::WalkDir;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
 use tetra3::fast_extractor::{
     FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor, FastSigmaMode,
@@ -2381,6 +2380,120 @@ fn test_performance_approx_vs_exact() {
             row.bg_mode_str,
             row.exact_time,
             row.approx_time
+        );
+    }
+}
+
+#[test]
+fn test_virtual_crops_with_base_crop() {
+    let image_paths = get_test_images();
+    let path = &image_paths[0];
+    let img = image::open(path).unwrap().to_luma8();
+    let (w, h) = img.dimensions();
+
+    // We only test if the image is reasonably large
+    if w < 1000 || h < 1000 {
+        return;
+    }
+
+    let mut input_img = Array2::<f32>::zeros((h as usize, w as usize));
+    for y in 0..h {
+        for x in 0..w {
+            input_img[[y as usize, x as usize]] = img.get_pixel(x, y)[0] as f32;
+        }
+    }
+
+    // 1. Define a base crop in the center
+    let base_crop_w = 800;
+    let base_crop_h = 800;
+
+    // 2. Define virtual crops relative to the FULL original dimensions (w x h).
+    // Let's make a top-left virtual crop and a bottom-right virtual crop.
+    let vc_w = 400;
+    let vc_h = 400;
+
+    // Top-left is at offset_y: -h/2 + vc_h/2, offset_x: -w/2 + vc_w/2
+    // Bottom-right is at offset_y: h/2 - vc_h/2, offset_x: w/2 - vc_w/2
+    // But it's easier to use Crop::Region with absolute coordinates mapping.
+    // tetra3::Crop::Region expects offset from center!
+
+    let offset_y_tl = -((h as isize - vc_h as isize) / 2);
+    let offset_x_tl = -((w as isize - vc_w as isize) / 2);
+
+    let offset_y_br = (h as isize - vc_h as isize) / 2;
+    let offset_x_br = (w as isize - vc_w as isize) / 2;
+
+    let virtual_crops = vec![
+        tetra3::Crop::Region {
+            width: vc_w,
+            height: vc_h,
+            offset_x: offset_x_tl,
+            offset_y: offset_y_tl,
+        },
+        tetra3::Crop::Region {
+            width: vc_w,
+            height: vc_h,
+            offset_x: offset_x_br,
+            offset_y: offset_y_br,
+        },
+    ];
+
+    let options = FastExtractOptions {
+        crop: Some((base_crop_w, base_crop_h)),
+        virtual_crops: Some(virtual_crops.clone()),
+        ..Default::default()
+    };
+
+    let mut extractor = FastExtractor::new(h as usize, w as usize, options);
+    let result = extractor.extract_f32(&input_img);
+
+    // The base crop (800x800) is in the center of the image.
+    // The Top-Left virtual crop (400x400) is in the top-left of the 1920x1080 image.
+    // Do they intersect?
+    // Center is [h/2 - 400, h/2 + 400] and [w/2 - 400, w/2 + 400].
+    // Top-Left is [0, 400] and [0, 400].
+    // For a 1920x1080 image, center is [140, 940] and [560, 1360].
+    // TL [0, 400] intersect center [140, 940] -> yes! from 140 to 400.
+
+    let v_centroids = result
+        .virtual_crop_centroids
+        .expect("Expected virtual crop centroids");
+    assert_eq!(v_centroids.len(), 2);
+
+    let (y_min_0, y_max_0, x_min_0, x_max_0) = virtual_crops[0].bounds(w as usize, h as usize);
+    let (y_min_1, y_max_1, x_min_1, x_max_1) = virtual_crops[1].bounds(w as usize, h as usize);
+
+    for c in &v_centroids[0] {
+        assert!(
+            c.y >= y_min_0 as f64 && c.y < y_max_0 as f64,
+            "Top-left Y out of bounds: {} not in [{}, {})",
+            c.y,
+            y_min_0,
+            y_max_0
+        );
+        assert!(
+            c.x >= x_min_0 as f64 && c.x < x_max_0 as f64,
+            "Top-left X out of bounds: {} not in [{}, {})",
+            c.x,
+            x_min_0,
+            x_max_0
+        );
+    }
+
+    for c in &v_centroids[1] {
+        assert!(
+            c.y >= y_min_1 as f64 && c.y < y_max_1 as f64,
+            "Bottom-right Y out of bounds: {} not in [{}, {})",
+            c.y,
+            y_min_1,
+            y_max_1
+        );
+        assert!(
+            c.x >= x_min_1 as f64 && c.x < x_max_1 as f64,
+            "Bottom-right X out of bounds: {} not in [{}, {})",
+            c.x,
+            x_min_1,
+            x_max_1
         );
     }
 }

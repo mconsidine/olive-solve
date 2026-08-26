@@ -320,7 +320,7 @@ impl FastExtractor {
         if self.options.crop.is_none() && input_image.is_standard_layout() {
             let src_slice = input_image.as_slice().unwrap();
             let centroids = self.extract_core(src_slice);
-            self.apply_virtual_crops(centroids, crop_y, crop_x)
+            self.apply_virtual_crops(centroids)
         } else {
             let cropped_view = input_image.slice(ndarray::s![
                 crop_y..crop_y + self.height,
@@ -343,7 +343,7 @@ impl FastExtractor {
             // to satisfy the Rust borrow checker. `extract_core` requires `&mut self` to update
             // internal buffers, which conflicts with taking an immutable slice of `self.image_u8`.
             let centroids = self.extract_from_internal();
-            self.apply_virtual_crops(centroids, crop_y, crop_x)
+            self.apply_virtual_crops(centroids)
         }
     }
 
@@ -397,15 +397,10 @@ impl FastExtractor {
         }
 
         let centroids = self.extract_from_internal();
-        self.apply_virtual_crops(centroids, crop_y, crop_x)
+        self.apply_virtual_crops(centroids)
     }
 
-    fn apply_virtual_crops(
-        &self,
-        centroids: Vec<FastCentroidResult>,
-        base_crop_y: usize,
-        base_crop_x: usize,
-    ) -> FastExtractionResult {
+    fn apply_virtual_crops(&self, centroids: Vec<FastCentroidResult>) -> FastExtractionResult {
         let virtual_crop_centroids = if let Some(crops) = &self.options.virtual_crops {
             let mut crop_results = Vec::with_capacity(crops.len());
             for crop in crops {
@@ -414,8 +409,8 @@ impl FastExtractor {
                 let filtered: Vec<_> = centroids
                     .iter()
                     .filter(|c| {
-                        let abs_y = c.y + base_crop_y as f64;
-                        let abs_x = c.x + base_crop_x as f64;
+                        let abs_y = c.y;
+                        let abs_x = c.x;
                         abs_y >= y_min as f64
                             && abs_y < y_max as f64
                             && abs_x >= x_min as f64

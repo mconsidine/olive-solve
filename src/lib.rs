@@ -414,6 +414,14 @@ impl FusedSolver {
                 // Always allow out of bounds targets for crops, as a target on the main
                 // image might naturally fall outside the crop's boundaries.
                 item_options.allow_out_of_bounds_target_pixel = Some(true);
+
+                // Disable radial distortion for virtual crops.
+                // The optical center of the lens is outside the crop boundaries (for off-center crops).
+                // Since tetra3 assumes the optical center is always at item_size / 2, leaving distortion
+                // enabled will incorrectly warp the stars away from the crop's center instead of the lens center,
+                // causing NoMatch. This also causes tetra3 to return distortion: None, which correctly
+                // prevents engine.rs from feeding bogus values into the global distortion EMA.
+                item_options.distortion = None;
             }
 
             // Adjust target_pixel for the crop offset
