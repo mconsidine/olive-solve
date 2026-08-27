@@ -407,3 +407,60 @@ impl Solution {
         Ok(out_dict)
     }
 }
+
+impl crate::fast_extractor::FastExtractOptionsUpdate {
+    /// Parses `FastExtractOptionsUpdate` from a Python dictionary.
+    pub fn from_dict(dict: &pyo3::Bound<'_, pyo3::types::PyDict>) -> pyo3::PyResult<Self> {
+        let mut update = Self::default();
+        if let Some(val) = dict.get_item("sigma")? {
+            update.sigma = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("noise_filter")? {
+            update.noise_filter = val.extract()?;
+        } else if let Some(val) = dict.get_item("binary_open")? {
+            update.noise_filter = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("min_area")? {
+            update.min_area = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("max_area")? {
+            update.max_area = val.extract()?;
+        }
+        if let Some(val) = dict.get_item("virtual_crops")? {
+            if val.is_none() {
+                update.virtual_crops = Some(None);
+            } else {
+                let py_list: Vec<pyo3::Bound<'_, pyo3::types::PyTuple>> = val.extract()?;
+                let mut crops = Vec::new();
+                for py_crop in py_list {
+                    let len = py_crop.len();
+                    if len == 1 {
+                        let fraction: usize = py_crop.get_item(0)?.extract()?;
+                        crops.push(crate::extractor::Crop::Fraction(fraction));
+                    } else if len == 2 {
+                        let height: usize = py_crop.get_item(0)?.extract()?;
+                        let width: usize = py_crop.get_item(1)?.extract()?;
+                        crops.push(crate::extractor::Crop::Center { height, width });
+                    } else if len == 4 {
+                        let height: usize = py_crop.get_item(0)?.extract()?;
+                        let width: usize = py_crop.get_item(1)?.extract()?;
+                        let offset_y: isize = py_crop.get_item(2)?.extract()?;
+                        let offset_x: isize = py_crop.get_item(3)?.extract()?;
+                        crops.push(crate::extractor::Crop::Region {
+                            height,
+                            width,
+                            offset_y,
+                            offset_x,
+                        });
+                    } else {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Invalid crop specification",
+                        ));
+                    }
+                }
+                update.virtual_crops = Some(Some(crops));
+            }
+        }
+        Ok(update)
+    }
+}

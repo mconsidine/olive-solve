@@ -189,6 +189,15 @@ pub trait FastPixel: Copy {
     where
         S: Data<Elem = Self>;
 
+    /// Executes the fast extraction path with variants.
+    fn extract_variants_fast<S>(
+        fe: &mut FastExtractor,
+        image: &ArrayBase<S, Ix2>,
+        variants: &[crate::fast_extractor::FastExtractOptionsUpdate],
+    ) -> Vec<crate::fast_extractor::FastExtractionResult>
+    where
+        S: Data<Elem = Self>;
+
     /// Executes the standard extraction path.
     fn extract_normal<S>(
         t3: &mut Tetra3,
@@ -209,6 +218,18 @@ impl FastPixel for f32 {
     {
         fe.extract_f32(image)
     }
+
+    fn extract_variants_fast<S>(
+        fe: &mut FastExtractor,
+        image: &ArrayBase<S, Ix2>,
+        variants: &[crate::fast_extractor::FastExtractOptionsUpdate],
+    ) -> Vec<crate::fast_extractor::FastExtractionResult>
+    where
+        S: Data<Elem = Self>,
+    {
+        fe.extract_variants_f32(image, variants)
+    }
+
     fn extract_normal<S>(
         t3: &mut Tetra3,
         image: &ArrayBase<S, Ix2>,
@@ -231,6 +252,18 @@ impl FastPixel for u8 {
     {
         fe.extract(image)
     }
+
+    fn extract_variants_fast<S>(
+        fe: &mut FastExtractor,
+        image: &ArrayBase<S, Ix2>,
+        variants: &[crate::fast_extractor::FastExtractOptionsUpdate],
+    ) -> Vec<crate::fast_extractor::FastExtractionResult>
+    where
+        S: Data<Elem = Self>,
+    {
+        fe.extract_variants(image, variants)
+    }
+
     fn extract_normal<S>(
         t3: &mut Tetra3,
         image: &ArrayBase<S, Ix2>,

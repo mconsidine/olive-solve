@@ -1,13 +1,18 @@
-# Olive Solve - Tetra3 Solver in Rust
+# Olive Solve - Enhanced Tetra3 Solver in Rust
 
-A fast, robust, and async-friendly Rust implementation and optimization of the [cedar-solve](https://github.com/smroid/cedar-solve) centroid extraction and plate solving algorithms. 
+A fast Rust implementation and optimization of the [cedar-solve](https://github.com/smroid/cedar-solve) centroid extraction and plate solving algorithms, with new features. 
 
 ## Unique Features
 
-This project is not just a straight port of the upstream Python logic. It introduces several performance optimizations and unique extraction features designed for constrained hardware and specific sensor characteristics.
+This project is not just a straight port of the upstream Python logic. It introduces a number of new features:
 
-**NEW** Olive Solve now includes a complete IMU implementation for tracking movement between camera plate solves.
-**NEW** A complete FusedSolver implementation integrates between image plate-solves and IMU sensors.
+* A complete IMU implementation for tracking movement between camera plate solves.
+* A full-featured FusedSolver that integrates between image plate-solves and IMU sensors.
+* Additional background extraction modes that optimize between accuracy and efficiency.
+* Efficient "virtual" cropping of images during extraction, enabling clients to process different parts of an image to avoid obstructions.
+* Multi-pass centroid extraction with shared background calculations and global background level estimation.
+* New solver options to reject below horizon pattern stars and final matches.
+* Solver enhancement to return the best low-confidence match when the match threshold isn't met.
 
 ### Extractor
 
@@ -16,12 +21,16 @@ This project is not just a straight port of the upstream Python logic. It introd
 * **Sequential Fast Extractor**: An alternative sequential path that trades a negligible amount of accuracy for much faster single-threaded performance.
 * **Hybrid Background Subtraction Modes**: Includes custom `Line Median` and `Block Median` background subtraction modes. These act as high-performance compromises between the fast (but less accurate) `Global Median` and the highly accurate (but computationally expensive) `Local Median` modes. *Note: `Line Median` is specifically designed to excel at handling cameras that exhibit horizontal banding noise.*
 * **Virtual Crops**: Calculates the centroids for sections of an image in addition to the full image.
+* **Multi-Variant Batching**: Supports evaluating multiple parameter combinations over a single image by reusing the initial background subtraction and noise matrices.
+* **Background Level Output**: Calculates a normalized global background brightness value for downstream exposure/gain control.
 
 ### Solver
 
 * **Database Support**: Supports both `tetra3` and `cedar-solve` database formats.
-* **Performance**: Blazingly fast single-threaded performance - centroids generated from clean images typically solve in under 0.25ms on a Raspberry Pi Zero 2W.
+* **Performance**: Incredibly fast single-threaded performance - centroids generated from clean images typically solve in under 0.25ms on a Raspberry Pi Zero 2W.
 * **Centroid Matcher**: Given a plate solution and a list of centroids, determines the valid set of centroids that match stars in the database.
+* **Horizon Rejection**: When provided with observer latitude and LST, reject below-horizon stars and final matches.
+* **Low-confidence Matches**: Optionally return the best potential match that doesn't meet the configured match threshold.
 
 ### Olive IMU
 
@@ -35,6 +44,14 @@ A robust integration framework for inertial measurement units.
 * **Timing Synchronization**: Employs queue-draining and back-dating timestamp strategies to map sensor-relative measurements to host wall-clock time, absorbing I2C jitter and preventing timeline drift.
 * **Asynchronous Polling**: A dedicated OS thread handles blocking I2C transactions to maintain high polling rates (100 Hz+) without stalling the main `tokio` async runtime.
 * **Sensor Telemetry**: Exposes real-time hardware telemetry (gyro, gravity vectors, and integrated quaternions if available) via the `FusedSolver`.
+
+### Fused Solver
+
+The `FusedSolver` provides an integrated architecture that bridges camera plate-solving and high-speed IMU telemetry.
+
+* **Continuous Orientation Tracking**: By coupling sparse, high-accuracy plate solves with dense, real-time IMU gyroscope data, the solver maintains orientation between camera exposures and during large slews.
+* **Batch Processing**: `get_centroids_from_image_variants` and `solve_from_centroid_batch` allow executing multiple extraction/solving variants over a single image efficiently.
+* **Low-Confidence Fallback**: When exact matches are constrained, the solver includes fallback heuristics to verify and accept motion-correlated low-confidence matches.
 
 ## Repository Structure
 

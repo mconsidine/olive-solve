@@ -107,6 +107,74 @@ impl PyFusedSolver {
         }
     }
 
+    #[pyo3(signature = (image, variants = None, **kwargs))]
+    /// Extracts star centroids using multiple sequential configurations concurrently via the fast pipeline.
+    ///
+    /// Args:
+    ///     image (numpy.ndarray): 2D uint8 or float32 image array.
+    ///     variants (list): A list of dictionaries, where each dictionary specifies options to override
+    ///                      for that specific extraction pass (e.g. `{'sigma': 5.0, 'min_area': 1}`).
+    ///     **kwargs: Base fast extraction options.
+    ///
+    /// Returns:
+    ///     list: A list of extraction results corresponding to each variant. Each result is
+    ///           either a numpy.ndarray of shape (N, 2), or a tuple of (base, crops) if virtual crops are used.
+    pub fn get_centroids_from_image_variants<'py>(
+        &self,
+        py: Python<'py>,
+        image: Bound<'py, PyAny>,
+        variants: Option<Vec<Bound<'py, PyDict>>>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let options = tetra3::fast_extractor::FastExtractOptions::from_kwargs(kwargs)?;
+
+        let rust_variants = match variants {
+            Some(v_list) => {
+                let mut rv = Vec::with_capacity(v_list.len());
+                for v in v_list {
+                    rv.push(tetra3::fast_extractor::FastExtractOptionsUpdate::from_dict(
+                        &v,
+                    )?);
+                }
+                rv
+            }
+            None => vec![tetra3::fast_extractor::FastExtractOptionsUpdate::default()],
+        };
+
+        let results = if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
+            let img_view = img_u8.as_array();
+            self.inner
+                .get_centroids_from_image_variants(&img_view, options, &rust_variants)
+        } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
+            let img_view = img_f32.as_array();
+            self.inner
+                .get_centroids_from_image_variants(&img_view, options, &rust_variants)
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Image must be a 2D NumPy array of u8 or f32",
+            ));
+        }
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        let mut py_results = Vec::with_capacity(results.len());
+        for result in results {
+            let core_result = tetra3::python::fast_centroids_to_numpy(py, &result.centroids);
+            if let Some(crop_results) = &result.virtual_crop_centroids {
+                let mut crop_list = Vec::with_capacity(crop_results.len());
+                for crop in crop_results {
+                    crop_list.push(tetra3::python::fast_centroids_to_numpy(py, crop));
+                }
+                let elements: Vec<Bound<'py, pyo3::types::PyAny>> =
+                    vec![core_result, PyTuple::new(py, crop_list).unwrap().into_any()];
+                py_results.push(PyTuple::new(py, elements).unwrap().into_any());
+            } else {
+                py_results.push(core_result);
+            }
+        }
+
+        Ok(py_results)
+    }
+
     #[pyo3(signature = (image, **kwargs))]
     /// Performs a full plate solve from an image using the standard pipeline.
     ///

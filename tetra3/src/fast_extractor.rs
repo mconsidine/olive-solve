@@ -107,11 +107,15 @@ pub struct FastCentroidResult {
     pub axis_ratio: f64,
 }
 
+/// Represents the results of a fast extraction pass.
 #[derive(Debug, Clone, Default)]
-#[allow(missing_docs)]
 pub struct FastExtractionResult {
+    /// The primary list of extracted centroids.
     pub centroids: Vec<FastCentroidResult>,
+    /// Centroids filtered by virtual crop regions, if requested.
     pub virtual_crop_centroids: Option<Vec<Vec<FastCentroidResult>>>,
+    /// The normalized (0-255) global background brightness of the image.
+    pub background_level: f32,
 }
 
 /// FastExtractor maintains pre-allocated global buffers to eliminate OS memory allocations
@@ -298,10 +302,22 @@ impl FastExtractor {
     }
 
     /// Primary fast-path extractor. Dispatches to either the `i16` (1x) or `i32` (downsampled) pipeline.
-    pub fn extract<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> FastExtractionResult
+    /// Extracts star centroids using multiple sequential configurations concurrently.
+    ///
+    /// The variants bypass the expensive background subtraction phase, reusing the baseline
+    /// background matrix for highly efficient multi-pass extractions.
+    pub fn extract_variants<S>(
+        &mut self,
+        input_image: &ArrayBase<S, Ix2>,
+        variants: &[FastExtractOptionsUpdate],
+    ) -> Vec<FastExtractionResult>
     where
         S: Data<Elem = u8>,
     {
+        if variants.is_empty() {
+            return Vec::new();
+        }
+
         debug_assert_eq!(
             input_image.dim(),
             (self.orig_height, self.orig_width),
@@ -319,8 +335,7 @@ impl FastExtractor {
 
         if self.options.crop.is_none() && input_image.is_standard_layout() {
             let src_slice = input_image.as_slice().unwrap();
-            let centroids = self.extract_core(src_slice);
-            self.apply_virtual_crops(centroids)
+            self.extract_core(src_slice, variants)
         } else {
             let cropped_view = input_image.slice(ndarray::s![
                 crop_y..crop_y + self.height,
@@ -339,20 +354,33 @@ impl FastExtractor {
                     }
                 }
             }
-            // We use `extract_from_internal()` here instead of calling `extract_core(&self.image_u8[..])`
-            // to satisfy the Rust borrow checker. `extract_core` requires `&mut self` to update
-            // internal buffers, which conflicts with taking an immutable slice of `self.image_u8`.
-            let centroids = self.extract_from_internal();
-            self.apply_virtual_crops(centroids)
+            self.extract_from_internal(variants)
         }
+    }
+
+    pub fn extract<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> FastExtractionResult
+    where
+        S: Data<Elem = u8>,
+    {
+        self.extract_variants(input_image, &[FastExtractOptionsUpdate::default()])
+            .remove(0)
     }
 
     /// Fast version of the extractor for f32 input images.
     /// Performs an extremely fast sequential conversion to u8 internally.
-    pub fn extract_f32<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> FastExtractionResult
+    /// Fast version of the extractor for f32 input images using variants.
+    pub fn extract_variants_f32<S>(
+        &mut self,
+        input_image: &ArrayBase<S, Ix2>,
+        variants: &[FastExtractOptionsUpdate],
+    ) -> Vec<FastExtractionResult>
     where
         S: Data<Elem = f32>,
     {
+        if variants.is_empty() {
+            return Vec::new();
+        }
+
         debug_assert_eq!(
             input_image.dim(),
             (self.orig_height, self.orig_width),
@@ -374,7 +402,6 @@ impl FastExtractor {
         ]);
 
         if let Some(s) = cropped_view.as_slice() {
-            // Bulk cast is auto-vectorized by LLVM
             for (o, &i) in self.contiguous_u8.iter_mut().zip(s.iter()) {
                 *o = i as u8;
             }
@@ -396,12 +423,26 @@ impl FastExtractor {
             }
         }
 
-        let centroids = self.extract_from_internal();
-        self.apply_virtual_crops(centroids)
+        self.extract_from_internal(variants)
     }
 
-    fn apply_virtual_crops(&self, centroids: Vec<FastCentroidResult>) -> FastExtractionResult {
-        let virtual_crop_centroids = if let Some(crops) = &self.options.virtual_crops {
+    /// Fast version of the extractor for f32 input images.
+    /// Performs an extremely fast sequential conversion to u8 internally.
+    pub fn extract_f32<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> FastExtractionResult
+    where
+        S: Data<Elem = f32>,
+    {
+        self.extract_variants_f32(input_image, &[FastExtractOptionsUpdate::default()])
+            .remove(0)
+    }
+
+    fn apply_virtual_crops(
+        &self,
+        centroids: Vec<FastCentroidResult>,
+        virtual_crops: &Option<Vec<crate::extractor::Crop>>,
+        background_level: f32,
+    ) -> FastExtractionResult {
+        let virtual_crop_centroids = if let Some(crops) = virtual_crops {
             let mut crop_results = Vec::with_capacity(crops.len());
             for crop in crops {
                 let (y_min, y_max, x_min, x_max) = crop.bounds(self.orig_width, self.orig_height);
@@ -429,22 +470,28 @@ impl FastExtractor {
         FastExtractionResult {
             centroids,
             virtual_crop_centroids,
+            background_level,
         }
     }
 
-    fn extract_from_internal(&mut self) -> Vec<FastCentroidResult> {
-        // Use a temporary swap or just access field directly in core logic
-        // To keep code clean, I'll use a pointer trick since I know I won't reallocate contiguous_u8.
-        let ptr = self.contiguous_u8.as_ptr();
-        let len = self.contiguous_u8.len();
-        let src_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        self.extract_core(src_slice)
+    fn extract_from_internal(
+        &mut self,
+        variants: &[FastExtractOptionsUpdate],
+    ) -> Vec<FastExtractionResult> {
+        let temp_u8 = std::mem::take(&mut self.contiguous_u8);
+        let results = self.extract_core(&temp_u8, variants);
+        self.contiguous_u8 = temp_u8;
+        results
     }
 
-    fn extract_core(&mut self, src_slice: &[u8]) -> Vec<FastCentroidResult> {
+    fn extract_core(
+        &mut self,
+        src_slice: &[u8],
+        variants: &[FastExtractOptionsUpdate],
+    ) -> Vec<FastExtractionResult> {
         let ds = self.options.downsample.factor();
 
-        let mut extracted = if ds > 1 {
+        let base_noise = if ds > 1 {
             // =====================================================================================
             // DOWNSAMPLED PATH (Uses `u32` for accumulation, `i32` for processing)
             // =====================================================================================
@@ -837,11 +884,11 @@ impl FastExtractor {
             };
 
             // Calculate local noise floor threshold
-            let threshold_f32 = match self.options.sigma_mode {
+            let base_noise = match self.options.sigma_mode {
                 FastSigmaMode::GlobalRootSquare => {
                     let mean_sq =
                         (sum_sq_global / (self.out_height * self.out_width) as f64) as f32;
-                    mean_sq.max(0.0).sqrt() * self.options.sigma
+                    mean_sq.max(0.0).sqrt()
                 }
                 FastSigmaMode::GlobalMedianAbs => {
                     self.median_scratch_i32.clear();
@@ -849,24 +896,10 @@ impl FastExtractor {
                         .extend(self.image_i32.iter().map(|&v| v.abs()));
                     let mid = self.median_scratch_i32.len() / 2;
                     let (_, &mut median, _) = self.median_scratch_i32.select_nth_unstable(mid);
-                    (median as f32 / 128.0) * 1.48 * self.options.sigma
+                    (median as f32 / 128.0) * 1.48
                 }
             };
-            let threshold_scaled = (threshold_f32 * 128.0).round() as i32;
-
-            Self::execute_erosion_and_extraction(
-                &self.image_i32,
-                self.out_width,
-                self.out_height,
-                threshold_scaled,
-                ds,
-                &self.options,
-                &mut self.mask,
-                &mut self.stack,
-                &self.cw_wx,
-                &self.cw_wy,
-                &self.cw_strides,
-            )
+            base_noise
         } else {
             // =====================================================================================
             // 1x RESOLUTION PATH (Uses `i16` for memory efficiency)
@@ -1175,10 +1208,11 @@ impl FastExtractor {
             };
 
             // Calculate local noise floor threshold
-            let threshold_f32 = match self.options.sigma_mode {
+            let base_noise = match self.options.sigma_mode {
                 FastSigmaMode::GlobalRootSquare => {
-                    let mean_sq = (sum_sq_global / (self.height * self.width) as f64) as f32;
-                    mean_sq.max(0.0).sqrt() * self.options.sigma
+                    let mean_sq =
+                        (sum_sq_global / (self.out_height * self.out_width) as f64) as f32;
+                    mean_sq.max(0.0).sqrt()
                 }
                 FastSigmaMode::GlobalMedianAbs => {
                     self.median_scratch_i16.clear();
@@ -1186,34 +1220,93 @@ impl FastExtractor {
                         .extend(self.image_i16.iter().map(|&v| v.abs()));
                     let mid = self.median_scratch_i16.len() / 2;
                     let (_, &mut median, _) = self.median_scratch_i16.select_nth_unstable(mid);
-                    (median as f32 / 128.0) * 1.48 * self.options.sigma
+                    (median as f32 / 128.0) * 1.48
                 }
             };
-            let threshold_scaled = (threshold_f32 * 128.0).round() as i16;
-
-            Self::execute_erosion_and_extraction(
-                &self.image_i16,
-                self.width,
-                self.height,
-                threshold_scaled,
-                1,
-                &self.options,
-                &mut self.mask,
-                &mut self.stack,
-                &self.cw_wx,
-                &self.cw_wy,
-                &self.cw_strides,
-            )
+            base_noise
         };
-        if let Some(_) = self.options.crop {
-            let offset_x = (self.orig_width.saturating_sub(self.width)) / 2;
-            let offset_y = (self.orig_height.saturating_sub(self.height)) / 2;
-            for r in &mut extracted {
-                r.x += offset_x as f64;
-                r.y += offset_y as f64;
-            }
+
+        // Quick AGC background level estimation
+        let mut bg_sum = 0u32;
+        let mut bg_count = 0;
+        for &v in src_slice.iter().step_by(64) {
+            bg_sum += v as u32;
+            bg_count += 1;
         }
-        extracted
+        let background_level = if bg_count > 0 {
+            bg_sum as f32 / bg_count as f32
+        } else {
+            0.0
+        };
+
+        let mut results = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let mut opt = self.options.clone();
+            if let Some(s) = variant.sigma {
+                opt.sigma = s;
+            }
+            if let Some(nf) = variant.noise_filter {
+                opt.binary_open = nf;
+            }
+            if let Some(ma) = variant.min_area {
+                opt.min_area = Some(ma);
+            }
+            if let Some(m_ar) = variant.max_area {
+                opt.max_area = Some(m_ar);
+            }
+            if let Some(ref vc) = variant.virtual_crops {
+                opt.virtual_crops = vc.clone();
+            }
+
+            let threshold_f32 = base_noise * opt.sigma;
+
+            let mut extracted = if ds > 1 {
+                let threshold_scaled = (threshold_f32 * 128.0).round() as i32;
+                Self::execute_erosion_and_extraction(
+                    &self.image_i32,
+                    self.out_width,
+                    self.out_height,
+                    threshold_scaled,
+                    ds,
+                    &opt,
+                    &mut self.mask,
+                    &mut self.stack,
+                    &self.cw_wx,
+                    &self.cw_wy,
+                    &self.cw_strides,
+                )
+            } else {
+                let threshold_scaled = (threshold_f32 * 128.0).round() as i16;
+                Self::execute_erosion_and_extraction(
+                    &self.image_i16,
+                    self.out_width,
+                    self.out_height,
+                    threshold_scaled,
+                    1,
+                    &opt,
+                    &mut self.mask,
+                    &mut self.stack,
+                    &self.cw_wx,
+                    &self.cw_wy,
+                    &self.cw_strides,
+                )
+            };
+
+            if let Some(_) = self.options.crop {
+                let offset_x = (self.orig_width.saturating_sub(self.width)) / 2;
+                let offset_y = (self.orig_height.saturating_sub(self.height)) / 2;
+                for r in &mut extracted {
+                    r.x += offset_x as f64;
+                    r.y += offset_y as f64;
+                }
+            }
+
+            let final_result =
+                self.apply_virtual_crops(extracted, &opt.virtual_crops, background_level);
+            results.push(final_result);
+        }
+
+        results
     }
 
     /// Generics-driven logic executor to seamlessly support `i16` and `i32` fixed point pipelines.

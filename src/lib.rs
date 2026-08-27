@@ -340,6 +340,35 @@ impl FusedSolver {
         Ok(T::extract_fast(fe, image))
     }
 
+    /// Extracts star centroids using multiple variants of fast extraction configurations.
+    pub fn get_centroids_from_image_variants<S, T>(
+        &self,
+        image: &ArrayBase<S, Ix2>,
+        options: FastExtractOptions,
+        variants: &[tetra3::fast_extractor::FastExtractOptionsUpdate],
+    ) -> Result<Vec<FastExtractionResult>, String>
+    where
+        S: Data<Elem = T>,
+        T: FastPixel,
+    {
+        let mut extractor_guard = self.fast_extractor.write().unwrap();
+        let (height, width) = image.dim();
+
+        let reinit = match extractor_guard.as_ref() {
+            Some(fe) => {
+                fe.orig_width() != width || fe.orig_height() != height || fe.options() != &options
+            }
+            None => true,
+        };
+
+        if reinit {
+            *extractor_guard = Some(FastExtractor::new(width, height, options));
+        }
+
+        let fe = extractor_guard.as_mut().unwrap();
+        Ok(T::extract_variants_fast(fe, image, variants))
+    }
+
     /// Performs a plate solve using pre-extracted centroids and given image dimensions.
     /// If successful, the solver automatically updates the IMU anchor internally.
     pub fn solve_from_centroids(

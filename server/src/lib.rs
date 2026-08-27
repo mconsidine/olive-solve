@@ -72,9 +72,7 @@ fn map_solve_options(opt: proto::SolveOptions) -> SolveOptions {
             .or(def.allow_out_of_bounds_target_pixel),
         observer_latitude: opt.observer_latitude.or(def.observer_latitude),
         observer_lst: opt.observer_lst.or(def.observer_lst),
-        min_boresight_altitude: opt
-            .min_boresight_altitude
-            .or(def.min_boresight_altitude),
+        min_boresight_altitude: opt.min_boresight_altitude.or(def.min_boresight_altitude),
         return_best_failed_match: opt
             .return_best_failed_match
             .unwrap_or(def.return_best_failed_match),
@@ -390,7 +388,10 @@ mod tests {
             return_catalog: Some(true),
             return_rotation_matrix: Some(true),
             target_pixel: vec![proto::Pixel { y: 100.0, x: 200.0 }],
-            target_sky_coord: vec![proto::SkyCoord { ra: 45.0, dec: 10.0 }],
+            target_sky_coord: vec![proto::SkyCoord {
+                ra: 45.0,
+                dec: 10.0,
+            }],
             allow_out_of_bounds_target_pixel: Some(true),
             observer_latitude: Some(41.5),
             observer_lst: Some(32.0),

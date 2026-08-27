@@ -2497,3 +2497,105 @@ fn test_virtual_crops_with_base_crop() {
         );
     }
 }
+
+#[test]
+fn test_fast_extractor_variants() {
+    use tetra3::fast_extractor::{FastExtractOptions, FastExtractOptionsUpdate, FastExtractor};
+
+    // Grab the first test image
+    let image_paths = get_test_images();
+    let img_path = &image_paths[0];
+
+    // Load as u8
+    let img = image::open(img_path).unwrap().into_luma8();
+    let (w, h) = img.dimensions();
+    let image_array = Array2::from_shape_vec((h as usize, w as usize), img.into_raw()).unwrap();
+
+    let base_options = FastExtractOptions {
+        sigma: 3.0,
+        downsample: FastDownsample::None,
+        bg_sub_mode: Some(FastBgSubMode::GlobalMedian),
+        sigma_mode: FastSigmaMode::GlobalMedianAbs,
+        ..Default::default()
+    };
+
+    let mut extractor = FastExtractor::new(w as usize, h as usize, base_options.clone());
+
+    // 1. Run via variants API
+    let variants = vec![
+        FastExtractOptionsUpdate {
+            sigma: Some(5.0),
+            min_area: Some(1),
+            ..Default::default()
+        },
+        FastExtractOptionsUpdate {
+            sigma: Some(3.0),
+            min_area: Some(2),
+            ..Default::default()
+        },
+    ];
+
+    let batch_results = extractor.extract_variants(&image_array, &variants);
+    assert_eq!(batch_results.len(), 2);
+
+    // 2. Run individually using standard update_options and extract
+    let mut extractor1 = FastExtractor::new(w as usize, h as usize, base_options.clone());
+    extractor1.update_options(variants[0].clone());
+    let res1 = extractor1.extract(&image_array);
+
+    let mut extractor2 = FastExtractor::new(w as usize, h as usize, base_options.clone());
+    extractor2.update_options(variants[1].clone());
+    let res2 = extractor2.extract(&image_array);
+
+    // 3. Compare lengths
+    assert_eq!(
+        batch_results[0].centroids.len(),
+        res1.centroids.len(),
+        "Variant 0 centroid count mismatch"
+    );
+    assert_eq!(
+        batch_results[1].centroids.len(),
+        res2.centroids.len(),
+        "Variant 1 centroid count mismatch"
+    );
+
+    // 4. Compare exact centroid matches
+    for (b_c, r_c) in batch_results[0].centroids.iter().zip(res1.centroids.iter()) {
+        assert_eq!(b_c.x, r_c.x, "Variant 0 x mismatch");
+        assert_eq!(b_c.y, r_c.y, "Variant 0 y mismatch");
+        assert_eq!(b_c.sum, r_c.sum, "Variant 0 sum mismatch");
+        assert_eq!(b_c.area, r_c.area, "Variant 0 area mismatch");
+    }
+
+    for (b_c, r_c) in batch_results[1].centroids.iter().zip(res2.centroids.iter()) {
+        assert_eq!(b_c.x, r_c.x, "Variant 1 x mismatch");
+        assert_eq!(b_c.y, r_c.y, "Variant 1 y mismatch");
+        assert_eq!(b_c.sum, r_c.sum, "Variant 1 sum mismatch");
+        assert_eq!(b_c.area, r_c.area, "Variant 1 area mismatch");
+    }
+
+    // 5. Check background level
+    assert!(batch_results[0].background_level >= 0.0);
+    assert!(batch_results[1].background_level >= 0.0);
+    assert_eq!(
+        batch_results[0].background_level,
+        batch_results[1].background_level
+    );
+
+    // 6. Check empty variants short circuit
+    let empty_results = extractor.extract_variants(&image_array, &[]);
+    assert_eq!(empty_results.len(), 0);
+
+    // 7. Check f32 images
+    let mut image_array_f32 = Array2::<f32>::zeros((h as usize, w as usize));
+    for ((y, x), val) in image_array.indexed_iter() {
+        image_array_f32[[y, x]] = *val as f32;
+    }
+    let mut f32_extractor = FastExtractor::new(w as usize, h as usize, base_options.clone());
+    let f32_batch_results = f32_extractor.extract_variants_f32(&image_array_f32, &variants);
+    assert_eq!(f32_batch_results.len(), 2);
+    assert_eq!(f32_batch_results[0].centroids.len(), res1.centroids.len());
+
+    let empty_results_f32 = f32_extractor.extract_variants_f32(&image_array_f32, &[]);
+    assert_eq!(empty_results_f32.len(), 0);
+}
