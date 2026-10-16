@@ -17,6 +17,9 @@ const SVD_MATURITY_SIZE: usize = 15;
 // The minimum 3D volume required to trust a calibration matrix.
 // 0.15 (15%) requires an intentional physical roll of the telescope.
 const MIN_CALIBRATION_CONFIDENCE: f64 = 0.15;
+// Maximum confidence score written to disk for pre-lock (immature) calibrations.
+// Ensures saved immature matrices reload as unlocked (< 0.15) on subsequent boots.
+const UNLOCKED_CALIBRATION_MAX_CONFIDENCE: f64 = MIN_CALIBRATION_CONFIDENCE - 0.01;
 // If the hardware shifts by more than this amount, force a recalibration override.
 const HARDWARE_ALTERATION_THRESHOLD_DEG: f64 = 10.0;
 // Time to allow sensor to settle before considering it to be motionless.
@@ -112,10 +115,10 @@ pub struct AlignmentState {
     pub calibration_axes: Vec<(Vector3<f64>, Vector3<f64>)>,
     /// Flag to track if the current mount_q was loaded from disk or previously locked
     pub is_locked: bool,
-    /// Counter for how many good slews have passed the startup sanity check
-    pub startup_slews_passed: u8,
-    /// The highest confidence score achieved by the currently locked mount_q
-    pub best_calibration_confidence: f64,
+    /// Counter for how many good slews have passed the startup sanity check (Some(n) if active, None if inactive/complete)
+    pub startup_slews_passed: Option<u8>,
+    /// The highest confidence score achieved by the current mount_q (None if uncalibrated)
+    pub best_calibration_confidence: Option<f64>,
     /// Counter for tracking massive projection errors during startup
     pub startup_strikes: u8,
     /// Rolling history of expected vs true error for metric tracking
@@ -131,8 +134,8 @@ impl Default for AlignmentState {
             transform_metrics: None,
             calibration_axes: Vec::new(),
             is_locked: false,
-            startup_slews_passed: 0,
-            best_calibration_confidence: 0.0,
+            startup_slews_passed: None,
+            best_calibration_confidence: None,
             startup_strikes: 0,
             error_history: Vec::new(),
         }
@@ -226,13 +229,18 @@ impl Imu {
                 ) {
                     initial_alignment.mount_q =
                         UnitQuaternion::new_normalize(nalgebra::Quaternion::new(w, x, y, z));
-                    initial_alignment.is_locked = true; // Protect this saved matrix
-                    initial_alignment.startup_slews_passed = 0;
+                    initial_alignment.is_locked = confidence >= MIN_CALIBRATION_CONFIDENCE;
+                    initial_alignment.startup_slews_passed = Some(0);
                     initial_alignment.startup_strikes = 0;
-                    initial_alignment.best_calibration_confidence = confidence;
+                    initial_alignment.best_calibration_confidence = Some(confidence);
                     info!(
-                        "Successfully loaded saved calibration (Confidence: {:.1}%): {:.3}, {:.3}, {:.3}, {:.3}",
-                        initial_alignment.best_calibration_confidence * 100.0,
+                        "Successfully loaded saved calibration (Confidence: {:.1}%, Status: {}): {:.3}, {:.3}, {:.3}, {:.3}",
+                        confidence * 100.0,
+                        if initial_alignment.is_locked {
+                            "LOCKED"
+                        } else {
+                            "UNLOCKED"
+                        },
                         x,
                         y,
                         z,
@@ -678,9 +686,9 @@ impl Imu {
             let angle_cam = q_true_delta.angle().to_degrees();
             let angle_imu = q_imu_delta.angle().to_degrees();
 
-            if align.is_locked {
-                // 1. Startup Sanity Check (Only active for the first few slews)
-                if align.startup_slews_passed < 3 && angle_cam > STATIONARY_MOTION_THRESHOLD_DEG {
+            // 1. Startup Sanity Check (Only active if armed by a loaded calibration)
+            if let Some(passed) = align.startup_slews_passed {
+                if angle_cam > STATIONARY_MOTION_THRESHOLD_DEG {
                     if final_error_angle > HARDWARE_ALTERATION_THRESHOLD_DEG {
                         align.startup_strikes += 1;
                         warn!(
@@ -690,9 +698,13 @@ impl Imu {
 
                         if align.startup_strikes >= 3 {
                             warn!("Hardware alteration detected! Discarding disk SVD calibration.");
+                            align.mount_q = UnitQuaternion::identity();
+                            align.transform_metrics = None;
                             align.is_locked = false;
+                            align.startup_slews_passed = None;
+                            align.startup_strikes = 0;
                             align.calibration_axes.clear();
-                            align.best_calibration_confidence = 0.0;
+                            align.best_calibration_confidence = None;
 
                             if let Some(storage) = self.storage.clone() {
                                 std::thread::spawn(move || storage.remove(CALIBRATION_KEY));
@@ -700,15 +712,21 @@ impl Imu {
                         }
                     } else {
                         align.startup_strikes = 0; // Reset strikes on good slew
-                        align.startup_slews_passed += 1;
-                        info!(
-                            "Startup sanity check: Passed {}/3",
-                            align.startup_slews_passed
-                        );
-                        if align.startup_slews_passed >= 3 {
-                            info!(
-                                "Startup calibration verified. SVD Matrix strictly locked for session."
-                            );
+                        let new_passed = passed + 1;
+                        info!("Startup sanity check: Passed {}/3", new_passed);
+                        if new_passed >= 3 {
+                            align.startup_slews_passed = None;
+                            if align.is_locked {
+                                info!(
+                                    "Startup calibration verified. SVD Matrix strictly locked for session."
+                                );
+                            } else {
+                                info!(
+                                    "Startup calibration verified. SVD Matrix active for session while collecting slews to improve confidence."
+                                );
+                            }
+                        } else {
+                            align.startup_slews_passed = Some(new_passed);
                         }
                     }
                 }
@@ -792,23 +810,40 @@ impl Imu {
                                         &Rotation3::from_matrix_unchecked(r_mount),
                                     );
 
-                                    align.mount_q = calculated_q;
-                                    align.best_calibration_confidence = new_pool_confidence;
-
                                     let is_mature =
                                         align.calibration_axes.len() >= SVD_MATURITY_SIZE;
-                                    if is_mature
-                                        && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
-                                    {
+                                    let can_lock = is_mature
+                                        && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE;
+
+                                    if can_lock {
+                                        align.mount_q = calculated_q;
+                                        align.best_calibration_confidence =
+                                            Some(new_pool_confidence);
                                         align.is_locked = true;
-                                        align.startup_slews_passed = 3;
+                                        align.startup_slews_passed = None;
                                         align.error_history.clear();
                                         self.save_calibration_to_disk(
                                             align.mount_q,
-                                            align.best_calibration_confidence,
+                                            new_pool_confidence,
                                         );
                                         info!(
                                             "Bootstrapping complete. SVD Matrix strictly locked for session! Confidence: {:.1}%",
+                                            new_pool_confidence * 100.0
+                                        );
+                                    } else if align
+                                        .best_calibration_confidence
+                                        .is_none_or(|best| new_pool_confidence >= best + 0.01)
+                                    {
+                                        align.mount_q = calculated_q;
+                                        align.best_calibration_confidence =
+                                            Some(new_pool_confidence);
+                                        self.save_calibration_to_disk(
+                                            align.mount_q,
+                                            new_pool_confidence
+                                                .min(UNLOCKED_CALIBRATION_MAX_CONFIDENCE),
+                                        );
+                                        info!(
+                                            "Updated SVD calibration matrix (Confidence: {:.1}%): saved to disk",
                                             new_pool_confidence * 100.0
                                         );
                                     }
@@ -867,7 +902,7 @@ impl Imu {
                     alt_error,
                     az_error,
                     roll_error,
-                    align.best_calibration_confidence * 100.0
+                    align.best_calibration_confidence.unwrap_or(0.0) * 100.0
                 );
             }
 
@@ -877,21 +912,23 @@ impl Imu {
             0.0
         };
 
-        // Assume standard optical camera axes: View = +Z, Up = +Y.
-        // Rotate the camera axes into the IMU's reference frame using our calibration matrix.
-        let cam_view_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 0.0, 1.0);
-        let cam_up_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 1.0, 0.0);
+        if align.best_calibration_confidence.is_some() {
+            // Assume standard optical camera axes: View = +Z, Up = +Y.
+            // Rotate the camera axes into the IMU's reference frame using our calibration matrix.
+            let cam_view_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 0.0, 1.0);
+            let cam_up_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 1.0, 0.0);
 
-        let (view_axis, view_misalign) = Self::get_closest_imu_axis(&cam_view_in_imu);
-        let (up_axis, up_misalign) = Self::get_closest_imu_axis(&cam_up_in_imu);
+            let (view_axis, view_misalign) = Self::get_closest_imu_axis(&cam_view_in_imu);
+            let (up_axis, up_misalign) = Self::get_closest_imu_axis(&cam_up_in_imu);
 
-        align.transform_metrics = Some(TransformMetrics {
-            transform_error_fraction: error_fraction,
-            camera_view_gyro_axis: view_axis,
-            camera_view_misalignment: view_misalign,
-            camera_up_gyro_axis: up_axis,
-            camera_up_misalignment: up_misalign,
-        });
+            align.transform_metrics = Some(TransformMetrics {
+                transform_error_fraction: error_fraction,
+                camera_view_gyro_axis: view_axis,
+                camera_view_misalignment: view_misalign,
+                camera_up_gyro_axis: up_axis,
+                camera_up_misalignment: up_misalign,
+            });
+        }
 
         // Pointing Anchor Update
         // We unconditionally apply the provided anchor position as the new ground truth.
@@ -947,11 +984,12 @@ impl Imu {
     pub fn clear_calibration(&self) {
         let mut align = self.alignment.write().unwrap();
         align.mount_q = UnitQuaternion::identity();
+        align.transform_metrics = None;
         align.calibration_axes.clear();
         align.is_locked = false;
-        align.startup_slews_passed = 0;
+        align.startup_slews_passed = None;
         align.startup_strikes = 0;
-        align.best_calibration_confidence = 0.0;
+        align.best_calibration_confidence = None;
 
         if let Some(storage) = self.storage.clone() {
             std::thread::spawn(move || {
@@ -976,7 +1014,7 @@ impl Imu {
         if let (Some(anchor_horiz), Some(anchor_quat)) =
             (align.last_camera_position, align.imu_anchor_state)
         {
-            if !align.is_locked && align.calibration_axes.len() < 3 {
+            if align.best_calibration_confidence.is_none() {
                 return Ok((anchor_horiz, false));
             }
 
@@ -1038,7 +1076,7 @@ impl Imu {
     /// Returns `true` if a full 3D calibration has been established.
     pub fn is_calibrated(&self) -> bool {
         let align = self.alignment.read().unwrap();
-        align.is_locked || align.calibration_axes.len() >= 3
+        align.best_calibration_confidence.is_some()
     }
 
     /// Retrieves the latest snapshot of the IMU's orientation and motion state.

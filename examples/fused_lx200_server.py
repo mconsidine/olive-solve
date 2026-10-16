@@ -342,7 +342,7 @@ class Lx200Controller:
                     )
                     if not is_cal:
                         logging.info(
-                            "[IMU] Status: Uncalibrated. Perform 3 distinct slews (e.g. pan azimuth, tilt altitude) "
+                            "[IMU] Status: Uncalibrated. Perform 2 distinct slews (e.g. pan azimuth, tilt altitude) "
                             "with steady plate-solves between movements to establish mount SVD calibration."
                         )
                 except Exception as e:
