@@ -149,8 +149,12 @@ pub struct BatchSolution {
 
 impl FusedSolver {
     /// Initialize the unified solver.
-    /// Takes in the database location, an optional IMU type (defaults to Auto),
-    /// and an optional storage implementation. Location must be set later.
+    ///
+    /// # Arguments
+    /// * `database_path` - File path to the pre-built star catalog (`.npz`).
+    /// * `imu_type` - Optional hardware IMU driver to probe (defaults to `Auto`).
+    /// * `storage` - Optional persistent storage implementation (e.g. `FileStorage`). Pass `None` for in-memory only.
+    /// * `enable_accel` - Whether to enable accelerometer hardware/features.
     pub fn new(
         database_path: &std::path::Path,
         imu_type: Option<ImuType>,
@@ -176,7 +180,11 @@ impl FusedSolver {
         })
     }
 
-    /// Sets the observer location. Must be called before IMU mapping can occur.
+    /// Sets the observer location in degrees.
+    ///
+    /// Must be called before IMU mapping can occur. Without observer coordinates,
+    /// camera solutions cannot be mapped into the topocentric horizontal frame,
+    /// preventing IMU anchor updates and emitting a rate-limited warning log.
     pub fn set_observer_location(&self, lat: f64, lon: f64) {
         *self.latitude.write().unwrap() = Some(lat);
         *self.longitude.write().unwrap() = Some(lon);
@@ -865,6 +873,14 @@ impl FusedSolver {
                     imu.update_pointing_anchor_only(&mount_coords, &time);
                 } else {
                     imu.update_anchor(&mount_coords, &time);
+                }
+            } else {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "IMU tracking is active but observer coordinates are not set! Call set_observer_location(lat, lon) to anchor the IMU."
+                    );
                 }
             }
         }

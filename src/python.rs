@@ -5,6 +5,79 @@ use crate::FusedSolver;
 use numpy::PyReadonlyArray2;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use std::path::PathBuf;
+use std::sync::Arc;
+use olive_imu::storage::{FileStorage, PersistentStorage};
+
+fn default_storage_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_default();
+    PathBuf::from(home).join(".olive_solve")
+}
+
+struct PyPersistentStorageAdapter {
+    obj: Py<PyAny>,
+}
+
+impl PersistentStorage for PyPersistentStorageAdapter {
+    fn get(&self, key: &str) -> Option<String> {
+        Python::try_attach(|py| {
+            self.obj
+                .bind(py)
+                .call_method1("get", (key,))
+                .and_then(|val| val.extract::<Option<String>>())
+                .unwrap_or_else(|e| {
+                    log::warn!("Python storage.get('{}') failed: {}", key, e);
+                    None
+                })
+        })
+        .flatten()
+    }
+
+    fn set(&self, key: &str, value: &str) {
+        let _ = Python::try_attach(|py| {
+            if let Err(e) = self.obj.bind(py).call_method1("set", (key, value)) {
+                log::error!("Python storage.set('{}', ...) failed: {}", key, e);
+            }
+        });
+    }
+
+    fn remove(&self, key: &str) {
+        let _ = Python::try_attach(|py| {
+            if let Err(e) = self.obj.bind(py).call_method1("remove", (key,)) {
+                log::warn!("Python storage.remove('{}') failed: {}", key, e);
+            }
+        });
+    }
+}
+
+fn parse_storage<'py>(
+    storage: Option<Bound<'py, PyAny>>,
+) -> PyResult<Option<Arc<dyn PersistentStorage>>> {
+    let default_storage =
+        || -> Arc<dyn PersistentStorage> { Arc::new(FileStorage::new(default_storage_dir())) };
+
+    let Some(obj) = storage.filter(|o| !o.is_none()) else {
+        return Ok(Some(default_storage()));
+    };
+
+    if let Ok(enabled) = obj.extract::<bool>() {
+        return Ok(enabled.then(default_storage));
+    }
+
+    if let Ok(path) = obj.extract::<PathBuf>() {
+        return Ok(Some(Arc::new(FileStorage::new(path))));
+    }
+
+    if obj.hasattr("get")? && obj.hasattr("set")? && obj.hasattr("remove")? {
+        Ok(Some(Arc::new(PyPersistentStorageAdapter { obj: obj.unbind() })))
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "storage must be None (default), bool, str/Path, or an object implementing get(key), set(key, value), and remove(key)",
+        ))
+    }
+}
 
 #[pyclass(name = "FusedSolver")]
 /// A Python wrapper for the FusedSolver, providing plate solving and star extraction.
@@ -16,14 +89,24 @@ pub struct PyFusedSolver {
 #[pymethods]
 impl PyFusedSolver {
     #[new]
-    #[pyo3(signature = (database_path, imu_type=None, enable_accel=true))]
+    #[pyo3(signature = (database_path, imu_type=None, enable_accel=true, storage=None))]
     /// Initializes a new FusedSolver instance.
     ///
     /// Args:
     ///     database_path (str): The file path to the npz star database.
     ///     imu_type (str, optional): The specific IMU to use (e.g. "bno085", "bmi160", "auto", "none"). Defaults to auto-detection.
     ///     enable_accel (bool, optional): Whether to enable accelerometer hardware/features. Defaults to true.
-    pub fn new(database_path: &str, imu_type: Option<&str>, enable_accel: bool) -> PyResult<Self> {
+    ///     storage (str, Path, bool, or object, optional): Storage for persisting IMU calibration parameters across runs.
+    ///         Defaults to None (which persists to ~/.olive_solve/imu_calibration.txt).
+    ///         Pass False to disable persistence (in-memory only).
+    ///         Pass a directory path string or pathlib.Path to store in a custom directory.
+    ///         Pass a custom object implementing get(key), set(key, value), and remove(key).
+    pub fn new<'py>(
+        database_path: &str,
+        imu_type: Option<&str>,
+        enable_accel: bool,
+        storage: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Self> {
         let rust_imu_type = match imu_type {
             Some(s) => Some(
                 s.parse::<crate::ImuType>()
@@ -32,10 +115,12 @@ impl PyFusedSolver {
             None => None,
         };
 
+        let rust_storage = parse_storage(storage)?;
+
         let inner = FusedSolver::new(
             std::path::Path::new(database_path),
             rust_imu_type,
-            None,
+            rust_storage,
             enable_accel,
         )
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
@@ -548,4 +633,15 @@ impl PyFusedSolver {
 fn olive_solve(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFusedSolver>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_storage_dir() {
+        let dir = default_storage_dir();
+        assert!(dir.ends_with(".olive_solve"));
+    }
 }
