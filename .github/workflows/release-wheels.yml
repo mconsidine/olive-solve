@@ -39,7 +39,10 @@ jobs:
         with:
           target: aarch64-unknown-linux-gnu
           manylinux: "2014"
-          args: --release -m tetra3-py/Cargo.toml --interpreter python3.11
+          # --locked: build against the committed Cargo.lock and fail if it is
+          # missing or stale, so the wheel's numpy/pyo3/transitive crate
+          # versions stay frozen and reproducible across rebuilds.
+          args: --release --locked -m tetra3-py/Cargo.toml --interpreter python3.11
 
       - uses: actions/upload-artifact@v7
         with:
@@ -69,6 +72,14 @@ jobs:
       - name: list wheels
         run: ls -la dist/
 
+      # Publish a SHA-256 next to each wheel so downstream (diofinder) can
+      # hard-verify the wheel it downloads (`sha256sum -c <wheel>.whl.sha256`).
+      - name: checksums
+        run: |
+          cd dist
+          for w in *.whl; do sha256sum "$w" > "$w.sha256"; done
+          cat *.sha256
+
       - name: resolve tag name
         id: tag
         run: |
@@ -82,7 +93,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          files: dist/*.whl
+          files: |
+            dist/*.whl
+            dist/*.whl.sha256
           body: |
             ## Installation
 
